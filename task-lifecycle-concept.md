@@ -192,21 +192,39 @@ Master Queue Consumer（定时 500ms 轮询）
    └─ DequeuedMessage 包含执行所需的全部上下文
 ```
 
-> **关键点**：`currentDequeued` 集合是在**第二步**的 `dequeueMessageFromKey` Lua 脚本中写入的，而非第一步。
+> **关键点**：`currentDequeued` 集合是在**第二步第 2 小步**的 `dequeueMessageFromKey` Lua 脚本中写入的（消息从 Worker Queue 取出后立即更新），既不是第一步，也不在后续的任务锁定阶段。
+>
+> - 如果误以为是第一步写入：会错误地认为"消息推入 Worker Queue 就标记为已取出"，导致排查并发计数偏差时方向错误
+> - 如果误以为是任务锁定阶段写入：会错误地怀疑"TypeScript 业务逻辑有 bug"，实际上这是纯 Lua 操作，与业务逻辑层无关
 
 ### 3.5 并发控制机制（Lua 脚本原子性保证）
 
-并发控制完全在 Lua 脚本中原子执行，避免竞态条件：
+并发控制分两个阶段在不同 Lua 脚本中原子执行：
 
+**阶段一：`dequeueMessagesFromQueue`（Master → Worker Queue）**
 ```
 检查顺序：
-1. 队列级并发限制：SCARD queueCurrentConcurrency < queueConcurrencyLimit
-2. 环境级并发限制：SCARD envCurrentConcurrency < envConcurrencyLimit * burstFactor
+1. 环境级并发限制：SCARD envCurrentConcurrency < envConcurrencyLimit * burstFactor
+2. 队列级并发限制：SCARD queueCurrentConcurrency < min(queueLimit, envLimit)
 3. 全部满足则：
    ├─ SADD queueCurrentConcurrency messageId
    ├─ SADD envCurrentConcurrency messageId
    └─ 返回成功
 ```
+
+**阶段二：`dequeueMessageFromKey`（Worker Queue → Worker）**
+```
+操作（完全在 Lua 内完成，与 TypeScript 业务层无关）：
+1. GET messageKey 获取完整 payload
+2. SADD queueCurrentDequeued messageId
+3. SADD envCurrentDequeued messageId
+4. 返回完整消息
+```
+
+> **两个集合的区别**：
+> - `currentConcurrency`：在阶段一写入，表示"已分配并发槽位"
+> - `currentDequeued`：在阶段二写入，表示"已被 Worker 实际取出"
+> - 两者差值 = Worker Queue 中等待被拉取的消息数（正常现象）
 
 ### 3.6 关键代码位置
 - Master Queue 调度：`run-queue/index.ts:1598` (`#processMasterQueueShard`)
@@ -217,10 +235,13 @@ Master Queue Consumer（定时 500ms 轮询）
 
 ---
 
-## 3.7 关于 XREAD + BLOOM 过滤的误判说明
+## 3.7 关于 XREAD + BLOOM 过滤、Key 命名与 currentDequeued 写入时机的误判说明
 
 ### 错误描述回顾
-之前的文档错误地将出队机制描述为 "Redis XREAD 阻塞式拉取（支持 BLOOM 过滤器）"，这与实际实现完全不符。
+之前的文档存在三处关键偏差：
+1. 错误地将出队机制描述为 "Redis XREAD 阻塞式拉取（支持 BLOOM 过滤器）"
+2. Message Key 示例未遵循真实的 hash tag 命名规则
+3. 错误地暗示 `currentDequeued` 可能在任务锁定阶段写入
 
 ### 真实机制 vs 错误描述
 
