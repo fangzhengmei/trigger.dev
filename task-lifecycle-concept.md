@@ -85,15 +85,18 @@ SYSTEM_FAILURE / EXPIRED / TIMED_OUT
 
 ### 3.1 队列架构
 
-RunQueue 采用**严格的两层队列架构**，数据结构和职责完全分离：
+RunQueue 采用**严格的三层队列架构**，数据结构和职责完全分离：
 
-| 层级 | 数据结构 | 职责 | Key 示例 |
-|------|----------|------|----------|
-| **Master Queue** | Redis ZSET（有序集合） | 全局调度、公平排序、并发控制 | `rq:master:shard:0` |
-| **Message Queue** | Redis ZSET（有序集合） | 按环境+队列维度的待执行任务池 | `rq:queue:{orgId}:{projId}:{envId}:{queueName}` |
-| **Worker Queue** | Redis LIST（列表） | 单个 Worker 的消费队列 | `rq:worker:queue:{workerQueueId}` |
+| 层级 | 数据结构 | 职责 | 真实 Key 格式 |
+|------|----------|------|--------------|
+| **Master Queue** | Redis ZSET（有序集合） | 全局调度索引，标记哪些队列有消息 | `masterQueue:shard:{shardNumber}` |
+| **Message Queue** | Redis ZSET（有序集合） | 按环境+队列维度的待执行任务池 | `{org:{orgId}}:proj:{projId}:env:{envId}:queue:{queueName}[:ck:{ck}]` |
+| **Worker Queue** | Redis LIST（列表） | 单个 Worker 的消费队列 | `workerQueue:{workerQueueId}` |
+| **Message Key** | Redis String | 完整消息 payload 存储 | `{org:{orgId}}:message:{runId}` |
 
-> **关键澄清**：不存在 XREAD + BLOOM 过滤机制。Master Queue 和 Message Queue 使用 ZSET + Lua 脚本原子操作，Worker Queue 使用 LIST + BLPOP 阻塞弹出。
+> **Key 命名说明**：`{org:xxx}` 是 Redis Cluster hash tag，确保同一组织的所有 key 落在同一槽位。
+>
+> **关键澄清**：不存在 XREAD + BLOOM 过滤机制。Master/Message Queue 使用 ZSET + Lua 脚本原子操作，Worker Queue 使用 LIST + BLPOP 阻塞弹出。
 
 ### 3.2 入队写入路径回顾
 
