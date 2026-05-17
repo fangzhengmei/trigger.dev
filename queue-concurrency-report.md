@@ -104,9 +104,9 @@ effectiveScore = baseTimestamp - priorityMs
 │             │ getDefaultEnvironmentLimit-     │ 且 currentPlan() 调用成功       │
 │             │ FromPlan()                      │ 按环境类型区分配额             │
 ├─────────────┼─────────────────────────────────┼───────────────────────────────┤
-│ 3           │ 组织级兜底值（仅无计费）         │ billing client 未配置           │
-│             │ Organization                    │ 或 billing client 配置但调用失败│
-│             │ .maximumConcurrencyLimit        │ 降级查询组织表                 │
+│ 3           │ 组织级兜底值（仅无计费）         │ billing client 未配置时         │
+│             │ Organization                    │ 主动查询组织表作为默认值       │
+│             │ .maximumConcurrencyLimit        │ 边界：自托管场景默认配额       │
 ├─────────────┼─────────────────────────────────┼───────────────────────────────┤
 │ 4           │ 系统默认值（最后兜底）           │ Redis 中无环境限制记录时        │
 │             │ DEFAULT_ENV_EXECUTION_          │ 环境变量默认值：100            │
