@@ -85,102 +85,108 @@ effectiveScore = baseTimestamp - priorityMs
 
 ## 2. 租户额度来源与生效顺序
 
-### 2.1 额度配置层级（校准版）
+### 2.1 四层关系的最终结论（无歧义版）
 
-基于 `apps/webapp/app/services/platform.v3.server.ts`、`apps/webapp/app/v3/marqs/index.server.ts`、`apps/webapp/app/env.server.ts` 等代码证据，并发额度的四层生效关系如下：
+基于完整代码证据分析，并发额度的四层关系、触发条件、生效顺序严格如下：
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                    生效优先级（高 → 低）                          │
-├──────────────────────────────────────────────────────────────────┤
-│                                                                  │
-│  1. 环境级显式覆盖                                               │
-│     └─ RuntimeEnvironment.maximumConcurrencyLimit               │
-│        来源：用户手动调整 / 订阅升级分配 / 管理员设置             │
-│        数据库默认：迁移脚本 20240402105424 设置 DEFAULT 5        │
-│                                                                  │
-│  2. 订阅计划级默认值（云端模式）                                  │
-│     └─ getDefaultEnvironmentLimitFromPlan()                     │
-│        来源：billing 服务返回的当前订阅计划                       │
-│        按环境类型区分：dev / stg / prev / prod 各有配额           │
-│                                                                  │
-│  3. 组织级兜底值（无计费模式）                                    │
-│     └─ Organization.maximumConcurrencyLimit                     │
-│        来源：组织创建默认值 / 管理员设置                          │
-│        触发条件：无 billing 服务（如自托管）时降级使用             │
-│                                                                  │
-│  4. 系统默认值（最后兜底）                                       │
-│     └─ DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT                  │
-│        来源：环境变量，默认值 = 100（env.server.ts:334）         │
-│        触发条件：Redis 中无环境限制记录时返回                     │
-│                                                                  │
-└──────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────────┐
+│                      并发额度四层关系（最终版）                                │
+├─────────────┬─────────────────────────────────┬───────────────────────────────┤
+│ 优先级（高→低）│ 配置层级                       │ 触发条件与边界                 │
+├─────────────┼─────────────────────────────────┼───────────────────────────────┤
+│ 1           │ 环境级显式覆盖                   │ 始终生效（数据库有值即生效）    │
+│             │ RuntimeEnvironment              │ 存储：PostgreSQL + Redis 缓存 │
+│             │ .maximumConcurrencyLimit        │ 同步：updateEnvConcurrencyLimits() │
+│             │ 数据库 DEFAULT：5               │ 边界：单环境粒度               │
+├─────────────┼─────────────────────────────────┼───────────────────────────────┤
+│ 2           │ 订阅计划级默认值（仅云端）       │ billing client 已配置           │
+│             │ getDefaultEnvironmentLimit-     │ 且 currentPlan() 调用成功       │
+│             │ FromPlan()                      │ 按环境类型区分配额             │
+├─────────────┼─────────────────────────────────┼───────────────────────────────┤
+│ 3           │ 组织级兜底值（仅无计费）         │ billing client 未配置           │
+│             │ Organization                    │ 或 billing client 配置但调用失败│
+│             │ .maximumConcurrencyLimit        │ 降级查询组织表                 │
+├─────────────┼─────────────────────────────────┼───────────────────────────────┤
+│ 4           │ 系统默认值（最后兜底）           │ Redis 中无环境限制记录时        │
+│             │ DEFAULT_ENV_EXECUTION_          │ 环境变量默认值：100            │
+│             │ CONCURRENCY_LIMIT              │ 边界：运行时最后防线           │
+└─────────────┴─────────────────────────────────┴───────────────────────────────┘
 ```
 
-### 2.2 各层级触发条件与边界
+### 2.2 云端模式的失败语义边界
 
-**第 1 层：环境级显式覆盖** (`RuntimeEnvironment.maximumConcurrencyLimit`)
-- **触发条件**：始终生效（只要数据库中有值）
-- **存储**：PostgreSQL 数据库字段 + Redis 缓存（key: `{prefix}:env:limit:{envId}`）
-- **同步机制**：`updateEnvConcurrencyLimits()` 被调用时从数据库同步到 Redis
-- **边界**：精确到单个环境，同一组织的 production/staging/dev 可独立配置
-- **数据库默认**：迁移脚本 `20240402105424_set_default_env_concurrency_limit_to_5` 为新创建的环境设置 DEFAULT 5
-- **关键区分**：这是**数据库层默认值**，而非系统运行时兜底值
+云端模式下，`getDefaultEnvironmentConcurrencyLimit()` 函数（`platform.v3.server.ts:286-310`）存在两种截然不同的失败场景，其行为边界严格区分如下：
 
-**第 2 层：订阅计划级默认值** (`getDefaultEnvironmentLimitFromPlan()`)
-- **触发条件**：有 billing 服务连接，且环境级未显式覆盖时
-- **来源**：`platform.v3.server.ts:312-330`，从 billing 服务获取当前订阅计划
-- **按环境类型分配**：
-  - `DEVELOPMENT` → `plan.limits.concurrentRuns.development`
-  - `STAGING` → `plan.limits.concurrentRuns.staging`
-  - `PREVIEW` → `plan.limits.concurrentRuns.preview`
-  - `PRODUCTION` → `plan.limits.concurrentRuns.production`
-- **边界**：为环境级覆盖提供计算基准，用户可在此基础上增减额度
+---
 
-**第 3 层：组织级兜底值** (`Organization.maximumConcurrencyLimit`)
-- **触发条件**：无 billing 服务连接（如自托管部署），且环境级未显式覆盖时
-- **来源**：`platform.v3.server.ts:290-300`，无 billing client 时直接查询组织表
-- **边界**：自托管场景下的组织级默认值，所有环境共享此配额作为计算基准
-- **降级路径**：`!client` → `$replica.organization.findFirst().maximumConcurrencyLimit`
+#### 场景 A：billing client 未配置
 
-**第 4 层：系统默认值** (`DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT`)
-- **触发条件**：Redis 中无该环境的并发限制记录时（极罕见兜底场景）
-- **实际值**：`env.server.ts:334` 中定义 `z.coerce.number().int().default(100)`
-- **自托管文档确认**：`docs/self-hosting/env/webapp.mdx:60` 标注默认值为 100
-- **边界**：这是**运行时最后兜底**，与数据库层默认值 5 是两个不同层面的概念，不可混淆
-- **使用场景**：MarQS 初始化、FairDequeuingStrategy 初始化、RunEngine 初始化时传入
-
-### 2.3 数据库默认值 vs 系统默认值的关键区分
-
-| 概念 | 位置 | 默认值 | 触发场景 | 代码证据 |
-|------|------|-------|---------|---------|
-| 数据库层默认值 | `RuntimeEnvironment.maximumConcurrencyLimit` 字段 DEFAULT | 5 | 新环境插入数据库时 | 迁移脚本 `20240402105424` |
-| 系统运行时兜底值 | `DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT` 环境变量 | 100 | Redis 无记录时 | `env.server.ts:334` |
-
-**结论**：原报告中"defaultEnvConcurrency 默认为 5"是错误的，5 是数据库字段的 DEFAULT 约束，而系统运行时兜底值为 100。
-
-### 2.4 云端与无计费部署的生效路径对照表
-
-| 部署模式 | 第 1 层 环境级覆盖 | 第 2 层 订阅计划级 | 第 3 层 组织级兜底 | 第 4 层 系统默认值 | 典型生效路径 |
-|---------|-------------------|------------------|------------------|------------------|-------------|
-| **云端模式**（有 billing） | ✅ 始终生效 | ✅ 有 billing 时生效 | ❌ 不触发 | ✅ 最后兜底 | 环境级 → 订阅计划级 → 系统默认值 |
-| **无计费模式**（自托管） | ✅ 始终生效 | ❌ 无 billing 不触发 | ✅ 降级触发 | ✅ 最后兜底 | 环境级 → 组织级兜底 → 系统默认值 |
-
-**云端模式详细路径**：
-```
-环境有显式设置 → 使用 RuntimeEnvironment.maximumConcurrencyLimit
-环境无显式设置 → 调用 getDefaultEnvironmentLimitFromPlan() 获取计划配额
-  → billing 服务可用 → 返回计划配额
-  → billing 服务不可用 → 降级查询 Organization.maximumConcurrencyLimit
-Redis 中无记录 → 使用 DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT (100)
+**代码证据**：`platform.v3.server.ts:290-300`
+```typescript
+if (!client) {
+  const org = await $replica.organization.findFirst({
+    where: { id: organizationId },
+    select: { maximumConcurrencyLimit: true },
+  });
+  if (!org) throw new Error("Organization not found");
+  return org.maximumConcurrencyLimit;
+}
 ```
 
-**无计费模式详细路径**：
+| 项目 | 行为 |
+|------|------|
+| **触发条件** | `!client` 为 true（billing 服务未初始化，如自托管、本地开发） |
+| **返回值** | `Organization.maximumConcurrencyLimit`（组织表中的配置值） |
+| **报错行为** | 仅当组织不存在时抛出 `Error("Organization not found")` |
+| **是否降级到组织级** | ✅ 是，主动降级，这是设计行为 |
+| **是否影响环境创建** | ❌ 不影响，可正常返回额度值 |
+
+---
+
+#### 场景 B：billing client 已配置但 `currentPlan()` 调用失败
+
+**代码证据**：`platform.v3.server.ts:303-307`
+```typescript
+const result = await client.currentPlan(organizationId);
+if (!result.success) throw new Error("Error getting current plan");
+
+const limit = getDefaultEnvironmentLimitFromPlan(environmentType, result);
+if (!limit) throw new Error("No plan found");
 ```
-环境有显式设置 → 使用 RuntimeEnvironment.maximumConcurrencyLimit
-环境无显式设置 → 无 billing 服务，直接查询 Organization.maximumConcurrencyLimit
-Redis 中无记录 → 使用 DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT (100)
-```
+
+| 失败类型 | 触发条件 | 报错行为 | 是否降级到组织级 | 对环境创建的影响 |
+|---------|---------|---------|----------------|----------------|
+| **B1：API 调用失败** | `result.success === false`（网络错误、billing 服务宕机等） | 抛出 `Error("Error getting current plan")` | ❌ 不降级，直接报错 | ⚠️ 环境创建流程会失败（`organization.server.ts:108` 无 try-catch） |
+| **B2：计划数据缺失** | `getDefaultEnvironmentLimitFromPlan()` 返回 `undefined`（计划中无对应环境类型的配额） | 抛出 `Error("No plan found")` | ❌ 不降级，直接报错 | ⚠️ 环境创建流程会失败 |
+
+**关键结论**：云端模式下，billing 服务故障是**致命错误**，不会自动降级到组织级兜底。这是设计使然——云端模式依赖计费系统确定配额，降级可能导致配额计算错误。
+
+---
+
+### 2.3 两层默认值的严格区分
+
+| 概念 | 位置 | 默认值 | 触发时机 | 代码证据 | 作用域 |
+|------|------|-------|---------|---------|-------|
+| 数据库层默认值 | `RuntimeEnvironment.maximumConcurrencyLimit` 字段 `DEFAULT` 约束 | **5** | 新环境 `INSERT` 数据库时 | 迁移脚本 `20240402105424` | 数据持久化层 |
+| 系统运行时兜底值 | `DEFAULT_ENV_EXECUTION_CONCURRENCY_LIMIT` 环境变量 | **100** | Redis 中无环境限制记录时（极罕见） | `env.server.ts:334`、`docs/self-hosting/env/webapp.mdx:60` | 运行时调度层 |
+
+**常见误解澄清**：
+- ❌ 错误："defaultEnvConcurrency 默认为 5"
+- ✅ 正确：5 是数据库字段的 DEFAULT 约束，100 是运行时 Redis 兜底的环境变量默认值
+- ✅ 正确：两者处于完全不同的系统层级，触发时机无重叠
+
+### 2.4 云端 vs 无计费部署生效路径对照表（精简版）
+
+| 维度 | 云端模式（有 billing） | 无计费模式（自托管） |
+|------|----------------------|---------------------|
+| **第 1 层 环境级覆盖** | ✅ 始终生效，数据库值同步到 Redis | ✅ 始终生效，数据库值同步到 Redis |
+| **第 2 层 订阅计划级** | ✅ billing 正常时生效 | ❌ 无 billing 不触发 |
+| **第 3 层 组织级兜底** | ❌ 仅 billing 未配置时降级（非失败场景） | ✅ 主动使用，无 billing 时直接查组织表 |
+| **第 4 层 系统默认值** | ✅ Redis 无记录时兜底（100） | ✅ Redis 无记录时兜底（100） |
+| **billing 未配置** | 降级到组织级（场景 A） | 正常路径，直接用组织级 |
+| **billing 调用失败** | ❌ 抛出异常，不降级 | N/A（无 billing 服务） |
+| **典型生效路径** | 环境级 → 订阅计划级 → 系统默认值 | 环境级 → 组织级兜底 → 系统默认值 |
 
 ### 2.5 突发因子（Burst Factor）
 
