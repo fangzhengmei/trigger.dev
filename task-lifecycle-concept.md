@@ -85,29 +85,90 @@ SYSTEM_FAILURE / EXPIRED / TIMED_OUT
 
 ### 3.1 队列架构
 
-RunQueue 采用**两层队列架构**：
-1. **Master Queue**：按环境 + 队列维度的公平调度（Fair Queue Selection Strategy）
-2. **Worker Queue**：具体工作节点的消费队列
+RunQueue 采用**严格的两层队列架构**，数据结构和职责完全分离：
 
-### 3.2 公平调度策略
+| 层级 | 数据结构 | 职责 | Key 示例 |
+|------|----------|------|----------|
+| **Master Queue** | Redis ZSET（有序集合） | 全局调度、公平排序、并发控制 | `rq:master:shard:0` |
+| **Message Queue** | Redis ZSET（有序集合） | 按环境+队列维度的待执行任务池 | `rq:queue:{orgId}:{projId}:{envId}:{queueName}` |
+| **Worker Queue** | Redis LIST（列表） | 单个 Worker 的消费队列 | `rq:worker:queue:{workerQueueId}` |
 
-`FairQueueSelectionStrategy` 实现了加权轮询算法：
-- 支持环境级并发限制（`defaultEnvConcurrency`）
-- 支持队列级优先级和权重配置
-- 支持突发因子（`concurrencyBurstFactor`）
-- 避免单个环境/队列饿死
+> **关键澄清**：不存在 XREAD + BLOOM 过滤机制。Master Queue 和 Message Queue 使用 ZSET + Lua 脚本原子操作，Worker Queue 使用 LIST + BLPOP 阻塞弹出。
 
-### 3.3 出队详细流程
+### 3.2 入队写入路径回顾
+
+入队时有两条路径（由 Lua 脚本原子判定）：
 
 ```
-1. Worker 发起拉取请求
-   └─ dequeueFromWorkerQueue(consumerId, workerQueue)
+Fast Path（直接入 Worker Queue）
+  条件：enableFastPath=true 且 并发可用
+  操作：直接 RPUSH 到 Worker Queue
 
-2. 队列拉取
-   ├─ Redis XREAD 阻塞式拉取（支持 BLOOM 过滤器）
-   └─ 多消费者竞争，确保每条消息只被消费一次
+Slow Path（标准流程）
+  操作：ZADD 到 Message Queue
+        ZADD 到 Master Queue（标记该队列有消息）
+        调度 processQueueForWorkerQueue Job（500ms 去抖）
+```
 
-3. 运行时检查
+### 3.3 公平调度策略
+
+`FairQueueSelectionStrategy` 实现加权轮询算法，运行在 **Master Queue Consumer** 中：
+
+```
+Master Queue Consumer（定时 500ms 轮询）
+    │
+    ├─ ZRANGE 从 Master Queue 获取候选队列列表
+    │
+    ├─ 按环境分组，应用公平调度权重
+    │  ├─ 环境级并发限制（defaultEnvConcurrency）
+    │  ├─ 突发因子（concurrencyBurstFactor）
+    │  └─ 队列优先级排序
+    │
+    └─ 对选中的队列调用 dequeueMessagesFromQueue
+```
+
+**调度特性**：
+- 支持 Cooloff 机制：连续空队列自动冷却（默认 10s）
+- 支持 CK（Concurrency Key）队列的通配符匹配
+- 避免单个环境/队列饿死
+
+### 3.4 出队完整流程（两步架构）
+
+#### 第一步：Master Queue → Worker Queue（后台调度）
+
+由 `#processMasterQueueShard` 定时任务执行（默认 500ms 间隔）：
+
+```
+1. 公平调度选队
+   ├─ 调用 distributeFairQueuesFromParentQueue()
+   └─ 获得候选队列列表（按环境 + 权重排序）
+
+2. 对每个队列执行 Lua 脚本出队
+   └─ redis.dequeueMessagesFromQueue()
+      ├─ ZRANGEBYSCORE 从 Message Queue 取消息（按时间戳）
+      ├─ 原子检查并发限制（环境级 + 队列级）
+      ├─ SADD 到 currentConcurrency 集合（占用并发槽）
+      ├─ ZREM 从 Message Queue 移除
+      └─ 返回消息列表（最多 10 条）
+
+3. 推入 Worker Queue
+   └─ RPUSH 到对应 Worker Queue（List）
+      └─ 每个消息存的是 messageKey 引用，不是完整 payload
+```
+
+#### 第二步：Worker Queue → Worker（Worker 拉取）
+
+由 Worker 主动调用 `dequeueMessageFromWorkerQueue()`：
+
+```
+1. Worker 发起阻塞拉取
+   └─ BLPOP workerQueueKey timeout（默认 10s 阻塞超时）
+      └─ 返回 messageKey（如 "rq:message:{orgId}:{runId}"）
+
+2. 读取完整消息
+   └─ GET messageKey 获取完整 payload
+
+3. 运行时检查（dequeueSystem.ts）
    ├─ 分布式锁 (RunLocker)
    ├─ 快照状态验证（必须是 QUEUED / QUEUED_EXECUTING）
    ├─ Worker/Task 存在性检查
@@ -117,6 +178,7 @@ RunQueue 采用**两层队列架构**：
 4. 任务锁定
    ├─ 更新 TaskRun.status = DEQUEUED
    ├─ 设置 lockedAt / lockedToVersionId / lockedQueueId
+   ├─ SADD 到 currentDequeued 集合
    ├─ 创建 PENDING_EXECUTING 快照
    └─ 发布 runLocked 事件
 
@@ -124,9 +186,60 @@ RunQueue 采用**两层队列架构**：
    └─ DequeuedMessage 包含执行所需的全部上下文
 ```
 
-### 3.4 关键代码位置
-- 出队系统：`internal-packages/run-engine/src/engine/systems/dequeueSystem.ts`
-- 公平调度：`internal-packages/run-engine/src/run-queue/fairQueueSelectionStrategy.ts`
+### 3.5 并发控制机制（Lua 脚本原子性保证）
+
+并发控制完全在 Lua 脚本中原子执行，避免竞态条件：
+
+```
+检查顺序：
+1. 队列级并发限制：SCARD queueCurrentConcurrency < queueConcurrencyLimit
+2. 环境级并发限制：SCARD envCurrentConcurrency < envConcurrencyLimit * burstFactor
+3. 全部满足则：
+   ├─ SADD queueCurrentConcurrency messageId
+   ├─ SADD envCurrentConcurrency messageId
+   └─ 返回成功
+```
+
+### 3.6 关键代码位置
+- Master Queue 调度：`run-queue/index.ts:1598` (`#processMasterQueueShard`)
+- 消息出队 Lua：`run-queue/index.ts:2024` (`#callDequeueMessagesFromQueue`)
+- Worker 取任务：`run-queue/index.ts:773` (`dequeueMessageFromWorkerQueue`)
+- 运行时检查：`engine/systems/dequeueSystem.ts`
+- 公平调度：`run-queue/fairQueueSelectionStrategy.ts`
+
+---
+
+## 3.7 关于 XREAD + BLOOM 过滤的误判说明
+
+### 错误描述回顾
+之前的文档错误地将出队机制描述为 "Redis XREAD 阻塞式拉取（支持 BLOOM 过滤器）"，这与实际实现完全不符。
+
+### 真实机制 vs 错误描述
+
+| 维度 | 真实机制 | 错误描述 | 差异影响 |
+|------|----------|----------|----------|
+| **数据结构** | ZSET (Master/Message Queue) + LIST (Worker Queue) | Redis Stream + Bloom Filter | 排障时会查错 Redis 数据类型 |
+| **消费模式** | 两步：后台调度推入 + Worker BLPOP 拉出 | 单步：XREAD 阻塞拉取 | 无法理解消息延迟来源（500ms 调度间隔） |
+| **原子性保证** | Lua 脚本原子操作 | （假设）Stream 消费组 | 排查并发问题时方向错误 |
+| **消息引用** | Worker Queue 存 messageKey 引用 | （假设）存完整消息 | 理解内存占用和大消息处理时出错 |
+
+### 该误判可能造成的排障误导
+
+1. **消息延迟排查**：
+   - 错误方向：怀疑 XREAD 阻塞超时、Stream 消费者组 lag
+   - 正确方向：检查 Master Queue Consumer 调度间隔（500ms）、Lua 脚本执行耗时、Cooloff 状态
+
+2. **并发问题排查**：
+   - 错误方向：怀疑 Bloom Filter 误判导致重复消费
+   - 正确方向：检查 Lua 脚本中的 SADD/ZREM 原子性、currentConcurrency 集合状态
+
+3. **性能瓶颈分析**：
+   - 错误方向：怀疑 Stream 写入放大、Bloom Filter 内存占用
+   - 正确方向：检查 ZSET 大小、Lua 脚本复杂度、Worker Queue LIST 长度
+
+4. **数据恢复场景**：
+   - 错误方向：尝试从 Stream 恢复消息
+   - 正确方向：检查 Message Queue ZSET、Message Key 是否存在
 
 ---
 
