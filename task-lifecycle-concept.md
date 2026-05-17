@@ -166,10 +166,14 @@ Master Queue Consumer（定时 500ms 轮询）
 ```
 1. Worker 发起阻塞拉取
    └─ BLPOP workerQueueKey timeout（默认 10s 阻塞超时）
-      └─ 返回 messageKey（如 "rq:message:{orgId}:{runId}"）
+      └─ 返回 messageKey（真实格式：`{org:org_2fe4d9c8}:message:run_8x7z2k3m`，前缀 `{org:xxx}` 是 Redis Cluster hash tag）
 
-2. 读取完整消息
-   └─ GET messageKey 获取完整 payload
+2. 读取完整消息（原子操作，Lua 脚本内完成）
+   └─ redis.dequeueMessageFromKey(messageKey)
+      ├─ GET messageKey 获取完整 payload
+      ├─ SADD 到 queueCurrentDequeued 集合（标记为已取出）
+      ├─ SADD 到 envCurrentDequeued 集合
+      └─ 返回完整消息
 
 3. 运行时检查（dequeueSystem.ts）
    ├─ 分布式锁 (RunLocker)
@@ -181,13 +185,14 @@ Master Queue Consumer（定时 500ms 轮询）
 4. 任务锁定
    ├─ 更新 TaskRun.status = DEQUEUED
    ├─ 设置 lockedAt / lockedToVersionId / lockedQueueId
-   ├─ SADD 到 currentDequeued 集合
    ├─ 创建 PENDING_EXECUTING 快照
    └─ 发布 runLocked 事件
 
 5. 结果返回
    └─ DequeuedMessage 包含执行所需的全部上下文
 ```
+
+> **关键点**：`currentDequeued` 集合是在**第二步**的 `dequeueMessageFromKey` Lua 脚本中写入的，而非第一步。
 
 ### 3.5 并发控制机制（Lua 脚本原子性保证）
 
