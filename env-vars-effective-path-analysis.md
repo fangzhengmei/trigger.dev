@@ -72,7 +72,10 @@ environmentvariable:{projectId}:{environmentId}:{key}
 
 #### 2.2.1 加密方案
 - **算法**: AES-256-GCM（认证加密）
-- **密钥来源**: `env.ENCRYPTION_KEY`（16字节十六进制字符串）
+- **密钥来源**: `env.ENCRYPTION_KEY`（32字节字符串）
+  - **实现依据**：`secretStore.server.ts:224` 和 `242` 中使用 `nodeCrypto.createCipheriv("aes-256-gcm", encryptionKey, nonce)`
+  - AES-256 要求密钥长度为 32 字节（256 位）
+  - 示例代码 `internal-packages/testcontainers/src/webapp.ts:87`: `"test-encryption-key-for-e2e!!!!!"` 恰好 32 字节
 - **存储结构**:
   ```json
   {
@@ -505,3 +508,115 @@ export function populateEnv(
 7. **运行时覆盖**: `populateEnv()` 默认不覆盖 `process.env` 中已存在的变量，但在任务执行时**总是**传入 `override: true`，因此平台返回的 envVars 会覆盖 Supervisor 预置的同名变量
 
 8. **API 安全**: `/api/v1/projects/:projectRef/envvars` 和 worker-actions API 都受认证保护（API Key / Worker Token）
+
+## 九、TRIGGER_RUN_ID 同名键冲突深度分析
+
+### 9.1 两处来源与值语义
+
+| 来源 | 注入位置 | 变量名 | 值来源 | 值语义 |
+|------|----------|--------|--------|--------|
+| Supervisor | 容器创建时 (docker.ts:77) | `TRIGGER_RUN_ID` | `opts.runFriendlyId` | **friendlyId** - 对外友好 ID，如 `run_abc123xyz` |
+| 平台 envVars | 运行时注入 (workerGroupTokenService.server.ts:562) | `TRIGGER_RUN_ID` | `engineResult.run.id` | **internal runId** - 数据库主键 ID，UUID 格式 |
+
+### 9.2 代码证据
+
+**Supervisor 端** (`docker.ts:77`):
+```typescript
+`TRIGGER_RUN_ID=${opts.runFriendlyId}`  // 传入的是 friendlyId
+```
+
+**平台端** (`workerGroupTokenService.server.ts:409-446`):
+```typescript
+async startRunAttempt({ runFriendlyId, ... }) {
+  const engineResult = await this._engine.startRunAttempt({
+    runId: fromFriendlyId(runFriendlyId),  // friendlyId 转为 internal ID
+    // ...
+  });
+
+  const envVars = environment
+    ? await this.getEnvVars(
+        environment,
+        engineResult.run.id,  // 传入 internal runId
+        // ...
+      )
+    : {};
+}
+
+private async getEnvVars(environment, runId, ...) {
+  variables.push(
+    { key: "TRIGGER_RUN_ID", value: runId },  // runId 是 internal ID
+    // ...
+  );
+}
+```
+
+### 9.3 最终生效结果
+
+由于 `populateEnv` 调用时传入 `{ override: true }`，**平台返回的 internal runId 会覆盖 Supervisor 注入的 friendlyId**。
+
+**结论**: `process.env.TRIGGER_RUN_ID` 的最终值是 **internal runId（数据库 UUID）**。
+
+## 十、实际冲突键清单
+
+### 10.1 会发生冲突的键（Supervisor 预置 vs 平台 envVars）
+
+| 变量名 | Supervisor 注入值 | 平台 envVars 注入值 | 最终生效值 | 备注 |
+|--------|------------------|---------------------|------------|------|
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | `env.OTEL_EXPORTER_OTLP_ENDPOINT` (Supervisor 环境) | `env.DEV_OTEL_EXPORTER_OTLP_ENDPOINT` 或 `{APP_ORIGIN}/otel` (平台环境) | 平台值 | 仅开发环境，`overridableOtelVariables` 包含此键 |
+| `TRIGGER_RUN_ID` | `opts.runFriendlyId` (friendlyId) | `engineResult.run.id` (internal runId) | 平台值 (internal runId) | 见第九节详细分析 |
+
+### 10.2 不冲突的键（仅 Supervisor 预置，平台不覆盖）
+
+这些变量仅由 Supervisor 注入，平台 envVars 中不包含，因此保留 Supervisor 的值：
+
+| 变量名 | 注入位置 | 值来源 |
+|--------|----------|--------|
+| `TRIGGER_DEQUEUED_AT_MS` | docker.ts:72 | `opts.dequeuedAt.getTime()` |
+| `TRIGGER_POD_SCHEDULED_AT_MS` | docker.ts:73 | `Date.now()` |
+| `TRIGGER_ENV_ID` | docker.ts:74 | `opts.envId` |
+| `TRIGGER_DEPLOYMENT_ID` | docker.ts:75 | `opts.deploymentFriendlyId` |
+| `TRIGGER_DEPLOYMENT_VERSION` | docker.ts:76 | `opts.deploymentVersion` |
+| `TRIGGER_SNAPSHOT_ID` | docker.ts:78 | `opts.snapshotFriendlyId` |
+| `TRIGGER_SUPERVISOR_API_PROTOCOL` | docker.ts:79 | `this.opts.workloadApiProtocol` |
+| `TRIGGER_SUPERVISOR_API_PORT` | docker.ts:80 | `this.opts.workloadApiPort` |
+| `TRIGGER_SUPERVISOR_API_DOMAIN` | docker.ts:81 | `this.opts.workloadApiDomain` 或 Docker host |
+| `TRIGGER_WORKER_INSTANCE_NAME` | docker.ts:82 | `env.TRIGGER_WORKER_INSTANCE_NAME` |
+| `TRIGGER_RUNNER_ID` | docker.ts:83 | runnerId (随机生成) |
+| `TRIGGER_MACHINE_CPU` | docker.ts:84 | `opts.machine.cpu` |
+| `TRIGGER_MACHINE_MEMORY` | docker.ts:85 | `opts.machine.memory` |
+| `PRETTY_LOGS` | docker.ts:86 | `env.RUNNER_PRETTY_LOGS` |
+| `TRIGGER_WARM_START_URL` | docker.ts:90 | `this.opts.warmStartUrl` (可选) |
+| `TRIGGER_METADATA_URL` | docker.ts:94 | `this.opts.metadataUrl` (可选) |
+| `TRIGGER_HEARTBEAT_INTERVAL_SECONDS` | docker.ts:98 | `this.opts.heartbeatIntervalSeconds` (可选) |
+| `TRIGGER_SNAPSHOT_POLL_INTERVAL_SECONDS` | docker.ts:103 | `this.opts.snapshotPollIntervalSeconds` (可选) |
+
+### 10.3 不冲突的键（仅平台 envVars 注入，Supervisor 不预置）
+
+这些变量仅由平台返回，Supervisor 不注入：
+
+| 变量名 | 来源类别 | 备注 |
+|--------|----------|------|
+| `TRIGGER_REALTIME_STREAM_VERSION` | overridableTriggerVariables | 平台全局配置 |
+| `TRIGGER_SECRET_KEY` | builtInVariables | 环境 API Key |
+| `TRIGGER_API_URL` | builtInVariables | 平台 API 地址 |
+| `TRIGGER_STREAM_URL` | builtInVariables | 平台 Stream 地址 |
+| `TRIGGER_RUNTIME_WAIT_THRESHOLD_IN_MS` | builtInVariables | 检查点阈值 |
+| `TRIGGER_ORG_ID` | builtInVariables | 组织 ID |
+| `TRIGGER_PREVIEW_BRANCH` | builtInVariables | 预览分支名 (可选) |
+| `TRIGGER_JWT` | 运行时追加 | 任务执行 JWT |
+| `TRIGGER_MACHINE_PRESET` | 运行时追加 | 机器配置名称 |
+| `TRIGGER_OTEL_*` 系列 | builtInVariables | OTEL 配置 |
+| `OTEL_*` 系列 (dev only) | overridableOtelVariables | 开发环境 OTEL 配置 |
+| `CUSTOM_OTEL_RESOURCE_ATTRIBUTES` | projectSecrets | 用户自定义 OTEL 属性 |
+| 用户自定义变量 | projectSecrets | 用户在面板设置的变量 |
+
+### 10.4 特殊说明
+
+1. **`additionalEnvVars` 扩展**: Supervisor 支持通过 `this.opts.additionalEnvVars` 注入额外变量，这些变量也会受到平台 envVars 的覆盖影响（如果键名冲突）。
+
+2. **环境差异**: 
+   - 开发环境可能有更多 OTEL 相关变量冲突（`overridableOtelVariables` 仅开发环境生效）
+   - 生产环境冲突较少，主要是 `TRIGGER_RUN_ID`
+
+3. **Kubernetes 特有变量**:
+   - `LIMITS_CPU`、`LIMITS_MEMORY`、`LIMITS_EPHEMERAL_STORAGE` 等 K8s downward API 变量仅 Supervisor 注入，平台不覆盖
