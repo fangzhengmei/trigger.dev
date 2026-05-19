@@ -110,8 +110,8 @@ task_runs_v2（原始任务运行表）
 | **引擎** | `AggregatingMergeTree()` | `SummingMergeTree(count)` |
 | **主键** | `(org, project, env, task, fingerprint)` | `(org, project, env, task, fingerprint, version, minute)` |
 | **聚合粒度** | 错误组级别（跨时间） | 分钟 + 任务版本级别 |
-| **存储内容** | 聚合状态（State）：<br>`first_seen`(minState)<br>`last_seen`(maxState)<br>`occurrence_count`(sumState)<br>`sample_*`(anyState) | 原始计数字段：<br>`count UInt64` |
-| **查询方式** | 用 `-Merge` 函数合并状态：<br>`sumMerge(occurrence_count)`<br>`minMerge(first_seen)`<br>`maxMerge(last_seen)` | 直接 `sum(count)` 聚合 |
+| **存储内容** | 聚合状态（State）：<br>`first_seen` SimpleAggregateFunction(min, ...)<br>`last_seen` SimpleAggregateFunction(max, ...)<br>`occurrence_count` AggregateFunction(sum, ...)<br>`sample_*` AggregateFunction(any, ...) | 原始计数字段：<br>`count UInt64` |
+| **查询方式** | **SimpleAggregateFunction** 直接用聚合函数：<br>`min(first_seen)`、`max(last_seen)`<br>**AggregateFunction** 用 `-Merge` 合并：<br>`sumMerge(occurrence_count)`、`anyMerge(sample_*)` | 直接 `sum(count)` 聚合 |
 | **适用场景** | 错误组列表、首次/末次出现时间、总次数 | 时间范围统计、忽略阈值检查、趋势图表 |
 | **TTL** | 90 天 | 90 天 |
 
@@ -131,8 +131,13 @@ ORDER BY (organization_id, project_id, environment_id, task_identifier, error_fi
 
 **关键特点**：
 - `AggregatingMergeTree` 存储的是**聚合函数的状态（State）**，不是最终结果
-- 写入时使用 `sumState()`、`minState()`、`maxState()` 等函数
-- 查询时必须使用对应的 `sumMerge()`、`minMerge()`、`maxMerge()` 合并状态
+- 字段分为两类：
+  - `SimpleAggregateFunction(min/max, ...)`：存储简单聚合状态
+  - `AggregateFunction(sum/any, ...)`：存储复杂聚合状态
+- 写入时物化视图使用 `min()`、`max()`、`sumState()`、`anyState()` 等函数
+- 查询时：
+  - `SimpleAggregateFunction` 直接用 `min()` / `max()` 函数
+  - `AggregateFunction` 必须用对应的 `sumMerge()` / `anyMerge()` 合并状态
 - 按错误组主键自动合并，相同组的多行数据会在后台合并为一行
 
 ### 3.4 `error_occurrences_v1` 详解
@@ -160,13 +165,16 @@ SELECT
   environment_id, task_identifier, error_fingerprint,
   any(error_type) as error_type,
   any(error_message) as error_message,
-  toString(toUnixTimestamp64Milli(minMerge(first_seen))) as first_seen,
-  toString(toUnixTimestamp64Milli(maxMerge(last_seen))) as last_seen,
+  any(sample_stack_trace) as sample_stack_trace,
+  toString(toUnixTimestamp64Milli(min(first_seen))) as first_seen,
+  toString(toUnixTimestamp64Milli(max(last_seen))) as last_seen,
   toUInt64(sumMerge(occurrence_count)) as occurrence_count
 FROM trigger_dev.errors_v1
 GROUP BY environment_id, task_identifier, error_fingerprint
-HAVING toInt64(maxMerge(last_seen)) > {scheduledAt}
+HAVING toInt64(max(last_seen)) > {scheduledAt}
 ```
+
+**注意**：`first_seen` / `last_seen` 是 `SimpleAggregateFunction`，直接用 `min()` / `max()`；`occurrence_count` 是 `AggregateFunction`，必须用 `sumMerge()`。
 
 **查询时间段内发生次数（error_occurrences_v1）**：
 ```sql
@@ -364,4 +372,4 @@ Alerts Worker 消费任务
 2. **规范化粒度**：过于激进的规范化可能导致不同错误被错误归组
 3. **评估间隔**：默认 5 分钟，告警存在最多 5 分钟延迟
 4. **忽略阈值计算**：基于滑动窗口，窗口大小 = 当前时间 - 上次调度时间
-5. **AggregatingMergeTree 查询**：必须使用 `-Merge` 函数，否则得到的是二进制状态而非可读数值
+5. **AggregatingMergeTree 查询**：`SimpleAggregateFunction` 直接用聚合函数（min/max），`AggregateFunction` 必须用 `-Merge` 函数，否则得到的是二进制状态而非可读数值
