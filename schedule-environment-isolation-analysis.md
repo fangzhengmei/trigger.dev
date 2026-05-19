@@ -596,19 +596,9 @@ getWorkerQueue(E)
         │
         ├─► E.type === DEVELOPMENT
         │       │
-        │       └─► masterQueue = E.id
+        │       └─► masterQueue = E.id  (特殊处理)
         │
-        └─► E.type === STAGING
-        │       │
-        │       ├─► 检查RUN_ENGINE_WORKER_QUEUE_OVERRIDES
-        │       │       │
-        │       │       ├─► 有environmentId覆盖 → 使用覆盖值
-        │       │       │
-        │       │       └─► 无 → 查询项目默认worker组
-        │       │
-        │       └─► 返回workerGroup.queueName
-        │
-        └─► E.type === PRODUCTION
+        └─► E.type === STAGING / PRODUCTION / PREVIEW
                 │
                 ├─► 检查RUN_ENGINE_WORKER_QUEUE_OVERRIDES
                 │       │
@@ -616,17 +606,22 @@ getWorkerQueue(E)
                 │       │
                 │       └─► 无 → 查询项目默认worker组
                 │
-                └─► 返回workerGroup.queueName
+                └─► 返回workerGroup.masterQueue
 ```
 
-**Staging与Production的运行器隔离方式**:
+**各环境运行器隔离方式对比**:
 
 | 场景 | 隔离方式 | 代码位置 |
 |------|---------|----------|
-| **默认情况** | STAGING和PRODUCTION共享项目默认worker组 | queues.server.ts:383-391 |
-| **需要隔离** | 通过`RUN_ENGINE_WORKER_QUEUE_OVERRIDES按environmentId精确指定 | workerQueueResolver.ts:50-52 |
-| **开发环境** | 每个DEVELOPMENT环境独立队列 | queues.server.ts:378-380 |
-| **预览分支** | 每个PREVIEW分支环境独立队列（同开发环境） | queues.server.ts:378-380 |
+| **DEVELOPMENT** | 每个开发环境独立队列，`masterQueue = environment.id` | queues.server.ts:380-381 |
+| **STAGING** | 默认共享项目worker组，可通过覆盖配置隔离 | queues.server.ts:384-407 |
+| **PRODUCTION** | 默认共享项目worker组，可通过覆盖配置隔离 | queues.server.ts:384-407 |
+| **PREVIEW** | 默认共享项目worker组，可通过覆盖配置隔离 | queues.server.ts:384-407 |
+
+**关键代码事实**:
+- `queues.server.ts:380` 只对 `environment.type === "DEVELOPMENT"` 有特殊处理
+- STAGING、PRODUCTION、PREVIEW 都通过 `WorkerGroupService.getDefaultWorkerGroupForProject()` 获取项目默认worker组
+- 三类环境都支持 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按 `environmentId` 精确指定队列
 
 ---
 
@@ -1149,13 +1144,60 @@ environmentId > projectId > orgId > workerQueue
 
 ---
 
-## 8. 总结
+## 9. 总结
+
+### 9.1 分支与环境选择决策链总览
+
+"按项目和分支选定运行环境"的完整决策链如下:
+
+```
+用户部署 → CLI参数解析 → 环境类型匹配 → 分支映射 → 环境ID确定
+                                                          │
+                                                          ▼
+                                                创建/更新调度实例
+                                                          │
+                                                          ▼
+                                                调度触发 → 运行器选择 → 执行
+```
+
+**关键决策点**:
+
+1. **项目级别**: 每个项目有独立的 `BranchTrackingConfig` 定义分支→环境映射
+2. **环境类型**:
+   - `PRODUCTION`: 关联 `branchTracking.prod.branch`（如 "main"）
+   - `STAGING`: 关联 `branchTracking.staging.branch`（如 "develop"）
+   - `PREVIEW`: 每个Git分支创建独立的子环境，`branchName` 字段存储分支名
+   - `DEVELOPMENT`: 无分支关联
+
+3. **调度实例归属**:
+   - 部署时 `syncDeclarativeSchedules` 为当前环境创建/更新调度实例
+   - 每个调度实例的 `environmentId` 精确绑定到特定环境
+   - 支持按环境类型过滤（`task.schedule.environments`）
+
+4. **运行器路由**:
+   - `DEVELOPMENT` 和 `PREVIEW` 环境: 使用 `environment.id` 作为队列名，强隔离
+   - `STAGING` 和 `PRODUCTION`: 默认共享项目worker组，可通过 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按环境ID精确指定
+
+### 9.2 Staging与Production隔离机制
+
+| 维度 | Staging | Production | 隔离机制 |
+|------|---------|------------|----------|
+| **数据模型** | 独立的RuntimeEnvironment记录，`type=STAGING` | 独立的RuntimeEnvironment记录，`type=PRODUCTION` | 独立的数据库记录，独立的apiKey |
+| **分支映射** | `branchTracking.staging.branch` | `branchTracking.prod.branch` | 通过BranchTrackingConfig分别配置 |
+| **调度实例** | 独立的TaskScheduleInstance，`environmentId=staging_env_id` | 独立的TaskScheduleInstance，`environmentId=prod_env_id` | 每个环境独立的调度实例 |
+| **运行队列** | 默认共享项目worker组，可通过覆盖配置隔离 | 默认共享项目worker组，可通过覆盖配置隔离 | 支持RUN_ENGINE_WORKER_QUEUE_OVERRIDES按environmentId精确指定 |
+| **执行环境** | 部署到staging环境的worker版本 | 部署到production环境的worker版本 | 独立部署，独立版本管理 |
+
+### 9.3 多层隔离机制总结
 
 整个系统通过**多层隔离机制**确保staging和production环境的调度信号正确隔离:
 
 1. **数据隔离**: 独立的环境记录和调度实例
 2. **认证隔离**: 每个环境独立的API密钥
-3. **路由隔离**: 按环境类型选择不同的worker队列策略
-4. **运行隔离**: 消息携带环境标识，物理存储在不同的Redis队列
+3. **分支隔离**: 通过BranchTrackingConfig建立分支与环境的映射
+4. **调度隔离**: 每个环境独立的调度实例，可按环境类型过滤
+5. **路由隔离**: 按环境类型选择不同的worker队列策略
+6. **运行隔离**: 消息携带环境标识，物理存储在不同的Redis队列
+7. **部署隔离**: 独立的部署流程和版本管理
 
 这种设计既保证了环境间的强隔离，又通过统一的 `AuthenticatedEnvironment` 对象简化了跨服务的环境信息传递，是一个典型的"边界清晰、上下文贯穿"的架构设计。
