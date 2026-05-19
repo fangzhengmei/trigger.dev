@@ -218,6 +218,22 @@ resolveVariablesForEnvironment()
 
 这是 CLI 和 SDK 获取环境变量的主要接口。
 
+### 4.2 isSecret 变量的返回行为（关键细节）
+
+**结论**: `/api/v1/projects/:projectRef/envvars` 返回 isSecret 变量的**明文值**。
+
+**代码证据**:
+- `api.v1.projects.$projectRef.envvars.ts:54-64` 调用 `resolveVariablesForEnvironment()`
+- `resolveVariablesForEnvironment()` 调用 `environmentVariablesRepository.getEnvironmentVariables()`
+- `getEnvironmentVariables()` 调用 `#getSecretEnvironmentVariables()`
+- `#getSecretEnvironmentVariables()` (`environmentVariablesRepository.server.ts:645-685`) 直接从 secretStore 读取所有密钥的明文值，**没有做任何脱敏处理**
+- 最后仅通过 `removeBlacklistedVariables()` 过滤黑名单变量（`TRIGGER_SECRET_KEY`、`TRIGGER_API_URL`）
+
+**对比 UI 端**:
+UI 端使用 `getEnvironmentWithRedactedSecrets()` 方法，该方法会将 isSecret 标记的变量值替换为 `<redacted>`。
+
+**安全说明**: 该 API 受 API Key 保护，只有拥有有效 API Key 的可信客户端才能访问。
+
 ## 五、构建时注入
 
 ### 5.1 CLI 构建流程
@@ -250,7 +266,26 @@ const workerManifest = await indexWorkerManifest({
 
 ## 六、任务执行时注入
 
-### 6.1 Supervisor 容器创建
+### 6.1 环境变量获取链路（生产环境）
+
+```
+Worker 启动
+  ↓
+调用 startRunAttempt API (POST /engine/v1/worker-actions/runs/.../attempts/start)
+  ↓
+平台端 workerGroupTokenService.server.ts:409-457
+  ├─ 调用 engine.startRunAttempt()
+  ├─ 查询 RuntimeEnvironment（含 parentEnvironment）
+  ├─ 调用 resolveVariablesForEnvironment() 获取用户变量 + 内置变量
+  ├─ 生成 TRIGGER_JWT、TRIGGER_RUN_ID、TRIGGER_MACHINE_PRESET
+  └─ 返回 { ...engineResult, envVars: Record<string, string> }
+  ↓
+Worker 收到 envVars，通过 IPC 传递给子进程
+  ↓
+子进程调用 populateEnv(env, { override: true })
+```
+
+### 6.2 Supervisor 容器创建
 Supervisor 在创建任务执行容器时注入系统级环境变量：
 
 #### Docker 方式
@@ -288,7 +323,7 @@ if (this.opts.additionalEnvVars) {
 
 通过 `env` 对象传递给计算实例。
 
-### 6.2 运行时进程填充
+### 6.3 运行时进程填充
 **文件**: `packages/core/src/v3/workers/populateEnv.ts`
 
 ```typescript
@@ -320,6 +355,93 @@ export function populateEnv(
 ```
 
 **默认行为**: 不覆盖已存在的 `process.env` 变量。
+
+### 6.4 Supervisor 预置变量与 populateEnv 的冲突处理（关键细节）
+
+**核心结论**: 平台返回的 envVars 优先级高于 Supervisor 预置变量，**会覆盖同名键**。
+
+**代码证据**:
+
+1. **开发环境调用** (`packages/cli-v3/src/entryPoints/managed-run-worker.ts:374-381`):
+   ```typescript
+   EXECUTE_TASK_RUN: async (
+     { execution, traceContext, metadata, metrics, env, isWarmStart },
+     sender
+   ) => {
+     if (env) {
+       populateEnv(env, {
+         override: true,  // 显式传入 true
+         previousEnv: _lastEnv,
+       });
+       _lastEnv = env;
+     }
+     // ...
+   }
+   ```
+
+2. **生产环境调用** (`packages/cli-v3/src/executions/taskRunProcess.ts:305-312`):
+   ```typescript
+   await this._ipc?.send("EXECUTE_TASK_RUN", {
+     execution,
+     traceContext,
+     metadata: this.options.serverWorker,
+     metrics,
+     env: params.env,  // 从平台获取的 envVars
+     isWarmStart: isWarmStart ?? this.options.isWarmStart,
+   });
+   ```
+
+3. **envVars 来源** (`apps/webapp/app/v3/services/worker/workerGroupTokenService.server.ts:545-580`):
+   ```typescript
+   private async getEnvVars(
+     environment: RuntimeEnvironment,
+     runId: string,
+     machinePreset: MachinePreset,
+     parentEnvironment?: RuntimeEnvironment,
+     taskEventStore?: string
+   ): Promise<Record<string, string>> {
+     const variables = await resolveVariablesForEnvironment(environment, parentEnvironment);
+     
+     // 添加运行时变量
+     variables.push(
+       ...[
+         { key: "TRIGGER_JWT", value: jwt },
+         { key: "TRIGGER_RUN_ID", value: runId },
+         { key: "TRIGGER_MACHINE_PRESET", value: machinePreset.name },
+       ]
+     );
+     // ...
+     return variables.reduce((acc, v) => ({ ...acc, [v.key]: v.value }), {});
+   }
+   ```
+
+**生效顺序总结**（从低到高）:
+
+```
+1. 容器基础环境变量 (OS / Docker 基础镜像)
+   ↓
+2. Supervisor 预置变量 (创建容器时注入)
+   ├─ OTEL_EXPORTER_OTLP_ENDPOINT
+   ├─ TRIGGER_DEQUEUED_AT_MS
+   ├─ TRIGGER_POD_SCHEDULED_AT_MS
+   ├─ TRIGGER_ENV_ID
+   ├─ TRIGGER_DEPLOYMENT_ID
+   ├─ TRIGGER_MACHINE_CPU
+   ├─ TRIGGER_MACHINE_MEMORY
+   └─ ... 其他系统变量
+   ↓
+3. 平台返回的 envVars (通过 populateEnv({ override: true }) 注入)
+   ├─ overridableTriggerVariables (最低)
+   ├─ overridableOtelVariables (dev only)
+   ├─ projectSecrets (用户变量，含 isSecret 明文)
+   ├─ builtInVariables (TRIGGER_SECRET_KEY, TRIGGER_API_URL 等)
+   └─ 运行时追加 (TRIGGER_JWT, TRIGGER_RUN_ID, TRIGGER_MACHINE_PRESET)
+```
+
+**注意**:
+- 虽然 `populateEnv` 的默认值是 `override: false`，但实际调用时**总是**传入 `override: true`
+- 这意味着平台返回的 envVars 会覆盖 Supervisor 预置的同名变量
+- 只有当平台返回的 envVars 中不包含某个键时，才会保留 Supervisor 预置的值
 
 ## 七、完整路径总结
 
@@ -356,16 +478,19 @@ export function populateEnv(
 ┌──────────────────┐ ┌──────────────────┐ ┌──────────────────┐
 │  API 暴露         │ │  构建时注入       │ │  任务执行注入     │
 │  GET /envvars     │ │  Dockerfile      │ │  Supervisor       │
-│  CLI/SDK 获取     │ │  镜像构建阶段     │ │  创建容器时       │
-│                  │ │  indexWorker     │ │  - Docker/K8s/    │
-│                  │ │  populateEnv()   │ │    Compute        │
-│                  │ │                  │ │  - populateEnv()  │
+│  返回 isSecret    │ │  镜像构建阶段     │ │  创建容器时注入   │
+│  明文值           │ │  indexWorker     │ │  预置系统变量     │
+│                  │ │  populateEnv()   │ │    ↓              │
+│                  │ │                  │ │  平台返回 envVars  │
+│                  │ │                  │ │  populateEnv({     │
+│                  │ │                  │ │    override: true  │
+│                  │ │                  │ │  }) 覆盖预置变量  │
 └──────────────────┘ └──────────────────┘ └──────────────────┘
 ```
 
 ## 八、关键注意事项
 
-1. **黑名单保护**: `TRIGGER_SECRET_KEY` 和 `TRIGGER_API_URL` 无法被用户覆盖，由系统自动注入
+1. **黑名单保护**: `TRIGGER_SECRET_KEY` 和 `TRIGGER_API_URL` 无法被用户设置，由系统自动注入
 
 2. **环境继承**: 子环境变量会覆盖父环境的同名变量
 
@@ -375,6 +500,8 @@ export function populateEnv(
 
 5. **版本追踪**: 每个环境变量值都有 `version` 字段，每次更新递增
 
-6. **密钥标记**: `isSecret` 标记的变量在 UI 中不会显示明文，也不会通过 API 返回
+6. **密钥标记**: `isSecret` 标记的变量在 UI 中显示为 `<redacted>`，但通过 API `/api/v1/projects/:projectRef/envvars` 返回明文值
 
-7. **运行时覆盖**: `populateEnv()` 默认不覆盖 `process.env` 中已存在的变量，除非指定 `override: true`
+7. **运行时覆盖**: `populateEnv()` 默认不覆盖 `process.env` 中已存在的变量，但在任务执行时**总是**传入 `override: true`，因此平台返回的 envVars 会覆盖 Supervisor 预置的同名变量
+
+8. **API 安全**: `/api/v1/projects/:projectRef/envvars` 和 worker-actions API 都受认证保护（API Key / Worker Token）
