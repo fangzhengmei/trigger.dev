@@ -515,8 +515,33 @@ export function populateEnv(
 
 | 来源 | 注入位置 | 变量名 | 值来源 | 值语义 |
 |------|----------|--------|--------|--------|
-| Supervisor | 容器创建时 (docker.ts:77) | `TRIGGER_RUN_ID` | `opts.runFriendlyId` | **friendlyId** - 对外友好 ID，如 `run_abc123xyz` |
-| 平台 envVars | 运行时注入 (workerGroupTokenService.server.ts:562) | `TRIGGER_RUN_ID` | `engineResult.run.id` | **internal runId** - 数据库主键 ID，UUID 格式 |
+| Supervisor | 容器创建时 (docker.ts:77) | `TRIGGER_RUN_ID` | `opts.runFriendlyId` | **friendlyId** - 对外友好 ID，格式 `{prefix}_{nanoid(21)}`，如 `run_abc123xyz...` |
+| 平台 envVars | 运行时注入 (workerGroupTokenService.server.ts:562) | `TRIGGER_RUN_ID` | `engineResult.run.id` | **internal runId** - 数据库主键 ID，**cuid 格式**，如 `cjld2cyuq0000t3rmniod1foy` |
+
+**格式依据** (`friendlyId.ts:1-12`):
+```typescript
+// friendlyId: 前缀 + 21位 nanoid (字母数字混合)
+const idGenerator = customAlphabet("123456789abcdefghijkmnopqrstuvwxyz", 21);
+export function generateFriendlyId(prefix: string) {
+  return `${prefix}_${idGenerator()}`;  // 如 "run_abc123..."
+}
+
+// internalId: cuid 格式 (25字符，以 c 开头)
+export function generateInternalId() {
+  return cuid();  // 如 "cjld2cyuq0000t3rmniod1foy"
+}
+```
+
+**转换关系** (`friendlyId.ts:15-58`):
+```typescript
+// internalId → friendlyId: 加前缀
+toFriendlyId("run", "cjld2cyuq0000t3rmniod1foy") 
+  → "run_cjld2cyuq0000t3rmniod1foy"
+
+// friendlyId → internalId: 去掉前缀
+fromFriendlyId("run_cjld2cyuq0000t3rmniod1foy")
+  → "cjld2cyuq0000t3rmniod1foy"
+```
 
 ### 9.2 代码证据
 
@@ -550,11 +575,73 @@ private async getEnvVars(environment, runId, ...) {
 }
 ```
 
+### 9.2 完整两阶段注入时序
+
+TRIGGER_RUN_ID 经历两次注入，时序如下：
+
+```
+阶段 1: 进程创建时注入 (initialize)
+├─ 来源: Supervisor 预置变量 (容器创建时传入)
+├─ 位置: taskRunProcess.ts:137-166
+├─ 代码:
+│   const fullEnv = {
+│     ...$env,                      // $env 包含 Supervisor 预置的所有变量
+│     OTEL_IMPORT_HOOK_INCLUDES: ...,
+│     NODE_OPTIONS: ...,
+│     PATH: process.env.PATH,
+│     TRIGGER_PROCESS_FORK_START_TIME: String(Date.now()),
+│     TRIGGER_WARM_START: "true" | "false",
+│     TRIGGERDOTDEV: "1",
+│   };
+│   this._child = fork(workerEntryPoint, args, { env: fullEnv });
+├─ 此时 process.env.TRIGGER_RUN_ID = friendlyId (如 "run_abc123...")
+└─ 时序: 子进程启动时
+
+阶段 2: EXECUTE_TASK_RUN 消息处理时注入
+├─ 来源: 平台返回的 envVars
+├─ 位置: managed-run-worker.ts:370-381 (开发环境) / taskRunProcess.ts:305-312 (生产环境)
+├─ 代码:
+│   EXECUTE_TASK_RUN: async ({ env, ... }) => {
+│     if (env) {
+│       populateEnv(env, {
+│         override: true,        // 关键：强制覆盖
+│         previousEnv: _lastEnv,
+│       });
+│       _lastEnv = env;
+│     }
+│   }
+├─ 此时 process.env.TRIGGER_RUN_ID 被覆盖为 internal runId (如 "cjld2cyuq0000t3rmniod1foy")
+└─ 时序: 每个任务执行前
+```
+
+**生产环境完整调用链**:
+```
+managed/execution.ts:executeRun()
+  ├─ const start = await this.httpClient.startRunAttempt(runFriendlyId, ...)
+  │   └─ 返回 { ..., envVars: Record<string, string> }  // 含 internal runId
+  ├─ this.taskRunProcess = await this.taskRunProcessProvider.getProcess({
+  │   taskRunEnv: { ...taskRunEnv, TRIGGER_PROJECT_REF: ... },
+  │   isWarmStart,
+  │ })
+  │   └─ 阶段 1: 进程创建，注入 Supervisor 变量 (friendlyId)
+  └─ const completion = await this.taskRunProcess.execute({
+       payload: { execution, ... },
+       messageId: run.friendlyId,
+       env: envVars,  // 阶段 2: 传入平台 envVars
+     })
+     └─ IPC 发送 EXECUTE_TASK_RUN 消息，触发 populateEnv({ override: true })
+```
+
 ### 9.3 最终生效结果
 
-由于 `populateEnv` 调用时传入 `{ override: true }`，**平台返回的 internal runId 会覆盖 Supervisor 注入的 friendlyId**。
+由于 `populateEnv` 调用时**总是**传入 `{ override: true }`，**平台返回的 internal runId 会覆盖 Supervisor 注入的 friendlyId**。
 
-**结论**: `process.env.TRIGGER_RUN_ID` 的最终值是 **internal runId（数据库 UUID）**。
+**结论**: `process.env.TRIGGER_RUN_ID` 的最终值是 **internal runId（cuid 格式，如 `cjld2cyuq0000t3rmniod1foy`）**。
+
+**取值依据**:
+1. 进程创建时：`process.env.TRIGGER_RUN_ID = run_<nanoid(21)>` (Supervisor 注入)
+2. 任务执行前：`process.env.TRIGGER_RUN_ID = <cuid>` (平台 envVars 覆盖)
+3. 任务代码中读取：获取到的是 internal runId (cuid)
 
 ## 十、实际冲突键清单
 
@@ -610,13 +697,73 @@ private async getEnvVars(environment, runId, ...) {
 | `CUSTOM_OTEL_RESOURCE_ATTRIBUTES` | projectSecrets | 用户自定义 OTEL 属性 |
 | 用户自定义变量 | projectSecrets | 用户在面板设置的变量 |
 
-### 10.4 特殊说明
+### 10.4 additionalEnvVars 动态冲突分析
 
-1. **`additionalEnvVars` 扩展**: Supervisor 支持通过 `this.opts.additionalEnvVars` 注入额外变量，这些变量也会受到平台 envVars 的覆盖影响（如果键名冲突）。
+**additionalEnvVars 机制** (`docker.ts:107-111`, `kubernetes.ts:249-254`, `compute.ts:108-110`):
+```typescript
+// 三种部署方式都支持通过 additionalEnvVars 注入额外变量
+if (this.opts.additionalEnvVars) {
+  Object.entries(this.opts.additionalEnvVars).forEach(([key, value]) => {
+    envVars.push(`${key}=${value}`);  // 追加到环境变量列表末尾
+  });
+}
+```
 
-2. **环境差异**: 
+**注入位置**: 在 Supervisor 预置变量之后、容器创建之前，因此优先级高于 Supervisor 预置变量，但仍然低于平台 envVars。
+
+**动态冲突边界**:
+
+| 冲突类型 | 判定条件 | 最终生效 |
+|----------|----------|----------|
+| additionalEnvVars vs Supervisor 预置 | key 相同 | additionalEnvVars 值（后追加覆盖先追加） |
+| additionalEnvVars vs 平台 envVars | key 相同 | 平台 envVars 值（`populateEnv({ override: true })` 覆盖） |
+| additionalEnvVars vs 用户自定义变量 | key 相同 | 用户自定义变量（包含在平台 envVars 中） |
+
+### 10.5 固定冲突键 vs 动态冲突键
+
+#### 固定冲突键（必然冲突，与部署配置无关）
+
+这些键在 Supervisor 预置变量和平台 envVars 中都必然存在，冲突是确定的：
+
+| 变量名 | 冲突场景 | 最终生效 | 备注 |
+|--------|----------|----------|------|
+| `TRIGGER_RUN_ID` | 所有环境 | 平台值 (internal runId) | 语义差异大，friendlyId → cuid |
+| `OTEL_EXPORTER_OTLP_ENDPOINT` | 仅开发环境 | 平台值 | 生产环境平台不返回此键 |
+
+#### 动态冲突键（取决于部署配置）
+
+这些键是否冲突取决于 `additionalEnvVars` 的配置：
+
+| 可能冲突的键 | 冲突条件 | 最终生效 |
+|--------------|----------|----------|
+| `TRIGGER_SECRET_KEY` | additionalEnvVars 中设置 | 平台值（平台必然返回） |
+| `TRIGGER_API_URL` | additionalEnvVars 中设置 | 平台值（平台必然返回） |
+| `TRIGGER_STREAM_URL` | additionalEnvVars 中设置 | 平台值（平台必然返回） |
+| `TRIGGER_ORG_ID` | additionalEnvVars 中设置 | 平台值（平台必然返回） |
+| `TRIGGER_JWT` | additionalEnvVars 中设置 | 平台值（运行时追加） |
+| `TRIGGER_MACHINE_PRESET` | additionalEnvVars 中设置 | 平台值（运行时追加） |
+| `TRIGGER_OTEL_*` | additionalEnvVars 中设置 | 平台值（如果平台返回） |
+| `OTEL_*` (开发环境) | additionalEnvVars 中设置 | 平台值（开发环境返回） |
+| 用户自定义变量名 | additionalEnvVars 中设置同名键 | 平台值（用户变量包含在 envVars 中） |
+
+#### 安全冲突键（不建议在 additionalEnvVars 中设置）
+
+这些键由平台控制，在 additionalEnvVars 中设置会被静默覆盖，造成配置迷惑：
+
+- `TRIGGER_SECRET_KEY` - 环境 API Key，平台从数据库读取
+- `TRIGGER_API_URL` - 平台 API 地址，由平台配置决定
+- `TRIGGER_JWT` - 任务执行令牌，每次运行动态生成
+- `TRIGGER_RUN_ID` - 任务运行 ID，语义差异大
+
+### 10.6 环境差异与特殊变量
+
+1. **环境差异**: 
    - 开发环境可能有更多 OTEL 相关变量冲突（`overridableOtelVariables` 仅开发环境生效）
    - 生产环境冲突较少，主要是 `TRIGGER_RUN_ID`
 
-3. **Kubernetes 特有变量**:
+2. **Kubernetes 特有变量**:
    - `LIMITS_CPU`、`LIMITS_MEMORY`、`LIMITS_EPHEMERAL_STORAGE` 等 K8s downward API 变量仅 Supervisor 注入，平台不覆盖
+   - 这些变量使用 K8s fieldRef / resourceFieldRef，值由 K8s 系统提供
+
+3. **Compute 特有变量**:
+   - 某些云服务商 Compute 实例可能注入特有元数据变量，平台不覆盖
