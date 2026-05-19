@@ -1011,9 +1011,182 @@ const finalStatuses: TaskRunStatus[] = [
 
 ---
 
+### 6.11 时序风险：执行中任务取消的状态不一致问题
+
+这是整个协同链路中最微妙、最容易出问题的时序细节。
+
+#### 6.11.1 问题场景
+
+考虑以下典型场景：
+```
+父任务执行 batch.triggerAndWait([task_1, task_2])
+    │
+    ├─→ task_1: 正在 EXECUTING（执行耗时任务）
+    └─→ task_2: 正在 EXECUTING（执行耗时任务）
+```
+
+用户在 Dashboard 选择"取消所有运行" → Bulk CANCEL Action
+
+#### 6.11.2 V2 引擎的时序风险
+
+**关键代码** (`runAttemptSystem.ts:1456-1486`):
+
+```typescript
+if (isExecuting(latestSnapshot.executionStatus) || isPendingExecuting(latestSnapshot.executionStatus)) {
+  if (!finalizeRun) {
+    const newSnapshot = await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
+      run,
+      snapshot: {
+        executionStatus: "PENDING_CANCEL",  // ⚠️  内部状态
+        description: "Run was cancelled",
+      },
+      // ...
+    });
+
+    await sendNotificationToWorker({ runId, snapshot: newSnapshot, ... });
+    
+    // ⚠️  关键：直接 return，不调用 #finalizeRun！
+    return {
+      alreadyFinished: false,
+      ...executionResultFromSnapshot(newSnapshot),
+    };
+  }
+}
+```
+
+**完整时序**：
+
+```
+时间轴：
+  T0: task_1 EXECUTING, task_2 EXECUTING
+  T1: 用户发起取消
+  T2: 处理 task_1 取消
+        ├─→ taskRun.status = "CANCELED"  (数据库已更新！)
+        ├─→ executionSnapshot.executionStatus = "PENDING_CANCEL"
+        ├─→ 通知 worker 取消
+        └─→ return  (⚠️  不调用 #finalizeRun)
+  T3: 处理 task_2 取消
+        ├─→ taskRun.status = "CANCELED"  (数据库已更新！)
+        ├─→ executionSnapshot.executionStatus = "PENDING_CANCEL"
+        ├─→ 通知 worker 取消
+        └─→ return  (⚠️  不调用 #finalizeRun)
+  T4: 此时：
+        ├─→ task_1.status = "CANCELED" (终态)
+        ├─→ task_2.status = "CANCELED" (终态)
+        ├─→ 但两个任务都还在 worker 上执行！
+        └─→ 没有触发任何批次检测！
+  T5: worker 收到取消通知，终止 task_1
+  T6: worker 调用 completeRunAttempt → attemptFailed → permanentlyFailRun
+  T7: task_1 调用 #finalizeRun → scheduleCompleteBatch (去抖动 200ms)
+  T8: worker 收到取消通知，终止 task_2
+  T9: worker 调用 completeRunAttempt → attemptFailed → permanentlyFailRun
+  T10: task_2 调用 #finalizeRun → scheduleCompleteBatch (去重，合并到 T7 的任务)
+  T11: 200ms 后，tryCompleteBatch 执行
+        ├─→ 查询所有运行 status：都是 CANCELED
+        └─→ 批次完成，恢复父任务
+```
+
+**风险点**：
+- 在 T4 时刻，两个任务的 `status` 已经是 `CANCELED`（终态），但还在 worker 上执行
+- 如果此时有**其他触发批次检测的事件**（比如第三个运行自然完成），批次检测会查询到所有运行都是终态，从而**提前完成批次**
+- 父任务可能在 worker 实际终止任务前就恢复了！
+
+**触发提前恢复的条件**：
+1. ✅ 被取消的任务 status 已经是 CANCELED（终态）
+2. ✅ 有其他事件触发批次检测（不是被取消任务自己触发的）
+3. ✅ 批次检测查询时，所有运行的 status 都是终态
+
+**不会提前恢复的条件**（正常情况）：
+1. ❌ 被取消的任务自己不触发批次检测（PENDING_CANCEL 路径 return 了）
+2. ❌ 如果没有其他运行终态化，就不会有其他触发事件
+3. ❌ 批次检测永远不会被触发，直到 worker 回执
+
+#### 6.11.3 V1 引擎的时序风险
+
+V1 引擎没有 PENDING_CANCEL 状态，取消流程更简单，但同样存在时序风险。
+
+```typescript
+// cancelTaskRunV1.server.ts:64-129
+public async call(taskRun, options?) {
+  // 1. 直接设置 status = CANCELED
+  const cancelledTaskRun = await finalizeService.call({
+    status: "CANCELED",
+    attemptStatus: "CANCELED",
+    // ...
+  });
+
+  // 2. 触发批次检测（如果不在跳过分支）
+  // FinalizeTaskRunService.call() 内部会调用 #finalizeBatch()
+
+  // 3. 然后才通知 worker 取消
+  if (opts.cancelAttempts) {
+    await this.#cancelPotentiallyRunningAttempts(cancelledTaskRun, cancelledTaskRun.attempts);
+    await this.#cancelRemainingRunWorkers(cancelledTaskRun);
+  }
+
+  return { id: cancelledTaskRun.id };
+}
+```
+
+**V1 时序**：
+```
+T0: task_1 EXECUTING, task_2 EXECUTING
+T1: 处理 task_1 取消
+      ├─→ taskRun.status = "CANCELED"
+      ├─→ #finalizeBatch() → 如果不在跳过分支，触发批次检测
+      └─→ 通知 worker 取消
+T2: 如果批次检测在 T1 就触发了
+      ├─→ 查询 task_1.status = CANCELED
+      ├─→ 查询 task_2.status = EXECUTING（还没处理取消）
+      └─→ 批次未完成，不恢复父任务
+T3: 处理 task_2 取消
+      ├─→ taskRun.status = "CANCELED"
+      ├─→ #finalizeBatch() → 触发批次检测
+      └─→ 通知 worker 取消
+T4: 批次检测执行
+      ├─→ 查询所有运行 status：都是 CANCELED
+      └─→ 批次完成，恢复父任务
+T5: worker 收到取消通知，终止 task_1 和 task_2（可能已经在 T4 之后！）
+```
+
+**V1 的特殊情况**：
+- 如果是**生产环境 + triggerAndWait**，`#finalizeBatch` 会**跳过**批次检测
+- 这种情况下，V1 不会有提前恢复的风险（因为根本不触发批次检测）
+- 批次完成由 `resumeDependentParents` 机制处理
+
+#### 6.11.4 风险总结对比表
+
+| 场景 | V2 引擎 | V1 引擎（非跳过分支） | V1 引擎（生产+triggerAndWait） |
+|------|---------|---------------------|-----------------------------|
+| **取消时更新 status** | ✅ 立即更新为 CANCELED | ✅ 立即更新为 CANCELED | ✅ 立即更新为 CANCELED |
+| **取消时触发批次检测** | ❌ PENDING_CANCEL 路径不触发 | ✅ 触发 | ❌ 跳过 |
+| **是否可能提前恢复** | ⚠️ 有条件可能（需其他触发事件） | ⚠️ 理论可能（概率低） | ❌ 不可能 |
+| **触发提前恢复的条件** | 有其他运行终态化触发检测 | 批量取消时前几个运行已更新 | 无（根本不触发检测） |
+| **worker 回执后触发检测** | ✅ completeRunAttempt 路径 | ❌ 无（V1 没有回执机制） | ❌ 无 |
+
+#### 6.11.5 设计权衡与缓解措施
+
+**为什么这么设计？**
+
+1. **UI 响应性**：用户点击取消后，希望立即看到状态变为 "已取消"，而不是等 worker 回执
+2. **最终一致性**：即使父任务提前恢复，worker 最终还是会终止任务，系统最终一致
+3. **概率低**：需要"其他运行恰好在这个时间窗口终态化"这个巧合条件
+
+**潜在问题**：
+- 父任务恢复后，可能认为批次已经完成，但实际上有些任务还在执行
+- 如果父任务依赖子任务的输出或副作用，可能出现不一致
+- 资源没有及时释放（worker 还在运行已"取消"的任务）
+
+**缓解措施**（代码中已实现）：
+1. **去抖动**：`scheduleCompleteBatch` 有 200ms 延迟，给取消操作留出时间窗口
+2. **执行快照隔离**：`executionStatus = "PENDING_CANCEL"` 是内部状态，不影响 UI 但能控制执行流程
+3. **V1 生产环境跳过**：最危险的场景（生产环境 + triggerAndWait）直接跳过批次检测，交给 resume 机制
+
+---
+
 ## 七、设计权衡与思考
 
-### 8.1 为什么 v1 批次强制顺序处理？
+### 7.1 为什么 v1 批次强制顺序处理？
 
 ```typescript
 // batchTrigger.server.ts:68-72
@@ -1051,13 +1224,14 @@ Batch Trigger 和 Bulk Action 虽然目标不同，但共享了**"批次拆分 �
 
 ### 跨系统协同的关键修正与洞察
 
-#### 最终修正的三处关键口径
+#### 最终修正的四处关键口径
 
 | 口径点 | 之前错误理解 | 实际代码行为 |
 |--------|-------------|-------------|
 | **V1 是否经过 #finalizeRun** | V1 和 V2 都走 Run Engine 的 `#finalizeRun` | **V1 不走**！V1 走 `FinalizeTaskRunService.#finalizeBatch`，生产环境 triggerAndWait 会跳过批次检测 |
 | **V1 不可取消返回的影响** | 只影响 alreadyFinished 分支 | V1 不可取消时返回 `undefined` → `!result` 为 true → **计为 failureCount** |
 | **Replay 对原运行的影响** | 可能修改原运行某些字段 | **完全不修改**！Replay 服务只读原运行配置创建新运行，原运行状态、batchId 等所有字段保持不变 |
+| **执行中任务取消的时序风险** | 取消后立即触发批次检测 | 执行中任务取消时 `taskRun.status` 立即设为 CANCELED，但**不触发批次检测**，需等 worker 回执；存在其他事件触发时的提前恢复风险 |
 
 #### V1 与 V2 批次检测路径的核心差异
 
@@ -1095,10 +1269,23 @@ Batch Trigger 和 Bulk Action 虽然目标不同，但共享了**"批次拆分 �
 ### 设计哲学
 
 整个系统体现了以下设计原则：
-- **解耦优于协调**: Bulk Action 不需要知道批次逻辑，通过 `#finalizeRun` 隐式协同
-- **最终一致性**: 不追求强一致，通过去抖动和重试达到最终一致
-- **用户期望优先**: `CANCELED` 作为终态、父任务及时恢复都是为了符合用户直觉
+- **解耦优于协调**: Bulk Action 不需要知道批次逻辑，通过终态化出口隐式协同
+- **最终一致性**: 不追求强一致，接受短暂的状态不一致，通过去抖动和重试达到最终一致
+- **用户期望优先**: `CANCELED` 作为终态、UI 立即显示取消状态都是为了符合用户直觉
 - **鲁棒性**: 任何环节中断都不会导致系统死锁或状态不一致
 - **语义纯净**: 批次、重播、取消各有清晰的边界，不互相污染
+- **权衡取舍**: 为了 UI 响应性接受小概率的时序风险，通过缓解措施降低影响
+
+### 时序风险总结
+
+执行中任务取消的状态不一致问题是整个协同链路中最微妙的设计权衡：
+
+| 引擎 | 取消时更新 status | 取消时触发检测 | 是否可能提前恢复 | 缓解措施 |
+|------|----------------|--------------|----------------|---------|
+| **V2** | ✅ 立即 CANCELED | ❌ PENDING_CANCEL 不触发 | ⚠️ 有条件可能（需其他触发事件） | 200ms 去抖动 + 执行快照隔离 |
+| **V1（非跳过）** | ✅ 立即 CANCELED | ✅ 触发 | ⚠️ 理论可能（概率低） | 批次检测需要所有运行都是终态 |
+| **V1（生产+triggerAndWait）** | ✅ 立即 CANCELED | ❌ 跳过 | ❌ 不可能 | 完全交给 resume 机制处理 |
+
+**关键启示**：代码不是完美的，存在理论上的时序风险，但在实践中通过去抖动、职责分离等措施将风险控制在可接受范围内。理解这些权衡有助于在遇到问题时快速定位和排查。
 
 理解这些机制有助于在使用 Trigger.dev 时更好地规划批量任务，以及在遇到问题时快速定位。
