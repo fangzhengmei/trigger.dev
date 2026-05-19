@@ -359,22 +359,23 @@ if (!isNewItem) return { enqueued: false };  // 重复项跳过
 
 当 Bulk Action（取消/重播）作用于由 Batch Trigger 生成的运行时，会触发一条复杂的协同链路，涉及**状态回写**、**批次完成判定**和**父任务等待恢复**三个核心环节。
 
-### 6.1 修正说明
+### 6.1 修正说明（最终版：三处关键口径）
 
-之前的分析存在几处与实际代码不符的地方，在此统一修正：
+经过对代码的逐行核查，以下是三处关键口径的最终修正：
 
-| 误解点 | 错误理解 | 实际代码行为 |
-|--------|----------|-------------|
-| 批次检测触发时机 | 只有取消操作触发 | **所有终态化路径**统一通过 `#finalizeRun` 触发（成功/失败/取消） |
-| Replay 对原运行的影响 | 可能先取消原运行 | **不修改原运行**，只创建新运行，原运行状态保持不变 |
-| V1/V2 取消分流 | 无差异 | 分流明确，V1 走 `CancelTaskRunServiceV1`，V2 走 `engine.cancelRun()` |
-| alreadyFinished 计数 | 已完成算成功 | `alreadyFinished: true` 被计为 **failureCount**（失败） |
+| 口径点 | 之前错误理解 | 实际代码行为 |
+|--------|-------------|-------------|
+| **V1 是否经过 #finalizeRun** | V1 和 V2 都走 Run Engine 的 `#finalizeRun` | **V1 不走**！V1 走 `FinalizeTaskRunService.#finalizeBatch`，有特殊条件分支可能跳过批次检测 |
+| **V1 不可取消返回的影响** | 只影响 alreadyFinished 分支 | V1 不可取消时返回 `undefined` → `!result` 为 true → **计为 failureCount** |
+| **Replay 对原运行的影响** | 可能修改原运行某些字段 | **完全不修改**！Replay 服务只读原运行配置创建新运行，原运行状态、batchId 等所有字段保持不变 |
 
 ---
 
-### 6.2 核心机制：#finalizeRun —— 所有终态路径的汇聚点
+### 6.2 核心机制：V1 与 V2 的批次完成检测路径完全分离
 
-**关键发现**: 批次完成检测的触发点不是"取消操作"，而是**所有运行终态化的统一出口**。
+**关键发现**：V1 和 V2 不仅取消逻辑分离，连批次完成检测的触发路径也完全不同。
+
+#### V2 路径：Run Engine 内部的 `#finalizeRun`（V2 专用）
 
 ```typescript
 // runAttemptSystem.ts:1720-1730
@@ -391,64 +392,210 @@ async #finalizeRun({ id, batchId }: { id: string; batchId: string | null }) {
 }
 ```
 
-**调用位置**: 这个方法在以下三个路径中都会被调用：
-1. **运行成功** → `attemptSucceeded()` → L846
-2. **运行失败** → `permanentlyFailRun()` → L1710
-3. **运行取消** → `cancelRun()` → L1514
+**V2 调用路径**：
+- 成功 → `attemptSucceeded()` → L846
+- 失败 → `permanentlyFailRun()` → L1710
+- 取消 → `cancelRun()` → L1514
+- **无论哪种路径，都会触发 `scheduleCompleteBatch`**
+- 没有条件分支，只要 `batchId` 存在就触发
 
-这意味着：
-- 无论是正常完成、失败、还是被取消，只要运行到达终态且属于某个批次，就会触发批次完成检测
-- Bulk Cancel 只是加速了运行到达终态的过程，本身不直接触发批次检测
+#### V1 路径：FinalizeTaskRunService 的 `#finalizeBatch`（V1 专用）
+
+```typescript
+// finalizeTaskRun.server.ts:191-261
+async #finalizeBatch(run: TaskRun) {
+  if (!run.batchId) return;
+
+  const batchItems = await this._prisma.batchTaskRunItem.findMany({
+    where: { taskRunId: run.id },
+    include: { batchTaskRun: { select: { id, dependentTaskAttemptId, batchVersion } } },
+  });
+  
+  for (const item of batchItems) {
+    // ⚠️  关键条件分支
+    // Don't do anything if this is a batchTriggerAndWait in a deployed task
+    // As that is being handled in resumeDependentParents and resumeTaskRunDependencies
+    if (environment.type !== "DEVELOPMENT" && item.batchTaskRun.dependentTaskAttemptId) {
+      continue;  // ⚠️  生产环境 + triggerAndWait → 跳过批次检测！
+    }
+
+    if (item.batchTaskRun.batchVersion === "v3") {
+      await completeBatchTaskRunItemV3(item.id, item.batchTaskRunId, this._prisma);
+    } else {
+      await this._prisma.batchTaskRunItem.update({...});
+      await ResumeBatchRunService.enqueue(item.batchTaskRunId, false);
+    }
+  }
+}
+```
+
+**V1 调用路径**：
+- 取消 → `CancelTaskRunServiceV1.call()` → L66 → `FinalizeTaskRunService.call()` → L126 → `#finalizeBatch()`
+- **有条件触发**：如果是**生产环境**的 `triggerAndWait` 批次（有 `dependentTaskAttemptId`），V1 取消不会触发批次完成检测！
+
+**V1 vs V2 批次检测触发对比**：
+
+| 场景 | V2 行为 | V1 行为 |
+|------|---------|---------|
+| 生产环境 + triggerAndWait | ✅ 触发 `scheduleCompleteBatch` | ❌ 跳过（交给 resumeDependentParents） |
+| 开发环境 + triggerAndWait | ✅ 触发 | ✅ 触发 |
+| 生产环境 + trigger（不等待） | ✅ 触发 | ✅ 触发 |
+| 开发环境 + trigger（不等待） | ✅ 触发 | ✅ 触发 |
 
 ---
 
-### 6.3 V1/V2 取消分流与 alreadyFinished 计数口径
+### 6.3 V1 不可取消状态的完整影响链
 
-#### 7.3.1 取消分流逻辑
+#### 6.3.1 取消分流逻辑
 
 ```typescript
-// cancelTaskRun.server.ts:26-35
-public async call(
-  taskRun: CancelableTaskRun,
-  options?: CancelTaskRunServiceOptions
-): Promise<CancelTaskRunServiceResult | undefined> {
+// cancelTaskRun.server.ts:26-52
+public async call(taskRun: CancelableTaskRun, options?) {
   if (taskRun.engine === RunEngineVersion.V1) {
     return await this.callV1(taskRun, options);
   } else {
     return await this.callV2(taskRun, options);
   }
 }
-```
 
-**V1 取消路径** (`callV1`):
-- 调用 `CancelTaskRunServiceV1`，直接设置 `status = "CANCELED"`
-- 始终返回 `alreadyFinished: false`（无论运行是否已完成）
+private async callV1(taskRun, options?) {
+  const service = new CancelTaskRunServiceV1(this._prisma);
+  const result = await service.call(taskRun, options);
 
-**V2 取消路径** (`callV2`):
-- 调用 `engine.cancelRun()`，有完整的状态机处理
-- 会检测运行是否已完成，返回准确的 `alreadyFinished` 值
+  if (!result) {
+    return;  // ⚠️  V1 不可取消时返回 undefined
+  }
 
-#### 7.3.2 alreadyFinished 计数口径
-
-```typescript
-// BulkActionV2.server.ts:216-220
-if (!result || result.alreadyFinished) {
-  failureCount++;   // ⚠️  已完成的运行被计为失败！
-} else {
-  successCount++;
+  return {
+    id: result.id,
+    alreadyFinished: false,
+  };
 }
 ```
 
-**计数逻辑**:
-- `alreadyFinished: true` → 运行已经是终态，取消操作没有实际执行 → **计为失败**
-- `alreadyFinished: false` → 运行成功被取消 → **计为成功**
-- V1 运行永远不会触发 `alreadyFinished` 分支（因为 V1 始终返回 false）
+```typescript
+// cancelTaskRunV1.server.ts:44-64
+public async call(taskRun, options?) {
+  if (!isCancellableRunStatus(taskRun.status)) {
+    // 运行不可取消（已经是终态）
+    if (opts.bulkActionId) {
+      await this._prisma.taskRun.update({  // 只追加 bulkActionId，不改状态
+        where: { id: taskRun.id },
+        data: { bulkActionGroupIds: { push: opts.bulkActionId } },
+      });
+    }
+    return;  // ⚠️  返回 undefined
+  }
+
+  // 运行可取消，执行取消...
+  const finalizeService = new FinalizeTaskRunService();
+  const cancelledTaskRun = await finalizeService.call({...});
+  return { id: cancelledTaskRun.id };
+}
+```
+
+#### 6.3.2 对 Bulk Action 计数的影响
+
+```typescript
+// BulkActionV2.server.ts:200-220
+const [error, result] = await tryCatch(
+  cancelService.call(run, { bulkActionId })
+);
+if (error) {
+  failureCount++;
+} else {
+  if (!result || result.alreadyFinished) {  // ⚠️  V1 不可取消时 result 是 undefined
+    failureCount++;  // 所以这里会被计为失败！
+  } else {
+    successCount++;
+  }
+}
+```
+
+**V1 不可取消的完整影响链**：
+```
+V1 运行状态为 CANCELED（不可取消）
+    ↓
+CancelTaskRunServiceV1.call() 返回 undefined
+    ↓
+CancelTaskRunService.callV1() 返回 undefined
+    ↓
+!result → true
+    ↓
+failureCount++ （计入失败）
+    ↓
+但运行的 bulkActionGroupIds 已经追加了该 bulkActionId
+```
+
+**V1 vs V2 计数对比**：
+
+| 场景 | V1 返回值 | 计数结果 | V2 返回值 | 计数结果 |
+|------|----------|---------|----------|---------|
+| 运行已完成（终态） | `undefined` | failureCount++ | `{ alreadyFinished: true }` | failureCount++ |
+| 运行可取消（PENDING） | `{ id, alreadyFinished: false }` | successCount++ | `{ alreadyFinished: false }` | successCount++ |
+| 运行执行中（EXECUTING） | `{ id, alreadyFinished: false }` | successCount++ | `{ alreadyFinished: false }` | successCount++ |
+| 调用出错 | - | failureCount++ | - | failureCount++ |
 
 ---
 
-### 6.4 链路 1：Bulk Cancel 对 Batch Trigger 的完整协同
+### 6.4 Replay 对原运行的影响：完全只读！
 
-#### 7.4.1 场景说明
+```typescript
+// replayTaskRun.server.ts:25-144
+public async call(existingTaskRun: TaskRun, overrideOptions?) {
+  // 1. 只读操作：读取原运行的 payload
+  const payloadPacket = await this.overrideExistingPayloadPacket(
+    existingTaskRun,
+    overrideOptions.payload
+  );
+  
+  // 2. 只读操作：读取原运行的配置（queue、tags、metadata 等）
+  const tags = overrideOptions.tags ?? existingTaskRun.runTags;
+  const metadata = overrideOptions.metadata ?? await this.getExistingMetadata(existingTaskRun);
+  const region = ignoreRegion ? undefined : overrideOptions.region ?? existingTaskRun.workerQueue;
+  
+  // 3. 创建新运行（完全不修改 existingTaskRun）
+  const result = await triggerTaskService.call(
+    existingTaskRun.taskIdentifier,
+    authenticatedEnvironment,
+    {
+      payload: parsedPayload,
+      options: {
+        tags,
+        metadata,
+        bulkActionId: overrideOptions?.bulkActionId,  // 新运行标记 bulkActionId
+        region,
+        // ... 其他配置
+      },
+    },
+    {
+      parentAsLinkType: "replay",
+      replayedFromTaskRunFriendlyId: existingTaskRun.friendlyId,  // 软关联原运行
+      // ...
+    }
+  );
+  
+  return result?.run;
+}
+```
+
+**铁证**：整个 `ReplayTaskRunService.call()` 方法中：
+- 没有任何 `this._prisma.taskRun.update()` 调用
+- 没有任何对 `existingTaskRun` 对象的修改
+- 所有对原运行的访问都是 `existingTaskRun.xxx` 这种只读访问
+
+**结论**：Replay 对原运行**零修改**，原运行的 `status`、`batchId`、`bulkActionGroupIds` 等所有字段保持原样。
+
+**重播对批次的影响**：
+- 原批次的完成判定只看原运行（`run_001` ~ `run_100`）是否全部到达终态
+- 重播创建的新运行（`run_101` ~ `run_130`）`batchId = null`，与原批次完全独立
+- 重播操作既不加速也不延迟原批次的完成
+
+---
+
+### 6.5 链路 1：Bulk Cancel 对 Batch Trigger 的完整协同
+
+#### 6.5.1 场景说明
 
 ```
 用户代码执行 batch.triggerAndWait([...100个任务...])
@@ -464,7 +611,7 @@ if (!result || result.alreadyFinished) {
 
 此时用户在 Dashboard 选择"取消所有运行" → Bulk CANCEL Action
 
-#### 7.4.2 阶段 1：Bulk Action 发起取消
+#### 6.5.2 阶段 1：Bulk Action 发起取消
 
 ```
 BulkActionGroup(type=CANCEL) 创建
@@ -490,7 +637,7 @@ BulkActionService.process() 拉取 runIds
 - **排队中/未执行**的运行：立即终态化，立即触发批次检测
 - **执行中**的运行：先进入 `PENDING_CANCEL`，worker 优雅退出后才终态化，延迟触发批次检测
 
-#### 7.4.3 阶段 2：批次完成检测（去抖动 + 幂等）
+#### 6.5.3 阶段 2：批次完成检测（去抖动 + 幂等）
 
 ```typescript
 // batchSystem.ts:20-29
@@ -509,7 +656,7 @@ public async scheduleCompleteBatch({ batchId }: { batchId: string }): Promise<vo
 - 但由于 Job ID 相同，队列中只会保留**一个**待执行的检测任务
 - 200ms 延迟确保最后一个运行终态化后才执行检测
 
-#### 7.4.4 阶段 3：批次完成检测逻辑
+#### 6.5.4 阶段 3：批次完成检测逻辑
 
 ```typescript
 // batchSystem.ts:39-136
@@ -558,7 +705,7 @@ async #tryCompleteBatch({ batchId }: { batchId: string }) {
 - 即使所有运行都被取消，批次仍然可以正常完成
 - 批次完成与运行成功/失败/取消无关，只与是否到达终态有关
 
-#### 7.4.5 阶段 4：父任务恢复
+#### 6.5.5 阶段 4：父任务恢复
 
 ```typescript
 // waitpointSystem.ts:498-521
@@ -585,9 +732,9 @@ async completeWaitpoint(...) {
 
 ---
 
-### 6.5 链路 2：Bulk Replay 对 Batch Trigger 的影响
+### 6.6 链路 2：Bulk Replay 对 Batch Trigger 的影响
 
-#### 7.5.1 Replay 对原运行的处理 —— 完全不修改！
+#### 6.6.1 Replay 对原运行的处理 —— 完全不修改！
 
 ```typescript
 // replayTaskRun.server.ts:25-144
@@ -623,7 +770,7 @@ public async call(existingTaskRun: TaskRun, overrideOptions: OverrideOptions = {
 - 新运行有自己的 ID，通过 `replayedFromTaskRunFriendlyId` 软关联原运行
 - 新运行的 `bulkActionGroupIds` 包含该 bulkActionId，但 **batchId 为 null**
 
-#### 7.5.2 对原批次的影响 —— 完全无影响！
+#### 6.6.2 对原批次的影响 —— 完全无影响！
 
 ```
 原批次 (batch_123) 有 100 个运行：
@@ -645,7 +792,7 @@ public async call(existingTaskRun: TaskRun, overrideOptions: OverrideOptions = {
 
 ---
 
-### 6.6 状态回写设计：bulkActionGroupIds 字段
+### 6.7 状态回写设计：bulkActionGroupIds 字段
 
 每个运行都有一个 `bulkActionGroupIds` 数组字段，记录对其执行过的所有 Bulk Action：
 
@@ -678,22 +825,48 @@ if (opts.bulkActionId) {
 
 ---
 
-### 6.7 不同分支下父任务恢复时序对比
+### 6.8 不同分支下父任务恢复时序对比（含 V1 特殊情况）
 
-| 分支场景 | 触发条件 | 批次完成时机 | 父任务恢复延迟 |
-|---------|----------|-------------|---------------|
-| **所有运行正常完成** | 无 Bulk Action | 最后一个运行成功/失败后 ~200ms | 正常 |
-| **全部取消（排队中）** | 所有运行都是 PENDING | 取消操作完成后 ~200ms | 很快（所有运行立即终态化） |
-| **全部取消（含执行中）** | 部分运行正在 EXECUTING | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
-| **部分取消** | 只取消部分运行 | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
-| **批量重播失败项** | 原批次有 FAILED 运行 | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
-| **取消 + 重播混合** | 先取消再重播 | 原批次所有运行终态后 | 不受重播影响 |
+#### 6.8.1 核心时序对比表
+
+| 分支场景 | 引擎版本 | 批次检测是否触发 | 批次完成时机 | 父任务恢复延迟 |
+|---------|---------|----------------|-------------|---------------|
+| **所有运行正常完成** | V2 | ✅ `#finalizeRun` 触发 | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **所有运行正常完成** | V1（生产+triggerAndWait） | ❌ 跳过（交给 resumeDependentParents） | 由 resume 机制触发 | 正常（与 V2 一致） |
+| **所有运行正常完成** | V1（其他场景） | ✅ `#finalizeBatch` 触发 | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **全部取消（排队中）** | V2 | ✅ 每个运行终态化时触发 | 取消操作完成后 ~200ms | 很快（所有运行立即终态化） |
+| **全部取消（排队中）** | V1（生产+triggerAndWait） | ❌ 跳过 | 由 resume 机制触发 | 可能比 V2 略慢（走不同链路） |
+| **全部取消（排队中）** | V1（其他场景） | ✅ `#finalizeBatch` 触发 | 取消操作完成后 ~200ms | 很快 |
+| **全部取消（含执行中）** | V2 | ✅ 每个运行终态化时触发 | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
+| **全部取消（含执行中）** | V1 | ✅（非生产环境）/ ❌（生产+triggerAndWait） | 同上 | 同上 |
+| **部分取消** | V2 | ✅ 被取消的运行终态化时触发 | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
+| **部分取消** | V1（生产+triggerAndWait） | ❌ 跳过 | 由 resume 机制触发 | 同上 |
+| **批量重播失败项** | V1/V2 | - | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
+| **取消 + 重播混合** | V1/V2 | - | 原批次所有运行终态后 | 不受重播影响 |
+
+#### 6.8.2 V1 生产环境 triggerAndWait 的特殊链路
+
+```
+V1 + 生产环境 + triggerAndWait 场景：
+    │
+    ├─→ 运行终态化（成功/失败/取消）
+    │     └─→ FinalizeTaskRunService.call() → #finalizeBatch()
+    │           └─→ 检测到 environment.type != "DEVELOPMENT" && dependentTaskAttemptId
+    │               └─→ continue; // 跳过批次检测！
+    │
+    ├─→ 批次完成检测由 resumeDependentParents 触发
+    │     └─→ ResumeDependentParentsService.call()
+    │           └─→ 检查所有子运行是否完成
+    │               └─→ 如果完成，恢复父运行
+    │
+    └─→ 父任务恢复时序与 V2 基本一致，但走不同的代码路径
+```
 
 **极端情况**：如果有运行卡在 `PENDING_CANCEL` 状态（worker 失去响应），批次永远不会完成，父任务永远阻塞。这种情况下需要手动干预（强制终态化或超时机制）。
 
 ---
 
-### 6.8 完整时序图（以 Bulk Cancel 含执行中运行为例）
+### 6.9 完整时序图（以 Bulk Cancel 含执行中运行为例）
 
 ```
   Bulk Action          Run Engine          Worker           Batch System        Waitpoint
@@ -758,9 +931,22 @@ if (opts.bulkActionId) {
 
 ---
 
-### 6.9 关键设计决策分析
+### 6.10 关键设计决策分析
 
-#### 决策 1：为什么通过 #finalizeRun 统一触发，而不是批量检测后统一触发？
+#### 决策 1：为什么 V1 和 V2 的批次检测路径完全分离？
+
+**原因**:
+1. **历史演进**: V2 是全新的 Run Engine，重写了整个状态机和生命周期管理
+2. **架构差异**: V2 是内联在任务执行流程中的状态机，V1 是外部服务驱动的状态更新
+3. **避免回归**: 分离路径确保 V2 的改动不会影响 V1 的已有逻辑
+4. **渐进迁移**: 可以逐步将用户从 V1 迁移到 V2，而不需要一次性切换
+
+**代价**:
+- 维护两套逻辑，增加了代码复杂度
+- 出现了 V1 生产环境 triggerAndWait 跳过批次检测的特殊分支
+- 需要两套测试覆盖
+
+#### 决策 2：为什么通过终态化出口统一触发批次检测，而不是批量检测后统一触发？
 
 **原因**:
 1. **解耦**: Bulk Action 不需要知道批次逻辑，运行终态化也不需要知道 Bulk Action
@@ -768,7 +954,7 @@ if (opts.bulkActionId) {
 3. **鲁棒性**: 即使 Bulk Action 中断，已终态化的运行仍然会触发检测
 4. **通用性**: 无论运行是成功、失败还是取消，都走同一个路径
 
-#### 决策 2：为什么 alreadyFinished 计为失败？
+#### 决策 3：为什么 alreadyFinished 和 V1 不可取消都计为失败？
 
 ```typescript
 // BulkActionV2.server.ts:216-217
@@ -780,36 +966,48 @@ if (!result || result.alreadyFinished) {
 - Bulk Action 的目标是"执行操作"，而不是"确保终态"
 - 对已完成的运行执行取消操作，操作本身没有产生效果
 - 用户关心的是"我成功取消了多少个运行"，而不是"有多少个运行已经是终态"
+- 保持 V1 和 V2 的计数口径一致（虽然返回值不同，但计数结果相同）
 
-#### 决策 3：为什么 Replay 不继承原 batchId？
-
-**原因**:
-1. **语义纯净**: 批次代表"一次批量触发操作"，重播是另一次独立操作
-2. **计数准确**: 原批次的 `runCount` 是固定的，添加新运行会导致计数混乱
-3. **责任清晰**: 原批次只对它创建的运行负责，重播的运行由 Bulk Action 负责
-4. **实现简单**: 不需要修改 BatchTaskRun 的不可变字段
-
-#### 决策 4：为什么 CANCELED 被视为终态？
+#### 决策 4：为什么 V1 生产环境 triggerAndWait 要跳过批次检测？
 
 ```typescript
-// isFinalRunStatus 包括 CANCELED
-if (runs.every((r) => isFinalRunStatus(r.status))) {
-  // 批次完成
+// finalizeTaskRun.server.ts:238-241
+if (environment.type !== "DEVELOPMENT" && item.batchTaskRun.dependentTaskAttemptId) {
+  continue;  // 跳过批次检测
 }
+```
+
+**原因**:
+1. **职责分离**: V1 triggerAndWait 的批次完成由 `resumeDependentParents` 专门处理
+2. **避免重复**: 如果两个路径都尝试完成批次，可能导致竞争和重复操作
+3. **历史原因**: V1 triggerAndWait 是后来添加的功能，选择了在 resume 路径中统一处理
+
+**代码注释明确说明**:
+> Don't do anything if this is a batchTriggerAndWait in a deployed task
+> As that is being handled in resumeDependentParents and resumeTaskRunDependencies
+
+#### 决策 5：为什么 Replay 完全不修改原运行？
+
+**原因**:
+1. **语义纯净**: 重播是"创建新运行"，不是"修改旧运行"
+2. **可追溯性**: 原运行的状态和历史完整保留，可以审计和对比
+3. **无副作用**: 不会意外触发原运行的其他逻辑（如批次检测、通知等）
+4. **实现简单**: 只读操作不会有并发问题，不需要事务和锁
+
+#### 决策 6：为什么 CANCELED 被视为终态？
+
+```typescript
+// statuses.ts:44-53
+const finalStatuses: TaskRunStatus[] = [
+  "CANCELED", "INTERRUPTED", "COMPLETED_SUCCESSFULLY",
+  "COMPLETED_WITH_ERRORS", "SYSTEM_FAILURE", "CRASHED", "EXPIRED", "TIMED_OUT",
+];
 ```
 
 **原因**:
 1. **用户期望**: 用户取消批量运行后，期望父任务能立即恢复，而不是永远等待
 2. **语义正确**: 被取消的运行不会再执行，确实是"最终"状态
 3. **结果可用**: 即使部分/全部运行被取消，批次结果仍然有意义（哪些成功了，哪些被取消了）
-
-#### 决策 3：为什么重播的新运行不继承原 batchId？
-
-**原因**:
-1. **批次语义**: 批次代表"一次批量触发操作"，重播是另一次独立操作
-2. **计数准确**: 原批次的 `runCount` 是固定的，添加新运行会导致计数混乱
-3. **责任清晰**: 原批次只对它创建的运行负责，重播的运行由 Bulk Action 负责
-4. **实现简单**: 不需要修改 BatchTaskRun 的不可变字段
 
 ---
 
@@ -853,34 +1051,46 @@ Batch Trigger 和 Bulk Action 虽然目标不同，但共享了**"批次拆分 �
 
 ### 跨系统协同的关键修正与洞察
 
-#### 修正的关键误解
+#### 最终修正的三处关键口径
 
-| 误解点 | 错误理解 | 实际代码行为 |
-|--------|----------|-------------|
-| 批次检测触发时机 | 只有取消操作触发 | **所有终态化路径**统一通过 `#finalizeRun` 触发（成功/失败/取消） |
-| Replay 对原运行的影响 | 可能先取消原运行 | **不修改原运行**，只创建新运行，原运行状态保持不变 |
-| V1/V2 取消分流 | 无差异 | 分流明确，V1 走 `CancelTaskRunServiceV1`，V2 走 `engine.cancelRun()` |
-| alreadyFinished 计数 | 已完成算成功 | `alreadyFinished: true` 被计为 **failureCount**（失败） |
+| 口径点 | 之前错误理解 | 实际代码行为 |
+|--------|-------------|-------------|
+| **V1 是否经过 #finalizeRun** | V1 和 V2 都走 Run Engine 的 `#finalizeRun` | **V1 不走**！V1 走 `FinalizeTaskRunService.#finalizeBatch`，生产环境 triggerAndWait 会跳过批次检测 |
+| **V1 不可取消返回的影响** | 只影响 alreadyFinished 分支 | V1 不可取消时返回 `undefined` → `!result` 为 true → **计为 failureCount** |
+| **Replay 对原运行的影响** | 可能修改原运行某些字段 | **完全不修改**！Replay 服务只读原运行配置创建新运行，原运行状态、batchId 等所有字段保持不变 |
+
+#### V1 与 V2 批次检测路径的核心差异
+
+| 维度 | V2 路径 | V1 路径 |
+|------|---------|---------|
+| **入口方法** | `RunAttemptSystem.#finalizeRun` | `FinalizeTaskRunService.#finalizeBatch` |
+| **触发时机** | 所有终态化路径（成功/失败/取消） | 取消和最终化路径 |
+| **条件分支** | 无条件（只要 batchId 存在就触发） | 生产环境 + triggerAndWait → **跳过** |
+| **检测逻辑** | `batchSystem.scheduleCompleteBatch` | `ResumeBatchRunService.enqueue` |
+| **去抖动** | 200ms + 唯一 Job ID | 无（直接处理） |
 
 #### 协同链路核心机制
 
 当 Bulk Action 作用于 Batch Trigger 生成的运行时，两者通过**统一出口 + 去抖动**的方式协同：
 
-1. **统一出口**: `#finalizeRun` 是所有运行终态化的汇聚点，无论成功/失败/取消都会触发批次检测
-2. **去抖动**: `scheduleCompleteBatch` 通过 200ms 延迟 + 唯一 Job ID 合并多次检测请求
+1. **统一出口**: V2 的 `#finalizeRun` 和 V1 的 `#finalizeBatch` 是运行终态化的汇聚点
+2. **去抖动**（V2 独有）: `scheduleCompleteBatch` 通过 200ms 延迟 + 唯一 Job ID 合并多次检测请求
 3. **状态回写**: `bulkActionGroupIds` 字段实现可追溯性，纯标记不影响业务逻辑
 4. **等待恢复**: `CANCELED` 是 8 种终态之一，确保用户取消后父任务能及时恢复
 5. **边界清晰**: 重播创建的新运行不继承原 batchId，保持批次语义纯净
 
-#### 不同分支下父任务恢复时序
+#### 不同分支下父任务恢复完整时序对比
 
-| 分支场景 | 批次完成时机 | 父任务恢复延迟 |
-|---------|-------------|---------------|
-| **所有运行正常完成** | 最后一个运行成功/失败后 ~200ms | 正常 |
-| **全部取消（排队中）** | 取消操作完成后 ~200ms | 很快（所有运行立即终态化） |
-| **全部取消（含执行中）** | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
-| **部分取消** | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
-| **批量重播失败项** | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
+| 分支场景 | 引擎版本 | 批次检测是否触发 | 批次完成时机 | 父任务恢复延迟 |
+|---------|---------|----------------|-------------|---------------|
+| **所有运行正常完成** | V2 | ✅ `#finalizeRun` 触发 | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **所有运行正常完成** | V1（生产+triggerAndWait） | ❌ 跳过 | 由 resume 机制触发 | 正常（与 V2 一致） |
+| **所有运行正常完成** | V1（其他场景） | ✅ `#finalizeBatch` 触发 | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **全部取消（排队中）** | V2 | ✅ 每个运行终态化时触发 | 取消操作完成后 ~200ms | 很快 |
+| **全部取消（排队中）** | V1（生产+triggerAndWait） | ❌ 跳过 | 由 resume 机制触发 | 可能比 V2 略慢 |
+| **全部取消（含执行中）** | V2 | ✅ 每个运行终态化时触发 | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
+| **部分取消** | V2 | ✅ 被取消的运行终态化时触发 | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
+| **批量重播失败项** | V1/V2 | - | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
 
 ### 设计哲学
 
