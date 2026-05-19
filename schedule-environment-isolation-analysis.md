@@ -721,7 +721,7 @@ async function isDevEnvironmentConnectedHandler(environmentId: string) {
 }
 ```
 
-### 2.4 调度触发回调
+### 3.4 调度触发回调
 
 **文件**: `apps/webapp/app/v3/scheduleEngine.server.ts:78-134`
 
@@ -1046,7 +1046,7 @@ export class RunQueue {
 │  ┌───────────────────────────────────────────────────────────────┐  │
 │  │ 6. Worker队列选择                                            │  │
 │  │    - DEVELOPMENT: masterQueue = environment.id              │  │
-│  │    - STAGING/PRODUCTION: 查询项目默认worker组               │  │
+│  │    - STAGING/PRODUCTION/PREVIEW: 查询项目默认worker组        │  │
 │  │    - 支持RUN_ENGINE_WORKER_QUEUE_OVERRIDES覆盖               │  │
 │  └───────────────────────────────┬───────────────────────────────┘  │
 └──────────────────────────────────┼──────────────────────────────────┘
