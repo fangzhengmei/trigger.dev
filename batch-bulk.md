@@ -355,74 +355,148 @@ if (!isNewItem) return { enqueued: false };  // 重复项跳过
 
 ---
 
-## 七、Bulk Action 作用于 Batch Trigger 运行的协同链路
+## 六、Bulk Action 作用于 Batch Trigger 运行的协同链路
 
 当 Bulk Action（取消/重播）作用于由 Batch Trigger 生成的运行时，会触发一条复杂的协同链路，涉及**状态回写**、**批次完成判定**和**父任务等待恢复**三个核心环节。
 
-### 7.1 场景说明
+### 6.1 修正说明
 
-考虑以下典型场景：
+之前的分析存在几处与实际代码不符的地方，在此统一修正：
 
-```
-用户代码中执行 batch.triggerAndWait([...100个任务...])
-    │
-    ├─→ 父任务被阻塞（等待 Waitpoint）
-    ├─→ 创建 BatchTaskRun（100个预期运行）
-    └─→ 100个子任务开始执行
-          ├─→ 50个已完成（SUCCEEDED/FAILED）
-          ├─→ 30个正在执行（RUNNING）
-          └─→ 20个排队中（PENDING）
-```
+| 误解点 | 错误理解 | 实际代码行为 |
+|--------|----------|-------------|
+| 批次检测触发时机 | 只有取消操作触发 | **所有终态化路径**统一通过 `#finalizeRun` 触发（成功/失败/取消） |
+| Replay 对原运行的影响 | 可能先取消原运行 | **不修改原运行**，只创建新运行，原运行状态保持不变 |
+| V1/V2 取消分流 | 无差异 | 分流明确，V1 走 `CancelTaskRunServiceV1`，V2 走 `engine.cancelRun()` |
+| alreadyFinished 计数 | 已完成算成功 | `alreadyFinished: true` 被计为 **failureCount**（失败） |
 
-此时用户在 Dashboard 中：
-- **场景 A**: 选择 "取消所有运行" → Bulk CANCEL Action
-- **场景 B**: 选择 "重播所有失败运行" → Bulk REPLAY Action
+---
 
-### 7.2 链路 1：Bulk Cancel 对 Batch Trigger 的影响
+### 6.2 核心机制：#finalizeRun —— 所有终态路径的汇聚点
 
-#### 阶段 1：Bulk Action 发起取消
+**关键发现**: 批次完成检测的触发点不是"取消操作"，而是**所有运行终态化的统一出口**。
 
-```
-用户在 Dashboard 选择批量取消 → 创建 BulkActionGroup(type=CANCEL)
-    │
-    ▼
-BulkActionService.process() 拉取一批 runIds（带 batchId）
-    │
-    ▼
-对每个 runId 调用 CancelTaskRunService.call(run, { bulkActionId })
-    │
-    ├─→ V2 运行 → engine.cancelRun({ runId, bulkActionId })
-    │     ├─→ 取消正在执行的运行
-    │     └─→ 运行状态更新为 CANCELED
-    │           ↓
-    │           关键：#finalizeRun({ id, batchId })
-    │                 ↓
-    │                 batchSystem.scheduleCompleteBatch({ batchId })
-    │
-    └─→ bulkActionId 追加到 taskRun.bulkActionGroupIds 数组
-```
-
-**关键代码** (`runAttemptSystem.ts:1723-1725`):
 ```typescript
+// runAttemptSystem.ts:1720-1730
+/*
+ * Whether the run succeeds, fails, is cancelled… we need to run these operations
+ */
 async #finalizeRun({ id, batchId }: { id: string; batchId: string | null }) {
   if (batchId) {
     await this.batchSystem.scheduleCompleteBatch({ batchId });
   }
-  // ...
+
+  //cancel the heartbeats
+  await this.$.worker.ack(`heartbeatSnapshot.${id}`);
 }
 ```
 
-每个被取消的运行如果属于某个批次（`batchId != null`），都会触发批次完成检测。
+**调用位置**: 这个方法在以下三个路径中都会被调用：
+1. **运行成功** → `attemptSucceeded()` → L846
+2. **运行失败** → `permanentlyFailRun()` → L1710
+3. **运行取消** → `cancelRun()` → L1514
 
-#### 阶段 2：批次完成判定（去抖动 + 幂等）
+这意味着：
+- 无论是正常完成、失败、还是被取消，只要运行到达终态且属于某个批次，就会触发批次完成检测
+- Bulk Cancel 只是加速了运行到达终态的过程，本身不直接触发批次检测
 
-`scheduleCompleteBatch` 会延迟 200ms 后执行，目的是**去抖动**：当批量取消 100 个运行时，不会触发 100 次批次完成检测，而是合并为一次。
+---
+
+### 6.3 V1/V2 取消分流与 alreadyFinished 计数口径
+
+#### 7.3.1 取消分流逻辑
+
+```typescript
+// cancelTaskRun.server.ts:26-35
+public async call(
+  taskRun: CancelableTaskRun,
+  options?: CancelTaskRunServiceOptions
+): Promise<CancelTaskRunServiceResult | undefined> {
+  if (taskRun.engine === RunEngineVersion.V1) {
+    return await this.callV1(taskRun, options);
+  } else {
+    return await this.callV2(taskRun, options);
+  }
+}
+```
+
+**V1 取消路径** (`callV1`):
+- 调用 `CancelTaskRunServiceV1`，直接设置 `status = "CANCELED"`
+- 始终返回 `alreadyFinished: false`（无论运行是否已完成）
+
+**V2 取消路径** (`callV2`):
+- 调用 `engine.cancelRun()`，有完整的状态机处理
+- 会检测运行是否已完成，返回准确的 `alreadyFinished` 值
+
+#### 7.3.2 alreadyFinished 计数口径
+
+```typescript
+// BulkActionV2.server.ts:216-220
+if (!result || result.alreadyFinished) {
+  failureCount++;   // ⚠️  已完成的运行被计为失败！
+} else {
+  successCount++;
+}
+```
+
+**计数逻辑**:
+- `alreadyFinished: true` → 运行已经是终态，取消操作没有实际执行 → **计为失败**
+- `alreadyFinished: false` → 运行成功被取消 → **计为成功**
+- V1 运行永远不会触发 `alreadyFinished` 分支（因为 V1 始终返回 false）
+
+---
+
+### 6.4 链路 1：Bulk Cancel 对 Batch Trigger 的完整协同
+
+#### 7.4.1 场景说明
+
+```
+用户代码执行 batch.triggerAndWait([...100个任务...])
+    │
+    ├─→ 父任务被阻塞（EXECUTING_WITH_WAITPOINTS）
+    ├─→ 创建 BatchTaskRun（runCount=100）
+    ├─→ 创建 Waitpoint（completedByBatchId=batch_123）
+    └─→ 100个子任务开始执行
+          ├─→ 40个已完成（SUCCEEDED/FAILED）→ 已触发 #finalizeRun
+          ├─→ 40个正在执行（EXECUTING）
+          └─→ 20个排队中（PENDING）
+```
+
+此时用户在 Dashboard 选择"取消所有运行" → Bulk CANCEL Action
+
+#### 7.4.2 阶段 1：Bulk Action 发起取消
+
+```
+BulkActionGroup(type=CANCEL) 创建
+    │
+    ▼
+BulkActionService.process() 拉取 runIds
+    │
+    ▼
+对每个 runId 调用 CancelTaskRunService.call(run, { bulkActionId })
+    │
+    ├─→ V1 运行 → CancelTaskRunServiceV1.call()
+    │     └─→ 直接更新 status=CANCELED，追加 bulkActionId
+    │
+    └─→ V2 运行 → engine.cancelRun({ runId, bulkActionId })
+          ├─→ 已完成 → alreadyFinished=true，追加 bulkActionId，返回
+          ├─→ 排队中 → 直接设置 status=CANCELED
+          │     └─→ 触发 #finalizeRun → scheduleCompleteBatch
+          └─→ 执行中 → 设置 status=PENDING_CANCEL，通知 worker
+                └─→ worker 确认后才会触发 #finalizeRun
+```
+
+**重要区别**:
+- **排队中/未执行**的运行：立即终态化，立即触发批次检测
+- **执行中**的运行：先进入 `PENDING_CANCEL`，worker 优雅退出后才终态化，延迟触发批次检测
+
+#### 7.4.3 阶段 2：批次完成检测（去抖动 + 幂等）
 
 ```typescript
 // batchSystem.ts:20-29
 public async scheduleCompleteBatch({ batchId }: { batchId: string }): Promise<void> {
   await this.$.worker.enqueue({
-    id: `tryCompleteBatch:${batchId}`,  // 相同 ID 会自动去重
+    id: `tryCompleteBatch:${batchId}`,  // ⚠️  相同 ID 自动去重
     job: "tryCompleteBatch",
     payload: { batchId: batchId },
     availableAt: new Date(Date.now() + 200),  // 200ms 延迟
@@ -430,7 +504,12 @@ public async scheduleCompleteBatch({ batchId }: { batchId: string }): Promise<vo
 }
 ```
 
-#### 阶段 3：批次完成检测逻辑
+**去抖动效果**:
+- 100 个运行终态化会调用 100 次 `scheduleCompleteBatch`
+- 但由于 Job ID 相同，队列中只会保留**一个**待执行的检测任务
+- 200ms 延迟确保最后一个运行终态化后才执行检测
+
+#### 7.4.4 阶段 3：批次完成检测逻辑
 
 ```typescript
 // batchSystem.ts:39-136
@@ -440,9 +519,9 @@ async #tryCompleteBatch({ batchId }: { batchId: string }) {
   // v2 批次使用 successfulRunCount + failedRunCount
   const processedRunCount = batch.successfulRunCount + batch.failedRunCount;
   
-  // 关键判断 1：所有运行都已被处理（创建或标记失败）
+  // 关键判断 1：所有运行都已被创建（不是处理完成！）
   if (processedRunCount < batch.runCount) {
-    return;  // 还有运行未创建，不完成批次
+    return;  // 还有运行未创建，批次还在生成中
   }
   
   // 关键判断 2：所有运行都到达终态
@@ -452,7 +531,8 @@ async #tryCompleteBatch({ batchId }: { batchId: string }) {
   });
   
   if (runs.every((r) => isFinalRunStatus(r.status))) {
-    // 所有运行都完成了（包括 CANCELED）
+    // 终态包括：CANCELED, INTERRUPTED, COMPLETED_SUCCESSFULLY,
+    //          COMPLETED_WITH_ERRORS, SYSTEM_FAILURE, CRASHED, EXPIRED, TIMED_OUT
     await this.$.prisma.batchTaskRun.update({
       where: { id: batchId },
       data: { status: "COMPLETED" },
@@ -473,186 +553,243 @@ async #tryCompleteBatch({ batchId }: { batchId: string }) {
 }
 ```
 
-**重要结论**:
-- `CANCELED` 状态被视为终态（`isFinalRunStatus` 返回 true）
+**关键洞察**:
+- `CANCELED` 是 8 种终态之一，完全符合完成条件
 - 即使所有运行都被取消，批次仍然可以正常完成
-- 批次完成后会自动触发 Waitpoint 完成
+- 批次完成与运行成功/失败/取消无关，只与是否到达终态有关
 
-#### 阶段 4：父任务恢复
-
-当 Waitpoint 完成后，父任务被唤醒：
+#### 7.4.5 阶段 4：父任务恢复
 
 ```typescript
-// waitpointSystem.ts:72-150
-async completeWaitpoint({ id, output }) {
+// waitpointSystem.ts:498-521
+async completeWaitpoint(...) {
   // 1. 更新 waitpoint 状态为 COMPLETED
   await this.$.prisma.waitpoint.updateMany({...});
   
-  // 2. 查找被阻塞的父运行
-  const affectedTaskRuns = await this.$.prisma.taskRunWaitpoint.findMany({
-    where: { waitpointId: id },
-    select: { taskRunId: true, ... },
-  });
+  // 2. 检查是否还有其他未完成的 waitpoint 阻塞该运行
+  const isRunBlocked = await this.#isRunBlockedByWaitpoints(runId);
   
-  // 3. 入队继续运行的任务
-  for (const run of affectedTaskRuns) {
+  if (!isRunBlocked) {
+    // 3. 没有其他阻塞，入队继续运行
     await this.$.worker.enqueue({
-      id: `continueRunIfUnblocked:${run.taskRunId}`,
+      id: `continueRunIfUnblocked:${runId}`,
       job: "continueRunIfUnblocked",
-      payload: { runId: run.taskRunId },
+      payload: { runId: runId },
       availableAt: new Date(Date.now() + 50),
     });
   }
 }
 ```
 
-父任务恢复后，`batch.triggerAndWait()` 会返回结果，其中包含所有子运行的 ID（包括被取消的）。
+父任务恢复后，`batch.triggerAndWait()` 返回结果，包含所有子运行的 ID（包括被取消的）。
 
-### 7.3 链路 2：Bulk Replay 对 Batch Trigger 的影响
+---
 
-Bulk Replay 的影响更为复杂，因为它**创建新运行**而不是修改现有运行状态。
+### 6.5 链路 2：Bulk Replay 对 Batch Trigger 的影响
 
-#### 阶段 1：Bulk Action 发起重播
+#### 7.5.1 Replay 对原运行的处理 —— 完全不修改！
 
+```typescript
+// replayTaskRun.server.ts:25-144
+public async call(existingTaskRun: TaskRun, overrideOptions: OverrideOptions = {}) {
+  // 1. 读取原运行的 payload 和配置
+  const payloadPacket = await this.overrideExistingPayloadPacket(...);
+  
+  // 2. 调用 TriggerTaskService 创建**新运行**
+  const result = await triggerTaskService.call(
+    existingTaskRun.taskIdentifier,
+    authenticatedEnvironment,
+    {
+      payload: parsedPayload,
+      options: {
+        // ... 复制原运行的配置
+        bulkActionId: overrideOptions?.bulkActionId,  // 新运行标记 bulkActionId
+      },
+    },
+    {
+      parentAsLinkType: "replay",
+      replayedFromTaskRunFriendlyId: existingTaskRun.friendlyId,  // 关联原运行
+      // ...
+    }
+  );
+  
+  return result?.run;
+}
 ```
-用户选择批量重播 → 创建 BulkActionGroup(type=REPLAY)
-    │
-    ▼
-BulkActionService.process() 拉取一批 runIds（带 batchId）
-    │
-    ▼
-对每个 runId 调用 ReplayTaskRunService.call(run, { bulkActionId })
-    │
-    ├─→ 读取原运行的 payload 和配置
-    ├─→ 调用 TriggerTaskService 创建新运行
-    │     └─→ 新运行的 bulkActionGroupIds 包含该 bulkActionId
-    └─→ 注意：新运行**没有** batchId！
-```
 
-**关键点**: 重播创建的新运行**不属于原来的批次**。原来的批次只跟踪它最初创建的那些运行。
+**关键事实**:
+- Replay 服务**不修改原运行的任何字段**（包括 status、batchId 等）
+- 原运行保持原样（FAILED 还是 FAILED，batchId 还是原来的 batchId）
+- 新运行有自己的 ID，通过 `replayedFromTaskRunFriendlyId` 软关联原运行
+- 新运行的 `bulkActionGroupIds` 包含该 bulkActionId，但 **batchId 为 null**
 
-#### 阶段 2：对原批次的影响
-
-重播操作本身不会直接影响原批次的完成判定，因为：
-1. 原运行仍然存在（状态可能是 FAILED）
-2. 新运行有自己的 ID，不关联原 batchId
-3. 原批次的 `runCount` 和 `runIds` 不会变化
-
-但如果原运行在重播前处于非终态，重播操作可能会：
-- 先取消原运行（取决于实现）
-- 取消会触发 `#finalizeRun` → `scheduleCompleteBatch`
-- 从而加速原批次的完成检测
-
-#### 阶段 3：批次完成判定不受影响
-
-原批次的完成判定仍然只看它自己创建的那些运行：
+#### 7.5.2 对原批次的影响 —— 完全无影响！
 
 ```
 原批次 (batch_123) 有 100 个运行：
   ├─→ run_001 ~ run_100（batchId = batch_123）
   │     ├─→ 50 个 SUCCEEDED
   │     ├─→ 30 个 FAILED（用户选择重播）
-  │     └─→ 20 个 CANCELED
+  │     └─→ 20 个 PENDING
   │
-  └─→ 重播创建的新运行：run_101 ~ run_130（batchId = null）
+  └─→ 重播创建的新运行：run_101 ~ run_130
+        ├─→ batchId = null（不属于任何批次）
+        ├─→ bulkActionGroupIds = [bulk_456]
+        └─→ replayedFromTaskRunFriendlyId = "run_xxx"
 ```
 
-当 `run_001` ~ `run_100` 全部到达终态后，批次 `batch_123` 就完成了，父任务恢复。新运行 `run_101` ~ `run_130` 的生命周期与原批次无关。
+**结论**:
+- 重播操作不会加速或延迟原批次的完成
+- 原批次的完成只取决于 `run_001` ~ `run_100` 是否全部到达终态
+- 新运行 `run_101` ~ `run_130` 的生命周期与原批次完全独立
 
-### 7.4 状态回写设计：bulkActionGroupIds 字段
+---
+
+### 6.6 状态回写设计：bulkActionGroupIds 字段
 
 每个运行都有一个 `bulkActionGroupIds` 数组字段，记录对其执行过的所有 Bulk Action：
 
 ```typescript
-// runAttemptSystem.ts:1403-1407
+// runAttemptSystem.ts:1403-1407 (V2 取消)
 data: {
   status: "CANCELED",
-  // ...
   bulkActionGroupIds: bulkActionId
     ? { push: bulkActionId }
     : undefined,
 }
 ```
 
-**设计意图**:
-1. **可追溯性**: 可以查询某个运行被哪些 Bulk Action 影响过
-2. **审计**: 支持 "这个运行为什么被取消了？" 这类问题的回答
-3. **幂等性**: 避免重复执行相同的 Bulk Action（虽然当前实现没有检查）
-
-**注意**: 这个字段是**纯标记**，不影响批次完成判定逻辑。批次完成只看 `status` 是否为终态。
-
-### 7.5 完整时序图（以 Bulk Cancel 为例）
-
-```
-  Bulk Action 发起者          Run Engine         Batch System      Waitpoint System
-       │                        │                    │                   │
-       │ 批量取消 100 个运行     │                    │                   │
-       ├───────────────────────▶│                    │                   │
-       │                        │                    │                   │
-       │                    取消 run_001             │                   │
-       │                        ├───┐                │                   │
-       │                        │   │ 状态→CANCELED   │                   │
-       │                        │   │                │                   │
-       │                        │◀──┘                │                   │
-       │                        │                    │                   │
-       │                        #finalizeRun         │                   │
-       │                        │                    │                   │
-       │                        ├───────────────────▶│                   │
-       │                        │ scheduleCompleteBatch                   │
-       │                        │                    │                   │
-       │                    取消 run_002             │                   │
-       │                        ├───┐                │                   │
-       │                        │   │ 状态→CANCELED   │                   │
-       │                        │   │                │                   │
-       │                        │◀──┘                │                   │
-       │                        │                    │                   │
-       │                        #finalizeRun         │                   │
-       │                        │                    │                   │
-       │                        ├───────────────────▶│ (去重，只保留一个)  │
-       │                        │                    │                   │
-       │                        ... (重复 98 次)     │                   │
-       │                        │                    │                   │
-       │                        │                    │ 200ms 后执行        │
-       │                        │                    │ tryCompleteBatch   │
-       │                        │                    │                    │
-       │                        │                    ├───┐               │
-       │                        │                    │   │ 检查所有运行    │
-       │                        │                    │   │ 是否为终态      │
-       │                        │                    │   │                │
-       │                        │                    │◀──┘               │
-       │                        │                    │                    │
-       │                        │                    │ Batch.status       │
-       │                        │                    │ = COMPLETED        │
-       │                        │                    │                    │
-       │                        │                    ├───────────────────▶│
-       │                        │                    │ completeWaitpoint  │
-       │                        │                    │                    │
-       │                        │                    │                    ├───┐
-       │                        │                    │                    │   │ 唤醒父任务
-       │                        │                    │                    │   │
-       │                        │                    │                    │◀──┘
-       │◀─────────────────────────────────────────────────────────────────┤
-       │                     batch.triggerAndWait() 返回结果              │
-```
-
-### 7.6 关键设计决策分析
-
-#### 决策 1：为什么每个运行取消时都触发批次检测，而不是批量检测后统一触发？
-
 ```typescript
-// 每个运行取消后都调用
-if (batchId) {
-  await this.batchSystem.scheduleCompleteBatch({ batchId });
+// cancelTaskRunV1.server.ts:52-60 (V1 取消，即使运行不可取消也追加)
+if (opts.bulkActionId) {
+  await this._prisma.taskRun.update({
+    where: { id: taskRun.id },
+    data: {
+      bulkActionGroupIds: { push: opts.bulkActionId },
+    },
+  });
 }
 ```
 
-**原因**:
-1. **解耦**: Bulk Action 不需要知道它取消的运行属于哪个批次，也不需要关心批次逻辑
-2. **实时性**: 最后一个运行取消后 200ms 内就能完成批次检测
-3. **鲁棒性**: 即使 Bulk Action 处理过程中断，已取消的运行仍然会触发批次检测
-4. **去抖动**: 通过 `scheduleCompleteBatch` 的延迟 + 唯一 job ID 实现合并
+**设计意图**:
+1. **可追溯性**: 可以查询某个运行被哪些 Bulk Action 影响过
+2. **审计**: 支持 "这个运行为什么被取消了？" 这类问题的回答
+3. **纯标记**: 不影响任何业务逻辑，批次完成只看 `status`
 
-#### 决策 2：为什么 CANCELED 被视为终态？
+---
+
+### 6.7 不同分支下父任务恢复时序对比
+
+| 分支场景 | 触发条件 | 批次完成时机 | 父任务恢复延迟 |
+|---------|----------|-------------|---------------|
+| **所有运行正常完成** | 无 Bulk Action | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **全部取消（排队中）** | 所有运行都是 PENDING | 取消操作完成后 ~200ms | 很快（所有运行立即终态化） |
+| **全部取消（含执行中）** | 部分运行正在 EXECUTING | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
+| **部分取消** | 只取消部分运行 | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
+| **批量重播失败项** | 原批次有 FAILED 运行 | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
+| **取消 + 重播混合** | 先取消再重播 | 原批次所有运行终态后 | 不受重播影响 |
+
+**极端情况**：如果有运行卡在 `PENDING_CANCEL` 状态（worker 失去响应），批次永远不会完成，父任务永远阻塞。这种情况下需要手动干预（强制终态化或超时机制）。
+
+---
+
+### 6.8 完整时序图（以 Bulk Cancel 含执行中运行为例）
+
+```
+  Bulk Action          Run Engine          Worker           Batch System        Waitpoint
+    │                    │                  │                   │                   │
+    │ 批量取消 100 个运行 │                  │                   │                   │
+    ├───────────────────▶│                  │                   │                   │
+    │                    │                  │                   │                   │
+    │              处理 run_001 (PENDING)   │                   │                   │
+    │                    ├───┐              │                   │                   │
+    │                    │   │ status=CANCELED                │                   │
+    │                    │   │              │                   │                   │
+    │                    │◀──┘              │                   │                   │
+    │                    │                  │                   │                   │
+    │                    #finalizeRun       │                   │                   │
+    │                    ├────────────────────────────────────▶│                   │
+    │                    │ scheduleCompleteBatch (job_1)        │                   │
+    │                    │                  │                   │                   │
+    │              处理 run_002 (EXECUTING) │                   │                   │
+    │                    ├───┐              │                   │                   │
+    │                    │   │ status=PENDING_CANCEL           │                   │
+    │                    │   │              │                   │                   │
+    │                    │◀──┘              │                   │                   │
+    │                    │ 通知取消          │                   │                   │
+    │                    ├─────────────────▶│                   │                   │
+    │                    │                  │ 运行中...         │                   │
+    │                    │                  │                   │                   │
+    │                    #finalizeRun (未触发，因为还没终态)    │                   │
+    │                    │                  │                   │                   │
+    │                    ... (处理其他 98 个运行)              │                   │
+    │                    │                  │                   │                   │
+    │                    │  200ms 后，job_1 执行 tryCompleteBatch                   │
+    │                    │                  │                   ├───┐               │
+    │                    │                  │                   │   │ 检测到还有     │
+    │                    │                  │                   │   │ PENDING_CANCEL │
+    │                    │                  │                   │   │ 运行，不完成   │
+    │                    │                  │                   │◀──┘               │
+    │                    │                  │                   │                   │
+    │                    │                  │ run_002 取消完成  │                   │
+    │                    │                  ├──────────────────▶│                   │
+    │                    │                  │ status=CANCELED   │                   │
+    │                    │                  │                   │                   │
+    │                    #finalizeRun       │                   │                   │
+    │                    ├────────────────────────────────────▶│                   │
+    │                    │ scheduleCompleteBatch (job_2)        │                   │
+    │                    │                  │                   │                   │
+    │                    │                  │  200ms 后，job_2 执行                   │
+    │                    │                  │                   ├───┐               │
+    │                    │                  │                   │   │ 所有运行已终态 │
+    │                    │                  │                   │◀──┘               │
+    │                    │                  │                   │                   │
+    │                    │                  │                   │ Batch.status      │
+    │                    │                  │                   │ = COMPLETED       │
+    │                    │                  │                   ├──────────────────▶│
+    │                    │                  │                   │ completeWaitpoint │
+    │                    │                  │                   │                   │
+    │                    │                  │                   │                   ├───┐
+    │                    │                  │                   │                   │   │ 唤醒父任务
+    │                    │                  │                   │                   │◀──┘
+    │◀──────────────────────────────────────────────────────────────────────────────┤
+    │                          batch.triggerAndWait() 返回结果                      │
+```
+
+---
+
+### 6.9 关键设计决策分析
+
+#### 决策 1：为什么通过 #finalizeRun 统一触发，而不是批量检测后统一触发？
+
+**原因**:
+1. **解耦**: Bulk Action 不需要知道批次逻辑，运行终态化也不需要知道 Bulk Action
+2. **实时性**: 最后一个运行终态化后 200ms 内就能完成批次检测
+3. **鲁棒性**: 即使 Bulk Action 中断，已终态化的运行仍然会触发检测
+4. **通用性**: 无论运行是成功、失败还是取消，都走同一个路径
+
+#### 决策 2：为什么 alreadyFinished 计为失败？
+
+```typescript
+// BulkActionV2.server.ts:216-217
+if (!result || result.alreadyFinished) {
+  failureCount++;
+```
+
+**原因**:
+- Bulk Action 的目标是"执行操作"，而不是"确保终态"
+- 对已完成的运行执行取消操作，操作本身没有产生效果
+- 用户关心的是"我成功取消了多少个运行"，而不是"有多少个运行已经是终态"
+
+#### 决策 3：为什么 Replay 不继承原 batchId？
+
+**原因**:
+1. **语义纯净**: 批次代表"一次批量触发操作"，重播是另一次独立操作
+2. **计数准确**: 原批次的 `runCount` 是固定的，添加新运行会导致计数混乱
+3. **责任清晰**: 原批次只对它创建的运行负责，重播的运行由 Bulk Action 负责
+4. **实现简单**: 不需要修改 BatchTaskRun 的不可变字段
+
+#### 决策 4：为什么 CANCELED 被视为终态？
 
 ```typescript
 // isFinalRunStatus 包括 CANCELED
@@ -676,7 +813,7 @@ if (runs.every((r) => isFinalRunStatus(r.status))) {
 
 ---
 
-## 八、设计权衡与思考
+## 七、设计权衡与思考
 
 ### 8.1 为什么 v1 批次强制顺序处理？
 
@@ -689,13 +826,13 @@ this._batchProcessingStrategy = "sequential";
 
 **权衡**: 牺牲并行速度，避免数据库锁竞争导致的死锁和性能下降。对于批次触发来说，创建任务的速度通常不是瓶颈，任务本身的执行才是。
 
-### 8.2 为什么 v2 批次使用 DRR 调度？
+#### 7.2 为什么 v2 批次使用 DRR 调度？
 
 **问题**: 单个大客户的 10 万项批次可能阻塞所有其他用户的批次处理。
 
 **解决方案**: DRR 确保每个环境（tenant）公平分配处理资源，通过 `quantum` 控制每轮处理的消息数。
 
-### 8.3 为什么 Bulk Action 不用 BatchQueue？
+#### 7.3 为什么 Bulk Action 不用 BatchQueue？
 
 - Bulk Action 的操作（取消/重播）通常很快，不需要复杂的调度
 - Bulk Action 是用户交互式操作，响应速度比公平调度更重要
@@ -703,7 +840,7 @@ this._batchProcessingStrategy = "sequential";
 
 ---
 
-## 总结
+## 八、总结
 
 ### 核心设计模式
 
@@ -714,21 +851,44 @@ Batch Trigger 和 Bulk Action 虽然目标不同，但共享了**"批次拆分 �
 3. **接力式处理** 支持中断恢复和流量平滑
 4. **原子计数 + 回调** 实现可靠的结果回收
 
-### 跨系统协同的关键洞察
+### 跨系统协同的关键修正与洞察
 
-当 Bulk Action 作用于 Batch Trigger 生成的运行时，两者通过**事件驱动 + 去抖动**的方式协同：
+#### 修正的关键误解
 
-1. **状态回写**: `bulkActionGroupIds` 字段实现可追溯性，不影响业务逻辑
-2. **完成检测**: 每个运行终态化时触发 `scheduleCompleteBatch`，通过 200ms 延迟 + 唯一 Job ID 实现去抖动
-3. **等待恢复**: `CANCELED` 被视为终态，确保用户取消后父任务能及时恢复
-4. **边界清晰**: 重播创建的新运行不继承原 batchId，保持批次语义纯净
+| 误解点 | 错误理解 | 实际代码行为 |
+|--------|----------|-------------|
+| 批次检测触发时机 | 只有取消操作触发 | **所有终态化路径**统一通过 `#finalizeRun` 触发（成功/失败/取消） |
+| Replay 对原运行的影响 | 可能先取消原运行 | **不修改原运行**，只创建新运行，原运行状态保持不变 |
+| V1/V2 取消分流 | 无差异 | 分流明确，V1 走 `CancelTaskRunServiceV1`，V2 走 `engine.cancelRun()` |
+| alreadyFinished 计数 | 已完成算成功 | `alreadyFinished: true` 被计为 **failureCount**（失败） |
+
+#### 协同链路核心机制
+
+当 Bulk Action 作用于 Batch Trigger 生成的运行时，两者通过**统一出口 + 去抖动**的方式协同：
+
+1. **统一出口**: `#finalizeRun` 是所有运行终态化的汇聚点，无论成功/失败/取消都会触发批次检测
+2. **去抖动**: `scheduleCompleteBatch` 通过 200ms 延迟 + 唯一 Job ID 合并多次检测请求
+3. **状态回写**: `bulkActionGroupIds` 字段实现可追溯性，纯标记不影响业务逻辑
+4. **等待恢复**: `CANCELED` 是 8 种终态之一，确保用户取消后父任务能及时恢复
+5. **边界清晰**: 重播创建的新运行不继承原 batchId，保持批次语义纯净
+
+#### 不同分支下父任务恢复时序
+
+| 分支场景 | 批次完成时机 | 父任务恢复延迟 |
+|---------|-------------|---------------|
+| **所有运行正常完成** | 最后一个运行成功/失败后 ~200ms | 正常 |
+| **全部取消（排队中）** | 取消操作完成后 ~200ms | 很快（所有运行立即终态化） |
+| **全部取消（含执行中）** | 最后一个 worker 确认取消后 ~200ms | 取决于最长的运行取消时间 |
+| **部分取消** | 未取消的运行自然完成后 | 取决于未取消运行的执行时间 |
+| **批量重播失败项** | 原批次所有运行自然终态后 | 不受重播影响，按原时序恢复 |
 
 ### 设计哲学
 
 整个系统体现了以下设计原则：
-- **解耦优于协调**: Bulk Action 不需要知道批次逻辑，通过事件隐式协同
+- **解耦优于协调**: Bulk Action 不需要知道批次逻辑，通过 `#finalizeRun` 隐式协同
 - **最终一致性**: 不追求强一致，通过去抖动和重试达到最终一致
 - **用户期望优先**: `CANCELED` 作为终态、父任务及时恢复都是为了符合用户直觉
 - **鲁棒性**: 任何环节中断都不会导致系统死锁或状态不一致
+- **语义纯净**: 批次、重播、取消各有清晰的边界，不互相污染
 
 理解这些机制有助于在使用 Trigger.dev 时更好地规划批量任务，以及在遇到问题时快速定位。
