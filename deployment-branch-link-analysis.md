@@ -180,7 +180,7 @@ if (instance.environment.archivedAt) {
 ```
 
 **2. 运行引擎层出队阶段**：
-**文件**: `internal-packages/run-engine/src/engine/systems/dequeueSystem.ts:849-854`
+**文件**: `internal-packages/run-engine/src/engine/systems/dequeueSystem.ts:849-857`
 ```typescript
 if (run.runtimeEnvironment.archivedAt) {
   span.setAttribute("result", "RUN_ENVIRONMENT_ARCHIVED");
@@ -188,14 +188,30 @@ if (run.runtimeEnvironment.archivedAt) {
     success: false as const,
     code: "RUN_ENVIRONMENT_ARCHIVED",
     message: `Run is on an archived environment: ${run.id}`,
+    run,  // 🔴 返回 run 对象供后续处理
   };
 }
 ```
 
+**出队后的处理逻辑**：
+**文件**: `internal-packages/run-engine/src/engine/systems/dequeueSystem.ts:298-309`
+```typescript
+case "RUN_ENVIRONMENT_ARCHIVED": {
+  // this happens if the preview branch was archived
+  this.$.logger.warn(
+    "RunEngine.dequeueFromWorkerQueue(): Run environment archived",
+    { runId, latestSnapshot: snapshot.id, result }
+  );
+  // 🔴 确认消息（从队列中移除），不执行任务
+  await this.$.runQueue.acknowledgeMessage(orgId, runId);
+  return;
+}
+```
+
 **归档过滤的三层防护**：
-1. **鉴权层**：RBAC authenticateBearer → childEnvironments 查询条件 `archivedAt: null`
-2. **调度层**：schedule-engine 执行前检查 `instance.environment.archivedAt`
-3. **执行层**：run-engine dequeue 时检查 `run.runtimeEnvironment.archivedAt`
+1. **鉴权层**：RBAC authenticateBearer → childEnvironments 查询条件 `archivedAt: null` → 阻止新请求路由到归档分支
+2. **调度层**：schedule-engine 执行前检查 `instance.environment.archivedAt` → 阻止定时任务触发新 run
+3. **执行层**：run-engine dequeue 时检查 `run.runtimeEnvironment.archivedAt` → 已入队的 run 被确认（从队列移除）但**不执行**
 
 ---
 
@@ -644,14 +660,18 @@ public async call(orgFilter, { environmentId }) {
 
 ### 5.2 环境变量合并
 - 合并入口: `apps/webapp/app/v3/environmentVariables/environmentVariablesRepository.server.ts:899-933`
-- 去重算法（优先级关键）: `apps/webapp/app/v3/deduplicateVariableArray.server.ts:4-14`
+- 去重算法（优先级关键）: `apps/webapp/app/v3/deduplicateVariableArray.server.ts:1-14`
 - 父子继承: `apps/webapp/app/v3/environmentVariables/environmentVariablesRepository.server.ts:645-685`
 - TRIGGER_PREVIEW_BRANCH 服务端注入: `apps/webapp/app/v3/environmentVariables/environmentVariablesRepository.server.ts:1123-1130`
+- 环境变量构建（任务执行时）: `apps/webapp/app/v3/marqs/sharedQueueConsumer.server.ts:2190-2222`
 
 ### 5.3 TRIGGER_PREVIEW_BRANCH 链路
-- 构建参数注入: `packages/cli-v3/src/deploy/buildImage.ts:235`
-- Containerfile 模板: `packages/cli-v3/src/deploy/buildImage.ts:790-799`
-- SDK 读取: `packages/core/src/v3/apiClientManager/index.ts:47-55`
+- CLI 参数定义: `packages/cli-v3/src/deploy/buildImage.ts:50`
+- 构建参数注入: `packages/cli-v3/src/deploy/buildImage.ts:234-235`
+- Containerfile 模板（indexer 阶段）: `packages/cli-v3/src/deploy/buildImage.ts:780-826`
+- 服务端动态注入: `apps/webapp/app/v3/environmentVariables/environmentVariablesRepository.server.ts:1123-1130`
+- 任务环境构建: `apps/webapp/app/v3/marqs/sharedQueueConsumer.server.ts:2190-2222`
+- SDK 读取: `packages/core/src/v3/apiClientManager/index.ts:47-55, 65`
 - ApiClient 请求头添加: `packages/core/src/v3/apiClient/index.ts:1843-1845`
 
 ### 5.4 分支生命周期
