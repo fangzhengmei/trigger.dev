@@ -532,7 +532,7 @@ async getWorkerQueue(
   }
 
   // 非开发环境: 通过WorkerGroupService获取项目默认worker组
-  // 关键: 这里没有区分STAGING和PRODUCTION
+  // 关键: 这里没有区分STAGING、PRODUCTION、PREVIEW
   // 它们使用相同的默认worker组策略
   const workerGroupService = new WorkerGroupService({
     prisma: this.prisma,
@@ -627,7 +627,7 @@ getWorkerQueue(E)
 
 ## 3. 调度服务 (Schedule Engine)
 
-### 2.1 核心架构
+### 3.1 核心架构
 
 **文件**: `internal-packages/schedule-engine/src/engine/index.ts`
 
@@ -647,7 +647,7 @@ export class ScheduleEngine {
 }
 ```
 
-### 2.2 调度注册流程
+### 3.2 调度注册流程
 
 **方法**: `registerNextTaskScheduleInstance` (line 125-269)
 
@@ -660,7 +660,7 @@ export class ScheduleEngine {
 2. 从实例获取 `environment.type` 用于指标标记 (line 170)
 3. 根据环境类型应用不同的调度策略
 
-### 2.3 调度触发流程
+### 3.3 调度触发流程
 
 **方法**: `triggerScheduledTask` (line 285-636)
 
@@ -1016,7 +1016,7 @@ export class RunQueue {
 │  ┌───────────────────────────────▼───────────────────────────────┐  │
 │  │ 2. 开发环境特殊检查                                          │  │
 │  │    - DEVELOPMENT: 检查devPresence连接状态                    │  │
-│  │    - STAGING/PRODUCTION: 无额外检查                          │  │
+│  │    - STAGING/PRODUCTION/PREVIEW: 无额外检查                  │  │
 │  └───────────────────────────────┬───────────────────────────────┘  │
 │                                  │                                  │
 │  ┌───────────────────────────────▼───────────────────────────────┐  │
@@ -1175,22 +1175,53 @@ environmentId > projectId > orgId > workerQueue
    - 支持按环境类型过滤（`task.schedule.environments`）
 
 4. **运行器路由**:
-   - `DEVELOPMENT` 和 `PREVIEW` 环境: 使用 `environment.id` 作为队列名，强隔离
-   - `STAGING` 和 `PRODUCTION`: 默认共享项目worker组，可通过 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按环境ID精确指定
+   - 只有 `DEVELOPMENT` 环境: 使用 `environment.id` 作为队列名，强隔离
+   - `STAGING`、`PRODUCTION`、`PREVIEW`: 默认共享项目worker组，可通过 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按环境ID精确指定
 
-### 9.2 Staging与Production隔离机制
+### 9.2 四类环境运行器队列选择对比
 
-| 维度 | Staging | Production | 隔离机制 |
-|------|---------|------------|----------|
-| **数据模型** | 独立的RuntimeEnvironment记录，`type=STAGING` | 独立的RuntimeEnvironment记录，`type=PRODUCTION` | 独立的数据库记录，独立的apiKey |
-| **分支映射** | `branchTracking.staging.branch` | `branchTracking.prod.branch` | 通过BranchTrackingConfig分别配置 |
-| **调度实例** | 独立的TaskScheduleInstance，`environmentId=staging_env_id` | 独立的TaskScheduleInstance，`environmentId=prod_env_id` | 每个环境独立的调度实例 |
-| **运行队列** | 默认共享项目worker组，可通过覆盖配置隔离 | 默认共享项目worker组，可通过覆盖配置隔离 | 支持RUN_ENGINE_WORKER_QUEUE_OVERRIDES按environmentId精确指定 |
-| **执行环境** | 部署到staging环境的worker版本 | 部署到production环境的worker版本 | 独立部署，独立版本管理 |
+| 环境类型 | 是否使用 `environment.id` 作为队列名 | 默认队列来源 | 支持队列覆盖 | 代码位置 |
+|----------|-------------------------------------|--------------|--------------|----------|
+| **DEVELOPMENT** | ✅ 是 | `masterQueue = environment.id` | ✅ 支持 | queues.server.ts:380-381 |
+| **STAGING** | ❌ 否 | 查询项目默认worker组 | ✅ 支持 | queues.server.ts:384-407 |
+| **PRODUCTION** | ❌ 否 | 查询项目默认worker组 | ✅ 支持 | queues.server.ts:384-407 |
+| **PREVIEW** | ❌ 否 | 查询项目默认worker组 | ✅ 支持 | queues.server.ts:384-407 |
 
-### 9.3 多层隔离机制总结
+**关键代码事实**:
+- `queues.server.ts:380` 只对 `environment.type === "DEVELOPMENT"` 有特殊处理
+- `workerQueueResolver.ts:67-68` 只对 `environmentType === "DEVELOPMENT"` 有特殊处理
+- STAGING、PRODUCTION、PREVIEW 三类环境走完全相同的worker队列选择逻辑
+- 四类环境都支持 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按 `environmentId` 精确指定队列
 
-整个系统通过**多层隔离机制**确保staging和production环境的调度信号正确隔离:
+### 9.3 各环境隔离维度对比
+
+| 维度 | DEVELOPMENT | STAGING | PRODUCTION | PREVIEW |
+|------|-------------|---------|------------|---------|
+| **数据模型** | 独立的RuntimeEnvironment记录，`type=DEVELOPMENT` | 独立的RuntimeEnvironment记录，`type=STAGING` | 独立的RuntimeEnvironment记录，`type=PRODUCTION` | 独立的RuntimeEnvironment记录，`type=PREVIEW` |
+| **分支映射** | 无 | `branchTracking.staging.branch` | `branchTracking.prod.branch` | `environment.branchName` 存储分支名 |
+| **调度实例** | 独立的TaskScheduleInstance | 独立的TaskScheduleInstance | 独立的TaskScheduleInstance | 独立的TaskScheduleInstance |
+| **运行队列** | `masterQueue = environment.id` | 查询项目默认worker组 | 查询项目默认worker组 | 查询项目默认worker组 |
+| **执行环境** | 开发者本地CLI | 部署到staging环境的worker版本 | 部署到production环境的worker版本 | 部署到preview环境的worker版本 |
+
+### 9.4 队列选择最终结论
+
+**✅ 走 `environment.id` 队列的环境：**
+- 只有 **DEVELOPMENT** 环境
+- 代码依据：`queues.server.ts:380-381` 和 `workerQueueResolver.ts:67-68` 两处都只对 `DEVELOPMENT` 类型特殊处理
+
+**❌ 走项目 worker 组的环境：**
+- **STAGING** 环境
+- **PRODUCTION** 环境
+- **PREVIEW** 环境（包括所有预览分支子环境）
+- 代码依据：这三类环境在 `queues.server.ts:384-407` 中走相同的 `WorkerGroupService.getDefaultWorkerGroupForProject()` 逻辑
+
+**⚠️ 注意：**
+- 四类环境都支持通过 `RUN_ENGINE_WORKER_QUEUE_OVERRIDES` 按 `environmentId` 精确指定队列
+- 队列覆盖优先级：`environmentId > projectId > orgId > workerQueue`
+
+### 9.5 多层隔离机制总结
+
+整个系统通过**多层隔离机制**确保各环境的调度信号正确隔离:
 
 1. **数据隔离**: 独立的环境记录和调度实例
 2. **认证隔离**: 每个环境独立的API密钥
