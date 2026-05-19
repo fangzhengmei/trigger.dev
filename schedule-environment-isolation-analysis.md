@@ -66,7 +66,571 @@ model TaskScheduleInstance {
 
 ---
 
-## 2. 调度服务 (Schedule Engine)
+## 2. 分支与环境选择决策链
+
+### 2.1 分支跟踪配置 (BranchTrackingConfig)
+
+项目级别的分支映射配置存储在 `ConnectedGithubRepository` 表的 `branchTracking` 字段中，定义了哪些Git分支对应到哪些环境。
+
+**文件**: `apps/webapp/app/v3/github.ts:3-12`
+
+```typescript
+export const BranchTrackingConfigSchema = z.object({
+  prod: z.object({
+    branch: z.string().optional(),
+  }),
+  staging: z.object({
+      branch: z.string().optional(),
+    }),
+});
+
+export function getTrackedBranchForEnvironment(
+  branchTracking: BranchTrackingConfig | undefined,
+  previewDeploymentsEnabled: boolean,
+  environment: {
+    type: "PRODUCTION" | "STAGING" | "DEVELOPMENT" | "PREVIEW";
+    branchName?: string;
+  }
+): string | undefined {
+  switch (environment.type) {
+    case "PRODUCTION":
+      return branchTracking?.prod?.branch;
+    case "STAGING":
+      return branchTracking?.staging?.branch;
+    case "PREVIEW":
+      return previewDeploymentsEnabled ? environment.branchName : undefined;
+    case "DEVELOPMENT":
+      return undefined;
+  }
+}
+```
+
+**配置示例**:
+```javascript
+// 连接GitHub仓库时的默认配置
+branchTracking: {
+  prod: { branch: "main" },     // main分支 → production环境
+  staging: { branch: "develop" },   // develop分支 → staging环境
+}
+```
+
+**文件**: `apps/webapp/app/services/projectSettings.server.ts:91-94`
+
+```typescript
+// 连接GitHub仓库时自动创建分支跟踪配置
+branchTracking: {
+  prod: { branch: defaultBranch },
+  staging: {},
+}
+```
+
+### 2.2 环境类型与分支的关联
+
+**文件**: `apps/webapp/app/models/runtimeEnvironment.server.ts:94-166`
+
+```typescript
+// 环境通过两个关键字段建立分支关联:
+type RuntimeEnvironment = {
+  id: string;
+  type: RuntimeEnvironmentType;  // PRODUCTION | STAGING | DEVELOPMENT | PREVIEW
+  branchName: string | null;     // 关联的Git分支名（仅PREVIEW环境有值
+  parentEnvironmentId: string | null;  // 父环境ID（PREVIEW环境指向PREVIEW根环境
+  shortcode: string;           // 环境短标识
+  // ...
+}
+```
+
+**环境层级关系**:
+
+```
+┌──────────────────────────────────────────────────────────┐
+│              RuntimeEnvironment 层级关系                 │
+├──────────────────────────────────────────────────────────┤
+│                                                  │
+│  PRODUCTION (type=PRODUCTION)                      │
+│    └─ shortcode: "prod"                          │
+│    └─ branchName: null                            │
+│    └─ parentEnvironmentId: null                  │
+│                                                  │
+│  STAGING (type=STAGING)                      │
+│    └─ shortcode: "staging"                       │
+│    └─ branchName: null                            │
+│    └─ parentEnvironmentId: null                  │
+│                                                  │
+│  PREVIEW (type=PREVIEW, isBranchable=true)   │
+│    └─ shortcode: "preview"                       │
+│    └─ branchName: null                            │
+│    └─ parentEnvironmentId: null                  │
+│    │                                              │
+│    ├─ PREVIEW (type=PREVIEW, branchName="feature-x")  │
+│    │    └─ shortcode: "preview-feature-x" │
+│    │    └─ branchName: "feature-x"           │
+│    │    └─ parentEnvironmentId: <preview-root-id │
+│    │                                              │
+│    └─ PREVIEW (type=PREVIEW, branchName="feature-y")  │
+│         └─ shortcode: "preview-feature-y" │
+│         └─ branchName: "feature-y"           │
+│         └─ parentEnvironmentId: <preview-root-id │
+│                                                  │
+│  DEVELOPMENT (type=DEVELOPMENT)                │
+│    └─ shortcode: "dev"                             │
+│    └─ branchName: null                            │
+│    └─ parentEnvironmentId: null                  │
+│                                                  │
+└──────────────────────────────────────────────────────────┘
+```
+
+**关键设计**:
+1. **PRODUCTION/STAGING/DEVELOPMENT 是**环境类型，每个项目各有一个根环境
+2. **PREVIEW** 环境可以有多个子环境，每个子环境对应一个Git分支
+3. `branchName` 字段仅在 PREVIEW 子环境上有值
+4. `parentEnvironmentId` 建立父子环境的层级关系
+
+### 2.3 部署时的环境选择决策链
+
+**CLI部署命令: `packages/cli-v3/src/commands/deploy.ts:63-111`
+
+```typescript
+const DeployCommandOptions = CommonCommandOptions.extend({
+  env: z.enum(["prod", "staging", "preview", "production"],
+  branch: z.string().optional(),
+  // ...
+});
+
+// 命令行选项说明
+.option(
+  "-e, --env <env>",
+  "Deploy to a specific environment",
+  "prod"
+)
+.option(
+  "-b, --branch <branch>",
+  "The preview branch to deploy to when passing --env preview"
+)
+```
+
+**环境选择流程:
+
+```
+CLI部署 → 环境类型解析 → 环境ID查找 → 认证环境对象创建
+```
+
+**步骤1: CLI环境参数解析**
+- `--env prod` → 查找 type=PRODUCTION
+- `--env staging` → 查找 type=STAGING
+- `--env preview` → 需要 `--branch` 参数
+
+**步骤2: 预览环境分支匹配**
+
+**文件**: `apps/webapp/app/models/runtimeEnvironment.server.ts:94-166
+
+```typescript
+export async function findEnvironmentByApiKey(
+  apiKey: string,
+  branchName: string | undefined
+): Promise<AuthenticatedEnvironment | null> {
+  // 1. 根据apiKey查找环境
+  let environment = await $replica.runtimeEnvironment.findFirst({
+    where: { apiKey },
+    include: {
+      // 如果提供了branchName，加载匹配的子环境
+      childEnvironments: branchName
+        ? {
+            where: {
+              branchName: sanitizeBranchName(branchName),
+              archivedAt: null,
+            },
+          }
+        : undefined,
+    },
+  });
+
+  // 2. 如果是PREVIEW类型且提供了branchName
+  if (environment.type === "PREVIEW") {
+    if (!branchName) {
+      logger.warn("Preview env with no branch name provided");
+      return null;
+    }
+
+    // 返回匹配的子环境（如果存在）
+    const childEnvironment = environment.childEnvironments.at(0);
+    if (childEnvironment) {
+      return toAuthenticated({
+        ...childEnvironment,
+        apiKey: environment.apiKey,  // 继承父环境的apiKey
+        orgMember: environment.orgMember,
+        organization: environment.organization,
+        project: environment.project,
+      });
+    }
+
+    // 分支不存在则返回null
+    return null;
+  }
+
+  // 3. 非PREVIEW环境直接返回
+  return toAuthenticated(environment);
+}
+```
+
+**步骤3: 预览分支环境创建（如果不存在）**
+
+**文件**: `apps/webapp/app/services/upsertBranch.server.ts:17-158
+
+```typescript
+export class UpsertBranchService {
+  public async call(
+    orgFilter: { type: "userMembership"; userId: string } | { type: "orgId"; organizationId: string },
+    { parentEnvironmentId, branchName, git }: CreateBranchOptions
+  ) {
+    const sanitizedBranchName = sanitizeBranchName(branchName);
+
+    // 1. 查找父环境（PREVIEW根环境）
+    const parentEnvironment = await this.#prismaClient.runtimeEnvironment.findFirst({
+      where: { id: parentEnvironmentId },
+      include: { organization: true, project: true },
+    });
+
+    // 2. 检查父环境必须支持分支
+    if (!parentEnvironment.isBranchableEnvironment) {
+      return { success: false, error: "Your preview environment is not branchable" };
+    }
+
+    // 3. 创建或更新分支环境
+    const branchSlug = `${slug(`${parentEnvironment.slug}-${sanitizedBranchName}`;
+    const shortcode = branchSlug;
+
+    const branch = await this.#prismaClient.runtimeEnvironment.upsert({
+      where: {
+        projectId_shortcode: {
+        projectId: parentEnvironment.project.id,
+        shortcode: shortcode,
+      },
+      create: {
+        slug: branchSlug,
+        apiKey: createApiKeyForEnv(parentEnvironment.type),
+        shortcode,
+        branchName: sanitizedBranchName,
+        type: parentEnvironment.type,  // 继承父环境类型（PREVIEW）
+        parentEnvironment: { connect: { id: parentEnvironment.id },
+        organization: { connect: { id: parentEnvironment.organization.id } },
+        project: { connect: { id: parentEnvironment.project.id } },
+        git: git ?? undefined,
+      },
+      update: {
+        git: git ?? undefined,
+      },
+    });
+
+    return { success: true, branch, alreadyExisted: branch.createdAt < now };
+  }
+}
+```
+
+**分支环境创建后的完整流程:
+
+```
+部署 --env preview --branch feature-x
+        │
+        ▼
+1. 使用PREVIEW环境的apiKey认证
+        │
+        ▼
+2. findEnvironmentByApiKey(apiKey, "feature-x")
+        │
+        ├─► 查找子环境 branchName="feature-x"
+        │
+        ├─► 存在 → 返回子环境
+        │
+        └─► 不存在 →
+              │
+              ▼
+3. UpsertBranchService 创建分支环境
+        │
+        ▼
+4. 返回新创建的分支环境
+```
+
+### 2.4 调度实例归属与分支的关联
+
+**文件**: `apps/webapp/app/v3/services/createBackgroundWorker.server.ts:626-784`
+
+```typescript
+export async function syncDeclarativeSchedules(
+  tasks: TaskResource[],
+  worker: BackgroundWorker,
+  environment: AuthenticatedEnvironment,
+  prisma: PrismaClientOrTransaction
+) {
+  // 1. 过滤出带schedule定义的task
+  const tasksWithDeclarativeSchedules = tasks.filter((task) => task.schedule);
+
+  // 2. 加载该项目已有的DECLARATIVE类型的调度
+  const existingDeclarativeSchedules = await prisma.taskSchedule.findMany({
+    where: {
+      type: "DECLARATIVE",
+      projectId: environment.projectId,
+    },
+    include: { instances: true },
+  });
+
+  // 3. 为每个带调度的task创建/更新调度
+  for (const task of tasksWithDeclarativeSchedules) {
+    // 关键: 检查环境过滤
+    if (task.schedule.environments && task.schedule.environments.length > 0) {
+      // 如果调度定义了environments数组，检查当前环境是否在列表中
+      if (!task.schedule.environments.includes(environment.type)) {
+        logger.debug("Skipping schedule creation due to environment filter", {
+          taskId: task.id,
+          environmentType: environment.type,
+          allowedEnvironments: task.schedule.environments,
+        });
+        continue;  // 当前环境不在允许列表中，跳过
+      }
+    }
+
+    // 查找该task在当前环境是否已有调度实例
+    const existingSchedule = existingDeclarativeSchedules.find(
+      (schedule) =>
+        schedule.taskIdentifier === task.id &&
+        schedule.instances.some(
+          (instance) => instance.environmentId === environment.id
+        )
+    );
+
+    if (existingSchedule) {
+      // 更新现有调度
+      const schedule = await prisma.taskSchedule.update({
+        where: { id: existingSchedule.id },
+        data: {
+          generatorExpression: task.schedule.cron,
+          generatorDescription: cronstrue.toString(task.schedule.cron),
+          timezone: task.schedule.timezone,
+        },
+        include: { instances: true },
+      });
+
+      // 重新注册调度实例
+      const instance = schedule.instances.at(0);
+      if (instance) {
+        await scheduleEngine.registerNextTaskScheduleInstance({
+          instanceId: instance.id,
+        });
+      }
+    } else {
+      // 创建新调度及其实例
+      const newSchedule = await prisma.taskSchedule.create({
+        data: {
+          friendlyId: generateFriendlyId("sched"),
+          projectId: environment.projectId,
+          taskIdentifier: task.id,
+          generatorExpression: task.schedule.cron,
+          generatorDescription: cronstrue.toString(task.schedule.cron),
+          timezone: task.schedule.timezone,
+          type: "DECLARATIVE",
+          instances: {
+            create: [
+              {
+                environmentId: environment.id,  // 关键: 关联到当前环境
+                projectId: environment.projectId,
+              },
+            ],
+          },
+        },
+        include: { instances: true },
+      });
+
+      const instance = newSchedule.instances.at(0);
+      if (instance) {
+        await scheduleEngine.registerNextTaskScheduleInstance({
+          instanceId: instance.id,
+        });
+      }
+    }
+  }
+
+  // 4. 删除不再需要的调度实例
+  // 只删除当前环境的实例，不影响其他环境
+  for (const schedule of potentiallyDeletableSchedules) {
+    const canDeleteSchedule =
+      schedule.instances.length === 0 ||
+      schedule.instances.every(
+      (instance) => instance.environmentId === environment.id
+    );
+
+    if (canDeleteSchedule) {
+      // 所有实例都属于当前环境，可以删除整个调度
+      await prisma.taskSchedule.delete({ where: { id: schedule.id });
+    } else {
+      // 只删除当前环境的实例，保留其他环境的
+      await prisma.taskScheduleInstance.deleteMany({
+        where: {
+          taskScheduleId: schedule.id,
+          environmentId: environment.id,
+        },
+      });
+    }
+  }
+}
+```
+
+**调度实例归属决策链:
+
+```
+部署到环境 E (environmentId=env_123, type=STAGING, branchName=null)
+        │
+        ▼
+syncDeclarativeSchedules(tasks, worker, E)
+        │
+        ▼
+遍历每个带schedule的task
+        │
+        ├─► task.schedule.environments = ["PRODUCTION"]
+        │       │
+        │       ├─► E.type = STAGING
+        │       │
+        │       └─► 不在列表中 → 跳过 ❌
+        │
+        └─► task.schedule.environments = ["STAGING", "PRODUCTION"]
+                │
+                ├─► E.type = STAGING
+                │
+                └─► 在列表中 → 继续 ✅
+                        │
+                        ▼
+                查找该task在E中是否已有实例
+                        │
+                        ├─► 有 → 更新调度cron/timezone
+                        │       重新注册实例
+                        │
+                        └─► 无 → 创建TaskSchedule
+                                │
+                                └─► 创建TaskScheduleInstance
+                                        │
+                                        └─► environmentId = E.id
+                                        └─► projectId = E.projectId
+```
+
+**关键点**:
+1. **调度定义 (TaskSchedule) 是**项目级**的，跨环境共享
+2. **调度实例 (TaskScheduleInstance) 是**环境级**的，每个环境独立
+3. 一个调度可以在多个环境有实例，也可以只在特定环境有实例
+4. 部署时只处理**当前环境**的调度实例，不影响其他环境
+
+### 2.5 分支对运行器路由的影响
+
+**文件**: `apps/webapp/app/runEngine/concerns/queues.server.ts:376-410`
+
+```typescript
+async getWorkerQueue(
+  environment: AuthenticatedEnvironment,
+  regionOverride?: string
+): Promise<{ masterQueue: string; enableFastPath: boolean } | undefined> {
+  // 开发环境: 使用environment.id作为队列名
+  if (environment.type === "DEVELOPMENT") {
+    return { masterQueue: environment.id, enableFastPath: true };
+  }
+
+  // 非开发环境: 通过WorkerGroupService获取项目默认worker组
+  // 关键: 这里没有区分STAGING和PRODUCTION
+  // 它们使用相同的默认worker组策略
+  const workerGroupService = new WorkerGroupService({
+    prisma: this.prisma,
+    engine: this.engine,
+  });
+
+  const workerGroup = await workerGroupService.getDefaultWorkerGroupForProject({
+    projectId: environment.projectId,
+    regionOverride,
+  });
+
+  return {
+    masterQueue: workerGroup.queueName,
+    enableFastPath: workerGroup.supportsFastPath,
+  };
+}
+```
+
+**文件**: `internal-packages/run-engine/src/run-queue/workerQueueResolver.ts:30-64`
+
+```typescript
+export class WorkerQueueResolver {
+  // 支持通过环境变量精确指定环境到队列的映射
+  // 优先级: environmentId > projectId > orgId > workerQueue
+
+  #getOverride(message: OutputPayloadV2): string | null {
+    if (!this.overrides) return null;
+
+    // 1. 按环境ID精确匹配（优先级最高）
+    if (this.overrides.environmentId?.[message.environmentId]) {
+      return this.overrides.environmentId[message.environmentId];
+    }
+
+    // 2. 按项目ID匹配
+    if (this.overrides.projectId?.[message.projectId]) {
+      return this.overrides.projectId[message.projectId];
+    }
+
+    // 3. 按组织ID匹配
+    if (this.overrides.orgId?.[message.orgId]) {
+      return this.overrides.orgId[message.orgId];
+    }
+
+    // 4. 按workerQueue匹配
+    if (this.overrides.workerQueue?.[message.workerQueue]) {
+      return this.overrides.workerQueue[message.workerQueue];
+    }
+
+    return null;
+  }
+}
+```
+
+**运行器路由决策链:
+
+```
+调度触发 → 环境E
+        │
+        ▼
+getWorkerQueue(E)
+        │
+        ├─► E.type === DEVELOPMENT
+        │       │
+        │       └─► masterQueue = E.id
+        │
+        └─► E.type === STAGING
+        │       │
+        │       ├─► 检查RUN_ENGINE_WORKER_QUEUE_OVERRIDES
+        │       │       │
+        │       │       ├─► 有environmentId覆盖 → 使用覆盖值
+        │       │       │
+        │       │       └─► 无 → 查询项目默认worker组
+        │       │
+        │       └─► 返回workerGroup.queueName
+        │
+        └─► E.type === PRODUCTION
+                │
+                ├─► 检查RUN_ENGINE_WORKER_QUEUE_OVERRIDES
+                │       │
+                │       ├─► 有environmentId覆盖 → 使用覆盖值
+                │       │
+                │       └─► 无 → 查询项目默认worker组
+                │
+                └─► 返回workerGroup.queueName
+```
+
+**Staging与Production的运行器隔离方式**:
+
+| 场景 | 隔离方式 | 代码位置 |
+|------|---------|----------|
+| **默认情况** | STAGING和PRODUCTION共享项目默认worker组 | queues.server.ts:383-391 |
+| **需要隔离** | 通过`RUN_ENGINE_WORKER_QUEUE_OVERRIDES按environmentId精确指定 | workerQueueResolver.ts:50-52 |
+| **开发环境** | 每个DEVELOPMENT环境独立队列 | queues.server.ts:378-380 |
+| **预览分支** | 每个PREVIEW分支环境独立队列（同开发环境） | queues.server.ts:378-380 |
+
+---
+
+## 3. 调度服务 (Schedule Engine)
 
 ### 2.1 核心架构
 
