@@ -4,6 +4,8 @@
 
 Trigger.dev v3 采用了多执行 Provider 的架构设计，支持 Docker 和 Kubernetes 两种主要的任务执行环境。任务在不同 Provider 之间的分派逻辑涉及 **Provider 能力声明**、**调度判定** 和 **回退路径** 三个核心环节。
 
+> **重要修正**：经过深入代码分析，发现之前对 Provider 路由机制的理解存在多处错误。本文档将准确描述实际的架构设计和潜在问题。
+
 ---
 
 ## 一、Provider 类型与能力声明
@@ -80,9 +82,11 @@ Kubernetes Provider 提供更丰富的能力：
 - 支持自定义标签和亲和性调度
 - 内置 Pod 清理器和任务监控器
 
-### 1.5 Provider 注册与连接
+### 1.5 Provider 连接与类型声明
 
-Provider 通过 WebSocket 连接到平台，连接时声明自身类型：
+Provider 会建立 **两个独立的 WebSocket 连接** 到平台：
+
+#### 连接 1：/provider namespace（控制通道）
 
 ```typescript
 // packages/core/src/v3/apps/provider.ts:183-194
@@ -99,29 +103,172 @@ Provider 通过 WebSocket 连接到平台，连接时声明自身类型：
 }
 ```
 
-平台端在 `apps/webapp/app/v3/handleSocketIo.server.ts:383-418` 中创建 Provider namespace 处理连接。
+**用途**：
+- 接收 `INDEX` 消息进行部署索引
+- 上报 `WORKER_CRASHED`、`INDEXING_FAILED` 等状态
+- **x-trigger-provider-type 仅在此连接中发送**
+
+#### 连接 2：/shared-queue namespace（数据通道）
+
+```typescript
+// packages/core/src/v3/apps/provider.ts:125-181
+#createSharedQueueSocket() {
+  const sharedQueueConnection = new ZodSocketConnection({
+    namespace: "shared-queue",
+    host: PLATFORM_HOST,
+    port: Number(PLATFORM_WS_PORT),
+    // 注意：这里没有发送 x-trigger-provider-type header！
+    handlers: {
+      SERVER_READY: async (message) => {
+        await sender.send("READY_FOR_TASKS", {
+          backgroundWorkerId: "placeholder",
+        });
+      },
+      BACKGROUND_WORKER_MESSAGE: async (message) => {
+        if (message.data.type === "SCHEDULE_ATTEMPT") {
+          try {
+            await this.tasks.create({...});  // 执行任务
+          } catch (error) {
+            logger.error("create failed", error);
+          }
+        }
+      },
+    },
+  });
+}
+```
+
+**关键发现**：
+- `/shared-queue` 连接 **不发送** `x-trigger-provider-type` header
+- 平台端在处理 `/shared-queue` 连接时 **完全不使用** Provider 类型信息
+- **结论：Provider 类型声明不参与平台侧的调度判定**
+
+#### 平台端验证
+
+在 `apps/webapp/app/v3/handleSocketIo.server.ts` 中：
+
+```typescript
+// /provider namespace 的 postAuth 只处理 x-supports-dynamic-config
+postAuth: async (socket, next, logger) => {
+  // 只读取 x-supports-dynamic-config，不读取 x-trigger-provider-type
+  setSocketDataFromHeader("supportsDynamicConfig", "x-supports-dynamic-config", false);
+  // ...
+}
+
+// /shared-queue namespace 没有 postAuth，完全不读取任何 header
+function createSharedQueueConsumerNamespace(io: Server) {
+  const sharedQueue = new ZodNamespace({
+    name: "shared-queue",
+    onConnection: async (socket, handler, sender, logger) => {
+      // 直接创建 SharedSocketConnection，不检查 provider 类型
+      const sharedSocketConnection = new SharedSocketConnection({...});
+    },
+  });
+}
+```
+
+**最终结论**：`x-trigger-provider-type` header 仅用于标识，**不参与任何调度决策**。
 
 ---
 
 ## 二、任务调度判定流程
 
-### 2.1 整体架构
+### 2.1 整体架构（修正版）
 
 ```
-┌─────────────────┐     ┌────────────────────┐     ┌─────────────────┐
-│   Run Engine    │────▶│   Shared Queue     │────▶│  Provider Pool  │
-│  (任务生成器)   │     │   (消息队列)      │     │  (执行器池)    │
-└─────────────────┘     └────────────────────┘     └─────────────────┘
-          │                        │                         │
-          ▼                        ▼                         ▼
-  任务入队与优先级        消费与分发                 实际执行
+┌─────────────────────────────────────────────────────────────────────────┐
+│                          Platform (webapp)                               │
+│                                                                         │
+│  ┌─────────────────────────────┐  ┌─────────────────────────────┐       │
+│  │   SharedSocketConnection    │  │   SharedSocketConnection    │       │
+│  │ (Provider A 连接建立时创建) │  │ (Provider B 连接建立时创建) │       │
+│  │                             │  │                             │       │
+│  │  _sender: namespace.emit()  │  │  _sender: namespace.emit()  │       │
+│  │  ConsumerPool (10 个消费者) │  │  ConsumerPool (10 个消费者) │       │
+│  └──────────────┬──────────────┘  └──────────────┬──────────────┘       │
+│                 │                                │                       │
+│                 └────────────────┬───────────────┘                       │
+│                                  │                                       │
+│                                  ▼                                       │
+│                    Redis 共享队列 (LPOP 原子操作)                        │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+                         消息被某个消费者获取
+                                   │
+                                   ▼
+                         通过 namespace.emit() 广播
+                                   │
+              ┌────────────────────┴────────────────────┐
+              ▼                                         ▼
+     Provider A 执行任务                        Provider B 执行任务
 ```
 
-### 2.2 SharedQueueConsumer 调度流程
+### 2.2 关键架构特征
+
+#### 特征 1：每个 Provider 连接创建独立的消费者池
+
+```typescript
+// apps/webapp/app/v3/sharedSocketConnection.ts:67-100
+constructor(opts: SharedSocketConnectionOptions) {
+  this._sender = new ZodMessageSender({
+    schema: serverWebsocketMessages,
+    sender: async (message) => {
+      const { type, ...payload } = message;
+      opts.namespace.emit(type, payload as any);  // 广播到整个 namespace
+    },
+    canSendMessage() {
+      // 只要 namespace 有至少一个连接就返回 true
+      return opts.namespace.sockets.size > 0;
+    },
+  });
+
+  // 每个连接创建独立的消费者池
+  this._sharedQueueConsumerPool = new SharedQueueConsumerPool({
+    poolSize: opts.poolSize ?? this._defaultPoolSize,  // 默认 10
+    sender: this._sender,
+  });
+}
+```
+
+#### 特征 2：所有消费者池共享同一个 Redis 队列
+
+```typescript
+// apps/webapp/app/v3/marqs/index.server.ts:654-746
+public async dequeueMessageFromSharedWorkerQueue(consumerId: string) {
+  // 从同一个 Redis list 中 LPOP（原子操作）
+  const messageId = await this.redis.popMessageFromWorkerQueue(workerQueueKey);
+  // ...
+}
+```
+
+Redis 的 `LPOP` 是原子操作，确保每条消息只会被一个消费者获取。
+
+#### 特征 3：消息通过广播发送到所有 Provider
+
+```typescript
+// apps/webapp/app/v3/sharedSocketConnection.ts:72-81
+sender: async (message) => {
+  return new Promise((resolve, reject) => {
+    try {
+      const { type, ...payload } = message;
+      opts.namespace.emit(type, payload as any);  // 广播到所有连接的客户端
+      resolve();
+    } catch (err) {
+      reject(err);
+    }
+  });
+},
+```
+
+**潜在问题**：如果有 N 个 Provider 连接到 `/shared-queue` namespace，同一条 `SCHEDULE_ATTEMPT` 消息会被广播到所有 N 个 Provider，导致 **同一个任务被执行 N 次**！
+
+### 2.3 SharedQueueConsumer 调度流程
 
 调度逻辑主要在 `apps/webapp/app/v3/marqs/sharedQueueConsumer.server.ts` 中实现。
 
-#### 步骤 1：消息出队
+#### 阶段 1：消息出队与基本校验
 
 ```typescript
 // sharedQueueConsumer.server.ts:427-449
@@ -140,7 +287,7 @@ async #doWorkInternal(): Promise<DoWorkInternalResult> {
 }
 ```
 
-#### 步骤 2：任务状态校验
+#### 阶段 2：任务状态校验
 
 ```typescript
 // sharedQueueConsumer.server.ts:572-616
@@ -156,7 +303,7 @@ if ((retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.fromCheckpoint.includes(
 }
 ```
 
-#### 步骤 3：部署匹配
+#### 阶段 3：部署匹配
 
 ```typescript
 // sharedQueueConsumer.server.ts:618-651
@@ -175,7 +322,7 @@ if (!deployment || !worker) {
 }
 ```
 
-#### 步骤 4：任务存在性校验
+#### 阶段 4：任务存在性校验
 
 ```typescript
 // sharedQueueConsumer.server.ts:673-718
@@ -189,7 +336,7 @@ if (!backgroundTask) {
 }
 ```
 
-#### 步骤 5：锁定任务
+#### 阶段 5：锁定任务
 
 ```typescript
 // sharedQueueConsumer.server.ts:720-783
@@ -210,7 +357,7 @@ const lockedTaskRun = await prisma.taskRun.update({
 });
 ```
 
-#### 步骤 6：发送到 Provider 执行
+#### 阶段 6：发送到 Provider 执行
 
 ```typescript
 // sharedQueueConsumer.server.ts:915-958
@@ -245,7 +392,7 @@ return await this.#startActiveSpan("scheduleAttemptOnProvider", async (span) => 
 });
 ```
 
-### 2.3 Provider 端执行流程
+### 2.4 Provider 端执行流程
 
 Provider 收到 `SCHEDULE_ATTEMPT` 消息后，根据自身类型执行任务：
 
@@ -303,73 +450,144 @@ async create(opts: TaskOperationsCreateOptions) {
 
 ---
 
-## 三、回退路径与容错机制
+## 三、回退路径与容错机制（按阶段梳理）
 
-### 3.1 Provider 连接失败回退
+### 3.1 部署匹配阶段回退
 
-当 Provider 连接不可用时，任务会被 nack 并在延迟后重试：
+此阶段发生在消息出队后，发送到 Provider 之前。
+
+#### 回退 1.1：无效任务状态
 
 ```typescript
-// sharedQueueConsumer.server.ts:947-956
-if (await this._providerSender.validateCanSendMessage()) {
-  // 发送到 Provider
-} else {
+// sharedQueueConsumer.server.ts:599-616
+if ((retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.fromCheckpoint.includes(status)) ||
+    (!retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.withoutCheckpoint.includes(status))) {
+  await marqs?.acknowledgeMessage(message.messageId, "invalid_run_status");
   return {
-    action: "nack_and_do_more_work",
-    reason: "provider_not_connected",
+    action: "ack_and_do_more_work",
+    reason: "invalid_run_status",
     interval: this._options.nextTickInterval,
-    retryInMs: 5_000,  // 5秒后重试
   };
 }
 ```
 
-### 3.2 部署缺失回退
+**处理策略**：Ack 消息（从队列移除）+ 继续处理下一条
+**回退路径**：无，任务状态无效直接丢弃
 
-当找不到匹配的部署时，任务被标记为 `WAITING_FOR_DEPLOY`：
+#### 回退 1.2：无匹配部署
 
 ```typescript
 // sharedQueueConsumer.server.ts:632-651
 if (!deployment || !worker) {
   await this.#markRunAsWaitingForDeploy(existingTaskRun.id);
+  await marqs?.acknowledgeMessage(message.messageId, "no_matching_deployment");
   return {
     action: "ack_and_do_more_work",
     reason: "no_matching_deployment",
+    interval: this._options.nextTickInterval,
   };
 }
 ```
 
-### 3.3 任务未部署回退
+**处理策略**：Ack 消息 + 标记任务为 `WAITING_FOR_DEPLOY`
+**回退路径**：等待新部署，部署完成后任务会被重新入队
 
-当任务在当前部署中不存在时，同样标记为 `WAITING_FOR_DEPLOY`：
+#### 回退 1.3：任务未部署
 
 ```typescript
 // sharedQueueConsumer.server.ts:673-718
 if (!backgroundTask) {
   await this.#markRunAsWaitingForDeploy(existingTaskRun.id);
+  await marqs?.acknowledgeMessage(message.messageId, "task_not_deployed");
   return {
     action: "ack_and_do_more_work",
     reason: "task_not_deployed",
+    interval: this._options.nextTickInterval,
   };
 }
 ```
 
-### 3.4 锁定失败回退
+**处理策略**：Ack 消息 + 标记任务为 `WAITING_FOR_DEPLOY`
+**回退路径**：等待包含该任务的新部署
 
-当任务锁定失败时（可能被其他消费者抢先锁定），任务被 ack 并跳过：
+#### 回退 1.4：锁定失败
 
 ```typescript
 // sharedQueueConsumer.server.ts:763-783
 if (!lockedTaskRun) {
+  await marqs?.acknowledgeMessage(message.messageId, "failed_to_lock_task_run");
   return {
     action: "ack_and_do_more_work",
     reason: "failed_to_lock_task_run",
+    interval: this._options.nextTickInterval,
   };
 }
 ```
 
-### 3.5 调度异常回退
+**处理策略**：Ack 消息
+**回退路径**：可能被其他消费者锁定，无需额外处理
 
-当发送到 Provider 过程中发生异常时，解锁任务并 nack 重试：
+#### 回退 1.5：Checkpoint 恢复失败
+
+```typescript
+// sharedQueueConsumer.server.ts:832-857
+if (data.checkpointEventId) {
+  const restoreService = new RestoreCheckpointService();
+  const checkpoint = await restoreService.call({
+    eventId: data.checkpointEventId,
+    isRetry,
+  });
+
+  if (!checkpoint) {
+    await marqs?.acknowledgeMessage(message.messageId, "failed_to_restore_checkpoint");
+    return {
+      action: "ack_and_do_more_work",
+      reason: "failed_to_restore_checkpoint",
+      interval: this._options.nextTickInterval,
+    };
+  }
+}
+```
+
+**处理策略**：Ack 消息
+**回退路径**：Checkpoint 数据损坏，需要人工介入
+
+### 3.2 发送执行阶段回退
+
+此阶段发生在任务锁定后，发送到 Provider 时。
+
+#### 回退 2.1：Provider 未连接
+
+```typescript
+// sharedQueueConsumer.server.ts:937-956
+if (await this._providerSender.validateCanSendMessage()) {
+  // 发送到 Provider
+} else {
+  // 解锁任务
+  await prisma.taskRun.update({
+    where: { id: lockedTaskRun.id },
+    data: {
+      lockedAt: null,
+      lockedById: null,
+      status: lockedTaskRun.status,
+      startedAt: existingTaskRun.startedAt,
+    },
+  });
+
+  await marqs?.nackMessage(message.messageId, Date.now() + 5000);
+  return {
+    action: "nack_and_do_more_work",
+    reason: "provider_not_connected",
+    interval: this._options.nextTickInterval,
+    retryInMs: 5_000,
+  };
+}
+```
+
+**处理策略**：解锁任务 + Nack 消息（5秒后重试）
+**回退路径**：等待 Provider 重新连接
+
+#### 回退 2.2：发送异常
 
 ```typescript
 // sharedQueueConsumer.server.ts:959-987
@@ -387,6 +605,7 @@ catch (e) {
     }),
   ]);
 
+  await marqs?.nackMessage(message.messageId, Date.now() + 5000);
   return {
     action: "nack_and_do_more_work",
     reason: "failed_to_schedule_attempt",
@@ -397,31 +616,14 @@ catch (e) {
 }
 ```
 
-### 3.6 Checkpoint 恢复失败回退
+**处理策略**：解锁任务 + Nack 消息（5秒后重试）
+**回退路径**：等待发送问题解决
 
-当从 checkpoint 恢复失败时，任务被 ack 并标记：
+### 3.3 Checkpoint 恢复阶段回退
 
-```typescript
-// sharedQueueConsumer.server.ts:832-857
-if (data.checkpointEventId) {
-  const restoreService = new RestoreCheckpointService();
-  const checkpoint = await restoreService.call({
-    eventId: data.checkpointEventId,
-    isRetry,
-  });
+此阶段发生在任务执行过程中或恢复时。
 
-  if (!checkpoint) {
-    return {
-      action: "ack_and_do_more_work",
-      reason: "failed_to_restore_checkpoint",
-    };
-  }
-}
-```
-
-### 3.7 Docker Checkpoint 能力降级
-
-当 Docker 不支持 checkpoint 时，自动降级为模拟模式：
+#### 回退 3.1：Docker Checkpoint 能力降级
 
 ```typescript
 // apps/docker-provider/src/index.ts:157-184
@@ -439,9 +641,10 @@ async restore(opts: TaskOperationsRestoreOptions) {
 }
 ```
 
-### 3.8 恢复消息回退（RESUME 路径）
+**处理策略**：自动降级为模拟模式
+**回退路径**：使用 pause/unpause 替代 checkpoint
 
-当 coordinator 无法恢复任务时，尝试从 checkpoint 恢复：
+#### 回退 3.2：RESUME 消息恢复失败
 
 ```typescript
 // sharedQueueConsumer.server.ts:1221-1298
@@ -455,10 +658,39 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
     const checkpoint = await restoreService.call({
       eventId: checkpointEvent.id,
     });
-    // ...
+    
+    if (!checkpoint) {
+      // 恢复失败，任务保持 WAITING_TO_RESUME 状态
+      return {
+        action: "ack_and_do_more_work",
+        reason: "failed_to_restore_checkpoint_on_resume",
+      };
+    }
+  } else {
+    // 没有 checkpoint，重新执行
+    await this.#requeueRun(resumableRun.id);
   }
 }
 ```
+
+**处理策略**：
+- 有 checkpoint 但恢复失败 → Ack 消息，任务保持 `WAITING_TO_RESUME`
+- 无 checkpoint → 重新入队执行
+**回退路径**：等待下次重试或人工介入
+
+### 3.4 回退路径汇总表
+
+| 阶段 | 回退场景 | 处理策略 | 消息操作 | 重试机制 |
+|------|----------|----------|----------|----------|
+| **部署匹配阶段** | 无效任务状态 | 直接丢弃 | Ack | 无 |
+| | 无匹配部署 | 标记 WAITING_FOR_DEPLOY | Ack | 等待新部署 |
+| | 任务未部署 | 标记 WAITING_FOR_DEPLOY | Ack | 等待新部署 |
+| | 锁定失败 | 跳过 | Ack | 无（可能被其他消费者处理） |
+| | Checkpoint 恢复失败 | 丢弃 | Ack | 无（需要人工介入） |
+| **发送执行阶段** | Provider 未连接 | 解锁 + 重试 | Nack | 5秒后重试 |
+| | 发送异常 | 解锁 + 重试 | Nack | 5秒后重试 |
+| **Checkpoint 恢复阶段** | Docker 不支持 checkpoint | 降级为模拟模式 | 无 | 自动降级 |
+| | RESUME 恢复失败 | 保持状态或重入队 | Ack | 等待下次重试 |
 
 ---
 
@@ -468,34 +700,37 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 
 | 操作 | 含义 | 使用场景 |
 |------|------|----------|
-| `ack` | 确认消息，从队列移除 | 任务已成功分派或状态无效 |
+| `ack` | 确认消息，从队列永久移除 | 任务已成功分派、状态无效、配置缺失 |
 | `nack` | 拒绝消息，重新入队 | Provider 不可用、调度异常 |
-| `nack + retryInMs` | 延迟重试 | 临时故障，需要等待恢复 |
+| `nack + retryInMs` | 延迟指定时间后重试 | 临时故障，需要等待恢复 |
 
 ### 4.2 任务锁定策略
 
-- **乐观锁定**：通过数据库更新实现，失败则放弃
-- **锁定信息**：`lockedAt`、`lockedById`、`lockedToVersionId`
+- **乐观锁定**：通过数据库 `UPDATE` 实现，失败则放弃
+- **锁定信息**：`lockedAt`（锁定时间）、`lockedById`（锁定的任务 ID）、`lockedToVersionId`（锁定的部署版本）
 - **解锁时机**：调度失败时立即解锁，避免任务永久卡住
+- **锁定超时**：通过 visibility timeout 机制自动解锁（默认 5 分钟）
 
-### 4.3 Provider 选择策略
+### 4.3 Provider 选择策略（修正版）
 
-当前实现采用 **"隐式路由"** 策略：
+当前实现 **没有任何 Provider 选择逻辑**：
+
 1. 所有 Provider 连接到同一个 `shared-queue` namespace
-2. `SharedSocketConnection` 的 sender 会广播到所有连接的 Provider
-3. 实际由哪个 Provider 执行取决于 WebSocket 连接的广播机制
-4. 没有显式的 Provider 负载均衡或能力路由（目前设计）
+2. 每个 Provider 连接创建独立的消费者池，共享同一个 Redis 队列
+3. 消息通过 `namespace.emit()` 广播到 **所有** 连接的 Provider
+4. **没有** 负载均衡、能力路由或任何类型的 Provider 选择
 
-> **注意**：当前架构中，任务分派不区分 Docker 和 Kubernetes Provider。如果同时部署了多个 Provider，任务可能被发送到任意一个连接的 Provider。
+> **重要警告**：如果同时部署了多个 Provider（如 Docker + Kubernetes），同一个任务会被 **所有 Provider 同时执行**！这是当前架构的一个严重设计问题。
 
 ### 4.4 错误分类处理
 
 | 错误类型 | 处理策略 | 回退路径 |
 |----------|----------|----------|
-| 临时故障（Provider 断开） | Nack + 延迟重试 | 等待 Provider 重连 |
-| 配置缺失（无部署/任务） | Ack + WAITING_FOR_DEPLOY | 等待新部署 |
+| 临时故障（Provider 断开、发送异常） | 解锁任务 + Nack + 5秒延迟重试 | 等待 Provider 重连或问题解决 |
+| 配置缺失（无部署/任务） | Ack + 标记 WAITING_FOR_DEPLOY | 等待新部署完成 |
 | 状态冲突（已锁定/状态无效） | Ack + 丢弃 | 避免重复处理 |
-| 数据损坏（Checkpoint 失效） | Ack + 标记 | 需要人工介入 |
+| 数据损坏（Checkpoint 失效） | Ack + 丢弃 | 需要人工介入 |
+| 能力不足（Docker 不支持 checkpoint） | 自动降级 | 使用模拟模式继续执行 |
 
 ---
 
@@ -503,29 +738,76 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 
 | 模块 | 文件路径 | 关键函数/类 |
 |------|----------|------------|
-| Provider 抽象 | `packages/core/src/v3/apps/provider.ts` | `ProviderShell`, `TaskOperations` |
-| Docker Provider | `apps/docker-provider/src/index.ts` | `DockerTaskOperations` |
-| Kubernetes Provider | `apps/kubernetes-provider/src/index.ts` | `KubernetesTaskOperations` |
-| 调度消费者 | `apps/webapp/app/v3/marqs/sharedQueueConsumer.server.ts` | `SharedQueueConsumer`, `#handleExecuteMessage` |
+| Provider 抽象 | `packages/core/src/v3/apps/provider.ts` | `ProviderShell`, `#createPlatformSocket`, `#createSharedQueueSocket` |
+| Docker Provider | `apps/docker-provider/src/index.ts` | `DockerTaskOperations`, `testDockerCheckpoint` |
+| Kubernetes Provider | `apps/kubernetes-provider/src/index.ts` | `KubernetesTaskOperations`, `#createPod` |
+| 调度消费者 | `apps/webapp/app/v3/marqs/sharedQueueConsumer.server.ts` | `SharedQueueConsumer`, `#handleExecuteMessage`, `#doWorkInternal` |
 | Socket 连接管理 | `apps/webapp/app/v3/handleSocketIo.server.ts` | `createProviderNamespace`, `createSharedQueueConsumerNamespace` |
 | 共享连接 | `apps/webapp/app/v3/sharedSocketConnection.ts` | `SharedSocketConnection`, `SharedQueueConsumerPool` |
+| 队列系统 | `apps/webapp/app/v3/marqs/index.server.ts` | `MarQS`, `dequeueMessageFromSharedWorkerQueue` |
 | 消息定义 | `packages/core/src/v3/schemas/messages.ts` | `BackgroundWorkerServerMessages`, `SCHEDULE_ATTEMPT` |
 
 ---
 
-## 六、改进建议
+## 六、架构问题与改进建议
 
-### 当前架构潜在问题
+### 6.1 当前架构的严重问题
 
-1. **缺少显式 Provider 路由**：任务可能被发送到不具备相应能力的 Provider（如需要 checkpoint 但 Provider 不支持）
+#### 问题 1：多 Provider 重复执行
 
-2. **多 Provider 负载均衡**：当前广播模式可能导致任务重复或负载不均
+**问题描述**：
+- 每个 Provider 连接创建独立的消费者池
+- 消息通过 `namespace.emit()` 广播到所有 Provider
+- 如果有 N 个 Provider，同一个任务会被执行 N 次
 
-3. **能力感知调度**：调度时未考虑 Provider 的实际负载和能力
+**影响**：
+- 任务重复执行，产生副作用
+- 资源浪费
+- 数据不一致风险
 
-### 可能的优化方向
+#### 问题 2：缺少 Provider 能力感知调度
 
-1. 引入 Provider 注册中心，跟踪每个 Provider 的能力和负载
-2. 在调度时根据任务需求（如 checkpoint、GPU 等）选择合适的 Provider
-3. 实现 Provider 级别限流和熔断机制
-4. 增加 Provider 健康检查，及时移除不健康的 Provider
+**问题描述**：
+- 调度时完全不考虑 Provider 的能力（如 checkpoint 支持、GPU 资源等）
+- 任务可能被发送到不具备相应能力的 Provider
+
+**影响**：
+- 需要 checkpoint 的任务可能在不支持的 Provider 上失败
+- 资源利用率低
+
+#### 问题 3：缺少负载均衡
+
+**问题描述**：
+- 没有任何负载均衡机制
+- 所有 Provider 接收相同的任务广播
+
+**影响**：
+- 某些 Provider 可能过载，而其他 Provider 空闲
+- 系统整体吞吐量无法线性扩展
+
+### 6.2 改进建议
+
+#### 建议 1：引入 Provider 注册中心
+
+- 跟踪每个 Provider 的类型、能力、负载和健康状态
+- 在调度时根据任务需求选择合适的 Provider
+
+#### 建议 2：实现点对点消息发送
+
+- 替换 `namespace.emit()` 广播为定向发送
+- 只将任务发送到选定的 Provider
+
+#### 建议 3：实现能力感知调度
+
+- 在任务定义中声明所需能力（checkpoint、GPU、内存等）
+- 调度时匹配 Provider 能力
+
+#### 建议 4：增加负载均衡策略
+
+- 实现轮询、最少连接、能力加权等负载均衡策略
+- 支持 Provider 级别限流和熔断
+
+#### 建议 5：增加 Provider 健康检查
+
+- 定期检查 Provider 健康状态
+- 及时从调度池中移除不健康的 Provider
