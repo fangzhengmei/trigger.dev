@@ -452,6 +452,45 @@ async create(opts: TaskOperationsCreateOptions) {
 
 ## 三、回退路径与容错机制（按阶段梳理）
 
+### 3.0 关键架构特征：Ack/Nack 统一在外层执行
+
+在深入各回退分支之前，必须先理解一个核心设计：
+
+```typescript
+// sharedQueueConsumer.server.ts:427-535
+async #doWorkInternal(): Promise<DoWorkInternalResult> {
+  // ... 消息出队 ...
+  
+  const messageResult = await this.#handleMessage(message, messageBody.data, dequeuedAt);
+  
+  // ✅ 所有 ack/nack 统一在这里执行
+  switch (messageResult.action) {
+    case "noop": {
+      return { ... };
+    }
+    case "ack_and_do_more_work": {
+      await this.#ack(message.messageId);  // 👈 统一 ack
+      return { ... };
+    }
+    case "nack_and_do_more_work": {
+      await this.#nack(message.messageId, messageResult.retryInMs);  // 👈 统一 nack
+      return { ... };
+    }
+    case "nack": {
+      await marqs?.nackMessage(message.messageId);
+      return { ... };
+    }
+  }
+}
+```
+
+**重要结论**：
+- `#handleExecuteMessage`、`#handleResumeMessage` 等处理函数 **只返回 `{ action, reason, ... }` 结果**
+- 真正的 `ack`/`nack` 操作 **统一在外层 `#doWorkInternal()` 的 switch 语句中执行**
+- 各分支内部不会直接调用 `marqs.acknowledgeMessage()` 或 `marqs.nackMessage()`
+
+---
+
 ### 3.1 部署匹配阶段回退
 
 此阶段发生在消息出队后，发送到 Provider 之前。
@@ -462,16 +501,15 @@ async create(opts: TaskOperationsCreateOptions) {
 // sharedQueueConsumer.server.ts:599-616
 if ((retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.fromCheckpoint.includes(status)) ||
     (!retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.withoutCheckpoint.includes(status))) {
-  await marqs?.acknowledgeMessage(message.messageId, "invalid_run_status");
   return {
-    action: "ack_and_do_more_work",
+    action: "ack_and_do_more_work",  // 👈 只返回 action
     reason: "invalid_run_status",
     interval: this._options.nextTickInterval,
   };
 }
 ```
 
-**处理策略**：Ack 消息（从队列移除）+ 继续处理下一条
+**处理策略**：返回 ack_and_do_more_work，外层统一执行 ack
 **回退路径**：无，任务状态无效直接丢弃
 
 #### 回退 1.2：无匹配部署
@@ -480,16 +518,15 @@ if ((retryingFromCheckpoint && !EXECUTABLE_RUN_STATUSES.fromCheckpoint.includes(
 // sharedQueueConsumer.server.ts:632-651
 if (!deployment || !worker) {
   await this.#markRunAsWaitingForDeploy(existingTaskRun.id);
-  await marqs?.acknowledgeMessage(message.messageId, "no_matching_deployment");
   return {
-    action: "ack_and_do_more_work",
+    action: "ack_and_do_more_work",  // 👈 只返回 action
     reason: "no_matching_deployment",
     interval: this._options.nextTickInterval,
   };
 }
 ```
 
-**处理策略**：Ack 消息 + 标记任务为 `WAITING_FOR_DEPLOY`
+**处理策略**：标记任务为 `WAITING_FOR_DEPLOY` + 返回 ack_and_do_more_work
 **回退路径**：等待新部署，部署完成后任务会被重新入队
 
 #### 回退 1.3：任务未部署
@@ -498,16 +535,15 @@ if (!deployment || !worker) {
 // sharedQueueConsumer.server.ts:673-718
 if (!backgroundTask) {
   await this.#markRunAsWaitingForDeploy(existingTaskRun.id);
-  await marqs?.acknowledgeMessage(message.messageId, "task_not_deployed");
   return {
-    action: "ack_and_do_more_work",
+    action: "ack_and_do_more_work",  // 👈 只返回 action
     reason: "task_not_deployed",
     interval: this._options.nextTickInterval,
   };
 }
 ```
 
-**处理策略**：Ack 消息 + 标记任务为 `WAITING_FOR_DEPLOY`
+**处理策略**：标记任务为 `WAITING_FOR_DEPLOY` + 返回 ack_and_do_more_work
 **回退路径**：等待包含该任务的新部署
 
 #### 回退 1.4：锁定失败
@@ -515,19 +551,18 @@ if (!backgroundTask) {
 ```typescript
 // sharedQueueConsumer.server.ts:763-783
 if (!lockedTaskRun) {
-  await marqs?.acknowledgeMessage(message.messageId, "failed_to_lock_task_run");
   return {
-    action: "ack_and_do_more_work",
+    action: "ack_and_do_more_work",  // 👈 只返回 action
     reason: "failed_to_lock_task_run",
     interval: this._options.nextTickInterval,
   };
 }
 ```
 
-**处理策略**：Ack 消息
+**处理策略**：返回 ack_and_do_more_work，外层统一执行 ack
 **回退路径**：可能被其他消费者锁定，无需额外处理
 
-#### 回退 1.5：Checkpoint 恢复失败
+#### 回退 1.5：Checkpoint 恢复失败（EXECUTE 路径）
 
 ```typescript
 // sharedQueueConsumer.server.ts:832-857
@@ -539,9 +574,8 @@ if (data.checkpointEventId) {
   });
 
   if (!checkpoint) {
-    await marqs?.acknowledgeMessage(message.messageId, "failed_to_restore_checkpoint");
     return {
-      action: "ack_and_do_more_work",
+      action: "ack_and_do_more_work",  // 👈 只返回 action
       reason: "failed_to_restore_checkpoint",
       interval: this._options.nextTickInterval,
     };
@@ -549,34 +583,30 @@ if (data.checkpointEventId) {
 }
 ```
 
-**处理策略**：Ack 消息
+**处理策略**：返回 ack_and_do_more_work，外层统一执行 ack
 **回退路径**：Checkpoint 数据损坏，需要人工介入
+
+---
 
 ### 3.2 发送执行阶段回退
 
 此阶段发生在任务锁定后，发送到 Provider 时。
 
-#### 回退 2.1：Provider 未连接
+#### 回退 2.1：Provider 未连接（关键修正）
 
 ```typescript
-// sharedQueueConsumer.server.ts:937-956
+// sharedQueueConsumer.server.ts:920-957
 if (await this._providerSender.validateCanSendMessage()) {
-  // 发送到 Provider
-} else {
-  // 解锁任务
-  await prisma.taskRun.update({
-    where: { id: lockedTaskRun.id },
-    data: {
-      lockedAt: null,
-      lockedById: null,
-      status: lockedTaskRun.status,
-      startedAt: existingTaskRun.startedAt,
-    },
-  });
-
-  await marqs?.nackMessage(message.messageId, Date.now() + 5000);
+  await this._providerSender.send("BACKGROUND_WORKER_MESSAGE", {...});
+  
   return {
-    action: "nack_and_do_more_work",
+    action: "noop",
+    reason: "scheduled_attempt",
+  };
+} else {
+  // ⚠️  重要：这里没有解锁操作！
+  return {
+    action: "nack_and_do_more_work",  // 👈 只返回 action
     reason: "provider_not_connected",
     interval: this._options.nextTickInterval,
     retryInMs: 5_000,
@@ -584,30 +614,35 @@ if (await this._providerSender.validateCanSendMessage()) {
 }
 ```
 
-**处理策略**：解锁任务 + Nack 消息（5秒后重试）
-**回退路径**：等待 Provider 重新连接
+**关键修正**：
+- ❌ **之前的错误**：认为此分支会解锁任务
+- ✅ **实际情况**：`provider_not_connected` 分支 **只返回 `nack_and_do_more_work`**，**不会解锁任务**
+- 任务仍然保持锁定状态（`lockedAt`、`lockedById`、`lockedToVersionId` 都已设置）
 
-#### 回退 2.2：发送异常
+**处理策略**：返回 nack_and_do_more_work，外层统一执行 nack（5秒后重试）
+**回退路径**：等待 Provider 重新连接
+**潜在问题**：任务保持锁定状态，下次重试时可能因锁定失败而被丢弃
+
+#### 回退 2.2：发送异常（唯一显式解锁路径）
 
 ```typescript
 // sharedQueueConsumer.server.ts:959-987
 catch (e) {
-  // 解锁任务
+  // ✅ 唯一的显式解锁路径
   await prisma.$transaction([
     prisma.taskRun.update({
       where: { id: lockedTaskRun.id },
       data: {
-        lockedAt: null,
-        lockedById: null,
+        lockedAt: null,       // 解锁
+        lockedById: null,     // 解锁
         status: lockedTaskRun.status,
         startedAt: existingTaskRun.startedAt,
       },
     }),
   ]);
 
-  await marqs?.nackMessage(message.messageId, Date.now() + 5000);
   return {
-    action: "nack_and_do_more_work",
+    action: "nack_and_do_more_work",  // 👈 只返回 action
     reason: "failed_to_schedule_attempt",
     error: e instanceof Error ? e : String(e),
     interval: this._options.nextTickInterval,
@@ -616,8 +651,14 @@ catch (e) {
 }
 ```
 
-**处理策略**：解锁任务 + Nack 消息（5秒后重试）
+**关键事实**：
+- 显式解锁 **只发生在 catch 路径**
+- 只有当 `_providerSender.send()` 抛出异常时，才会解锁任务
+
+**处理策略**：解锁任务 + 返回 nack_and_do_more_work
 **回退路径**：等待发送问题解决
+
+---
 
 ### 3.3 Checkpoint 恢复阶段回退
 
@@ -647,50 +688,83 @@ async restore(opts: TaskOperationsRestoreOptions) {
 #### 回退 3.2：RESUME 消息恢复失败
 
 ```typescript
-// sharedQueueConsumer.server.ts:1221-1298
-if (resumableRun.status === "WAITING_TO_RESUME") {
-  const restoreService = new RestoreCheckpointService();
-  const checkpointEvent = await restoreService.getLastCheckpointEventIfUnrestored(
-    resumableRun.id
-  );
+// sharedQueueConsumer.server.ts:990-1031
+async #handleResumeMessage(...) {
+  if (data.checkpointEventId) {
+    try {
+      const restoreService = new RestoreCheckpointService();
+      const checkpoint = await restoreService.call({
+        eventId: data.checkpointEventId,
+      });
 
-  if (checkpointEvent) {
-    const checkpoint = await restoreService.call({
-      eventId: checkpointEvent.id,
-    });
-    
-    if (!checkpoint) {
-      // 恢复失败，任务保持 WAITING_TO_RESUME 状态
+      if (!checkpoint) {
+        return {
+          action: "ack_and_do_more_work",  // 👈 只返回 action
+          reason: "failed_to_restore_checkpoint",
+        };
+      }
+
       return {
-        action: "ack_and_do_more_work",
-        reason: "failed_to_restore_checkpoint_on_resume",
+        action: "noop",
+        reason: "restored_checkpoint",
+      };
+    } catch (e) {
+      return {
+        action: "nack_and_do_more_work",  // 👈 只返回 action
+        reason: "failed_to_restore_checkpoint",
+        error: e instanceof Error ? e : String(e),
       };
     }
-  } else {
-    // 没有 checkpoint，重新执行
-    await this.#requeueRun(resumableRun.id);
   }
+  // ...
 }
 ```
 
 **处理策略**：
-- 有 checkpoint 但恢复失败 → Ack 消息，任务保持 `WAITING_TO_RESUME`
-- 无 checkpoint → 重新入队执行
+- 恢复成功 → 返回 noop
+- 恢复失败 → 返回 ack_and_do_more_work
+- 发生异常 → 返回 nack_and_do_more_work
 **回退路径**：等待下次重试或人工介入
 
-### 3.4 回退路径汇总表
+---
 
-| 阶段 | 回退场景 | 处理策略 | 消息操作 | 重试机制 |
-|------|----------|----------|----------|----------|
-| **部署匹配阶段** | 无效任务状态 | 直接丢弃 | Ack | 无 |
-| | 无匹配部署 | 标记 WAITING_FOR_DEPLOY | Ack | 等待新部署 |
-| | 任务未部署 | 标记 WAITING_FOR_DEPLOY | Ack | 等待新部署 |
-| | 锁定失败 | 跳过 | Ack | 无（可能被其他消费者处理） |
-| | Checkpoint 恢复失败 | 丢弃 | Ack | 无（需要人工介入） |
-| **发送执行阶段** | Provider 未连接 | 解锁 + 重试 | Nack | 5秒后重试 |
-| | 发送异常 | 解锁 + 重试 | Nack | 5秒后重试 |
-| **Checkpoint 恢复阶段** | Docker 不支持 checkpoint | 降级为模拟模式 | 无 | 自动降级 |
-| | RESUME 恢复失败 | 保持状态或重入队 | Ack | 等待下次重试 |
+### 3.4 回退路径汇总表（修正版）
+
+| 阶段 | 回退场景 | 返回 action | 解锁操作 | 外层执行 | 重试机制 |
+|------|----------|------------|----------|----------|----------|
+| **部署匹配阶段** | 无效任务状态 | `ack_and_do_more_work` | 无 | ack | 无 |
+| | 无匹配部署 | `ack_and_do_more_work` | 无 | ack | 等待新部署 |
+| | 任务未部署 | `ack_and_do_more_work` | 无 | ack | 等待新部署 |
+| | 锁定失败 | `ack_and_do_more_work` | 无 | ack | 无 |
+| | Checkpoint 恢复失败 | `ack_and_do_more_work` | 无 | ack | 无 |
+| **发送执行阶段** | Provider 未连接 | `nack_and_do_more_work` | ❌ 无 | nack | 5秒后重试 |
+| | 发送异常（catch） | `nack_and_do_more_work` | ✅ 显式解锁 | nack | 5秒后重试 |
+| **Checkpoint 恢复阶段** | Docker 不支持 checkpoint | 无 | 无 | 无 | 自动降级 |
+| | RESUME 恢复失败 | `ack_and_do_more_work` | 无 | ack | 无 |
+| | RESUME 恢复异常 | `nack_and_do_more_work` | 无 | nack | 立即重试 |
+
+---
+
+### 3.5 潜在设计问题：provider_not_connected 时任务保持锁定
+
+```
+任务锁定（lockedAt 设置）
+    ↓
+provider_not_connected
+    ↓
+返回 nack_and_do_more_work（不解锁）
+    ↓
+外层执行 nack，消息 5 秒后重新入队
+    ↓
+下次重试时，任务仍然锁定
+    ↓
+lockedTaskRun = prisma.taskRun.update(...) 失败（因为 WHERE id = ? AND lockedAt IS NULL）
+    ↓
+返回 ack_and_do_more_work，任务被丢弃
+```
+
+**问题影响**：当 Provider 短暂断开时，正在处理的任务可能因保持锁定而无法重试，最终被丢弃。
+**建议修复**：在 provider_not_connected 分支也应该解锁任务。
 
 ---
 
@@ -698,18 +772,34 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 
 ### 4.1 消息确认机制（Ack/Nack）
 
+#### 核心设计：统一外层执行
+
+```
+#handleExecuteMessage() / #handleResumeMessage()
+    ↓
+只返回 { action, reason, ... }
+    ↓
+#doWorkInternal() switch 语句
+    ↓
+统一执行 ack / nack
+```
+
 | 操作 | 含义 | 使用场景 |
 |------|------|----------|
-| `ack` | 确认消息，从队列永久移除 | 任务已成功分派、状态无效、配置缺失 |
-| `nack` | 拒绝消息，重新入队 | Provider 不可用、调度异常 |
-| `nack + retryInMs` | 延迟指定时间后重试 | 临时故障，需要等待恢复 |
+| `ack` | 确认消息，从队列永久移除 | 状态无效、配置缺失、锁定失败 |
+| `nack` | 拒绝消息，立即重新入队 | 消费者未启用 |
+| `nack + retryInMs` | 延迟指定时间后重试 | Provider 不可用、调度异常 |
 
-### 4.2 任务锁定策略
+### 4.2 任务锁定策略（修正版）
 
 - **乐观锁定**：通过数据库 `UPDATE` 实现，失败则放弃
 - **锁定信息**：`lockedAt`（锁定时间）、`lockedById`（锁定的任务 ID）、`lockedToVersionId`（锁定的部署版本）
-- **解锁时机**：调度失败时立即解锁，避免任务永久卡住
+- **解锁时机**：**只在发送异常的 catch 路径中显式解锁**，provider_not_connected 时不解锁
 - **锁定超时**：通过 visibility timeout 机制自动解锁（默认 5 分钟）
+
+**关键发现**：锁定策略存在不一致性
+- ✅ 发送异常时：解锁任务
+- ❌ Provider 未连接时：不解锁任务（潜在问题）
 
 ### 4.3 Provider 选择策略（修正版）
 
@@ -722,15 +812,16 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 
 > **重要警告**：如果同时部署了多个 Provider（如 Docker + Kubernetes），同一个任务会被 **所有 Provider 同时执行**！这是当前架构的一个严重设计问题。
 
-### 4.4 错误分类处理
+### 4.4 错误分类处理（修正版）
 
-| 错误类型 | 处理策略 | 回退路径 |
-|----------|----------|----------|
-| 临时故障（Provider 断开、发送异常） | 解锁任务 + Nack + 5秒延迟重试 | 等待 Provider 重连或问题解决 |
-| 配置缺失（无部署/任务） | Ack + 标记 WAITING_FOR_DEPLOY | 等待新部署完成 |
-| 状态冲突（已锁定/状态无效） | Ack + 丢弃 | 避免重复处理 |
-| 数据损坏（Checkpoint 失效） | Ack + 丢弃 | 需要人工介入 |
-| 能力不足（Docker 不支持 checkpoint） | 自动降级 | 使用模拟模式继续执行 |
+| 错误类型 | 处理策略 | 解锁 | 消息操作 | 回退路径 |
+|----------|----------|------|----------|----------|
+| Provider 未连接 | 返回 nack_and_do_more_work | ❌ 不解锁 | nack（5秒后重试） | 等待 Provider 重连 |
+| 发送异常（catch） | 解锁 + 返回 nack_and_do_more_work | ✅ 解锁 | nack（5秒后重试） | 等待问题解决 |
+| 配置缺失（无部署/任务） | 标记 WAITING_FOR_DEPLOY | 无 | ack | 等待新部署 |
+| 状态冲突（已锁定/状态无效） | 丢弃 | 无 | ack | 避免重复处理 |
+| 数据损坏（Checkpoint 失效） | 丢弃 | 无 | ack | 需要人工介入 |
+| 能力不足（Docker 不支持 checkpoint） | 自动降级 | 无 | 无 | 使用模拟模式继续执行 |
 
 ---
 
@@ -765,7 +856,21 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 - 资源浪费
 - 数据不一致风险
 
-#### 问题 2：缺少 Provider 能力感知调度
+#### 问题 2：Provider 未连接时任务保持锁定（新增）
+
+**问题描述**：
+- 当 `provider_not_connected` 时，任务已被锁定但不会被解锁
+- 消息被 nack 后 5 秒重试，但任务仍然锁定
+- 下次重试时因锁定失败而被丢弃
+
+**代码位置**：`sharedQueueConsumer.server.ts:947-956`
+
+**影响**：
+- Provider 短暂断开可能导致任务丢失
+- 需要等待 visibility timeout（5分钟）才能自动解锁
+- 任务处理延迟增加
+
+#### 问题 3：缺少 Provider 能力感知调度
 
 **问题描述**：
 - 调度时完全不考虑 Provider 的能力（如 checkpoint 支持、GPU 资源等）
@@ -775,7 +880,7 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 - 需要 checkpoint 的任务可能在不支持的 Provider 上失败
 - 资源利用率低
 
-#### 问题 3：缺少负载均衡
+#### 问题 4：缺少负载均衡
 
 **问题描述**：
 - 没有任何负载均衡机制
@@ -787,27 +892,51 @@ if (resumableRun.status === "WAITING_TO_RESUME") {
 
 ### 6.2 改进建议
 
-#### 建议 1：引入 Provider 注册中心
+#### 建议 1：修复 provider_not_connected 解锁逻辑（高优先级）
+
+```typescript
+// 建议修复：在 provider_not_connected 分支也解锁任务
+} else {
+  // 解锁任务
+  await prisma.taskRun.update({
+    where: { id: lockedTaskRun.id },
+    data: {
+      lockedAt: null,
+      lockedById: null,
+      status: lockedTaskRun.status,
+      startedAt: existingTaskRun.startedAt,
+    },
+  });
+  
+  return {
+    action: "nack_and_do_more_work",
+    reason: "provider_not_connected",
+    retryInMs: 5_000,
+  };
+}
+```
+
+#### 建议 2：引入 Provider 注册中心
 
 - 跟踪每个 Provider 的类型、能力、负载和健康状态
 - 在调度时根据任务需求选择合适的 Provider
 
-#### 建议 2：实现点对点消息发送
+#### 建议 3：实现点对点消息发送
 
 - 替换 `namespace.emit()` 广播为定向发送
 - 只将任务发送到选定的 Provider
 
-#### 建议 3：实现能力感知调度
+#### 建议 4：实现能力感知调度
 
 - 在任务定义中声明所需能力（checkpoint、GPU、内存等）
 - 调度时匹配 Provider 能力
 
-#### 建议 4：增加负载均衡策略
+#### 建议 5：增加负载均衡策略
 
 - 实现轮询、最少连接、能力加权等负载均衡策略
 - 支持 Provider 级别限流和熔断
 
-#### 建议 5：增加 Provider 健康检查
+#### 建议 6：增加 Provider 健康检查
 
 - 定期检查 Provider 健康状态
 - 及时从调度池中移除不健康的 Provider
