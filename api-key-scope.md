@@ -227,9 +227,13 @@ const environment = await authenticatedEnvironmentForAuthentication(
 );
 ```
 
-#### 3.3.2 apiBuilder 新链路：隐式校验 + 资源绑定
+#### 3.3.2 apiBuilder 新链路：apiKey 路由 vs PAT 路由
 
-**文件**：`apps/webapp/app/services/routeBuilders/apiBuilder.server.ts:51-79`
+apiBuilder 有两类路由，它们在 projectRef 的暴露和校验方式上完全不同：
+
+##### 3.3.2.1 apiKey 路由（`createLoaderApiRoute` / `createActionApiRoute`）
+
+**文件**：`apps/webapp/app/services/routeBuilders/apiBuilder.server.ts:51-79, 232-390`
 
 ```typescript
 async function authenticateRequestForApiBuilder(
@@ -244,7 +248,7 @@ async function authenticateRequestForApiBuilder(
     return { ok: false, status: result.status, error: result.error };
   }
 
-  // apiBuilder 不做显式 projectRef 校验
+  // apiKey 路由不做显式 projectRef 校验
   // 项目隔离通过以下方式保证：
   // 1. authenticateBearer 返回的 environment 已绑定到具体 project
   // 2. findResource 使用 environment.projectId 过滤查询
@@ -263,20 +267,78 @@ async function authenticateRequestForApiBuilder(
 }
 ```
 
+**调用示例**：`apps/webapp/app/routes/api.v1.runs.ts:12-51`
+```typescript
+// URL: /api/v1/runs （路径中无 projectRef）
+export const loader = createLoaderApiRoute(
+  {
+    searchParams: ApiRunListSearchParams,
+    allowJWT: true,
+    findResource: async () => 1, // 无资源查找，直接通过认证
+    // handler 中通过 authentication.environment.project 隐式获取项目
+  },
+  async ({ searchParams, authentication, apiVersion }) => {
+    const presenter = new ApiRunListPresenter();
+    const result = await presenter.call(
+      authentication.environment.project,  // 项目来自认证结果
+      searchParams,
+      apiVersion,
+      authentication.environment
+    );
+    return json(result);
+  }
+);
+```
+
+##### 3.3.2.2 PAT 路由（`createLoaderPATApiRoute` / `createPATActionApiRoute`）
+
+**文件**：`apps/webapp/app/services/routeBuilders/apiBuilder.server.ts:392-590`
+
+```typescript
+type PATRouteBuilderOptions<...> = {
+  // ...
+  // Resolves the target org/project for the request. Fed to
+  // `rbac.authenticatePat` so the plugin can compute the user's role
+  // floor (their authority in that org) for the cap intersection.
+  // When omitted, the PAT runs in identity-only mode — no role floor,
+  // no per-route ability gating beyond what authorization (if any)
+  // declares against a permissive baseline.
+  context?: (
+    params: ...,
+    request: Request
+  ) =>
+    | { organizationId?: string; projectId?: string }
+    | Promise<{ organizationId?: string; projectId?: string }>;
+  // ...
+};
+
+// PAT 路由认证流程
+const ctx = contextFn ? await contextFn(parsedParams, request) : {};
+const patAuth = await rbac.authenticatePat(request, ctx);  // ctx 传入 authenticatePat
+```
+
+**PAT 路由特点**：
+- PAT 是**用户级令牌**，本身不绑定到任何项目/环境
+- 必须通过 `context` 回调显式解析目标 `organizationId` / `projectId`
+- context 传给 `rbac.authenticatePat`，用于在有 RBAC 插件时计算用户在该项目中的角色权限
+- 无 context 时运行在 **identity-only 模式**，返回 `permissiveAbility`，依赖 authorization 做额外检查
+
 #### 3.3.3 新旧链路对比
 
-| 对比项 | Legacy 链路 | apiBuilder 新链路 |
-|--------|------------|-----------------|
-| 校验时机 | 认证后立即执行 | 不做集中校验，分散到 findResource |
-| 校验方式 | 显式比较 `project.externalRef === projectRef` | 通过 `environment.projectId` 隐式过滤 |
-| 失败状态码 | 400 Bad Request | 404 Not Found (资源不存在) |
-| slug/branch 校验 | 显式检查 `environment.slug === slug` | 认证时已通过 branchName 路由到正确环境 |
-| 错误信息 | 明确提示 "Invalid project ref" | 不暴露项目存在性信息（更安全） |
-| 适用场景 | 旧版 API 路由（`/api/v1/projects/:projectRef/...`） | 新版 API 路由（使用 apiBuilder） |
+| 对比项 | Legacy 链路 | apiBuilder apiKey 路由 | apiBuilder PAT 路由 |
+|--------|------------|---------------------|-------------------|
+| 认证方式 | `authenticateRequest()` | `rbac.authenticateBearer()` | `rbac.authenticatePat(request, ctx)` |
+| projectRef 位置 | URL 路径参数 | 不暴露，来自认证结果 | 通过 `context` 回调显式解析 |
+| 校验方式 | 显式比较 `project.externalRef === projectRef` | 通过 `environment.projectId` 隐式过滤 | 无集中校验，依赖 context + RBAC |
+| 失败状态码 | 400 Bad Request | 404 Not Found (资源不存在) | 403 Forbidden (无权限) |
+| slug/branch 校验 | 显式检查 `environment.slug === slug` | 认证时已通过 branchName 路由 | 无（PAT 无环境概念） |
+| 错误信息 | 明确提示 "Invalid project ref" | 不暴露项目存在性信息 | 权限不足提示 |
+| 适用场景 | 旧版 API（`/api/v1/projects/:projectRef/...`） | 新版环境级 API | 用户级 API（CLI、跨项目操作） |
 
 **设计意图**：
 - Legacy：URL 路径中包含 `projectRef`，需要显式校验防止跨项目调用
-- apiBuilder：URL 不直接暴露 `projectRef`，通过认证结果隐式绑定，更安全且减少冗余校验
+- apiKey 路由：URL 不直接暴露 `projectRef`，通过 API Key → Environment → Project 链隐式绑定，更安全
+- PAT 路由：PAT 是跨项目用户令牌，必须显式指定目标项目上下文才能计算权限
 
 ### 3.4 JWT 密钥更换后的宽限期回退校验
 
@@ -334,11 +396,108 @@ async function validateAgainstRevokedApiKeys(
 }
 ```
 
+### 3.4.1 JWT 验证的三个阶段（按顺序执行）
+
+```
+JWT 验证请求
+   │
+   ▼
+┌─────────────────────────────────────┐
+│ 阶段 1：主密钥验证                   │
+│ 使用 environment.apiKey 验证签名     │
+│ （含父环境 apiKey 回退）             │
+└───────────────┬─────────────────────┘
+                │ 验证成功
+                ├───────────────────► 返回验证通过
+                │ 验证失败
+                ▼
+┌─────────────────────────────────────┐
+│ 阶段 2：宽限期回退验证               │
+│ 查询 revokedApiKey 表中              │
+│ expiresAt > now 的所有旧密钥         │
+│ 依次尝试验证签名                     │
+└───────────────┬─────────────────────┘
+                │ 任一验证成功
+                ├───────────────────► 返回验证通过
+                │ 全部失败
+                ▼
+┌─────────────────────────────────────┐
+│ 阶段 3：过期后失效                   │
+│ 返回具体错误：                       │
+│ - ERR_JWT_EXPIRED：令牌自身过期      │
+│ - ERR_JWT_CLAIM_INVALID：声明无效    │
+│ - 其他：签名验证完全失败             │
+└─────────────────────────────────────┘
+```
+
+**各阶段详细说明**：
+
+| 阶段 | 触发条件 | 验证目标 | 成功/失败行为 |
+|------|---------|---------|--------------|
+| **阶段 1：主密钥验证** | 所有 JWT 请求必经 | 当前环境的 `apiKey`（含父环境密钥回退） | 成功 → 直接通过；失败 → 进入阶段 2 |
+| **阶段 2：宽限期回退** | 阶段 1 签名失败 | `revokedApiKey` 表中 `expiresAt > now` 的所有密钥 | 任一成功 → 通过；全部失败 → 进入阶段 3 |
+| **阶段 3：过期后失效** | 阶段 2 全部失败 | 无验证，直接返回错误 | 按错误类型返回 401 |
+
+**关键代码**：`apps/webapp/app/services/realtime/jwtAuth.server.ts:38-53, 87-108`
+```typescript
+// 阶段 1：主密钥验证
+let result = await validateJWT(
+  token,
+  environment.parentEnvironment?.apiKey ?? environment.apiKey
+);
+
+// 阶段 2：宽限期回退（仅在阶段 1 失败时触发）
+if (!result.ok) {
+  result = await validateAgainstRevokedApiKeys(
+    token,
+    environment.parentEnvironment?.id ?? environment.id,
+    result
+  );
+}
+
+// 阶段 3：返回具体错误
+if (!result.ok) {
+  switch (result.code) {
+    case "ERR_JWT_EXPIRED": { /* 令牌自身过期 */ }
+    case "ERR_JWT_CLAIM_INVALID": { /* 声明无效 */ }
+    default: { /* 签名完全失败 */ }
+  }
+}
+```
+
+**回退验证逻辑**：
+```typescript
+async function validateAgainstRevokedApiKeys(
+  token: string,
+  signingEnvironmentId: string,
+  primaryResult: ValidationResult
+): Promise<ValidationResult> {
+  // 仅查询当前环境下仍在宽限期内的密钥
+  const revokedApiKeys = await $replica.revokedApiKey.findMany({
+    where: {
+      runtimeEnvironmentId: signingEnvironmentId,
+      expiresAt: { gt: new Date() },  // 宽限期未过期
+    },
+    select: { apiKey: true },
+  });
+
+  // 依次尝试每个已吊销密钥
+  for (const { apiKey } of revokedApiKeys) {
+    const fallbackResult = await validateJWT(token, apiKey);
+    if (fallbackResult.ok) {
+      return fallbackResult;  // 任一成功即返回
+    }
+  }
+
+  return primaryResult;  // 全部失败，返回原始错误
+}
+```
+
 **宽限期机制要点**：
-1. **触发时机**：JWT 签名验证失败时（不是过期，是密钥不匹配）
+1. **触发时机**：仅在 JWT 签名验证失败时触发（不是令牌过期，是密钥不匹配）
 2. **查询范围**：仅查询当前 `environmentId` 下的吊销记录，防止跨环境尝试
-3. **验证顺序**：先主密钥，再依次尝试所有宽限期内的旧密钥
-4. **安全边界**：宽限期到期后（默认 24 小时），旧密钥签名的 JWT 彻底失效
+3. **验证顺序**：严格按 主密钥 → 宽限期密钥 → 错误返回 的顺序执行
+4. **安全边界**：宽限期到期后（默认 24 小时），旧密钥从 `revokedApiKey` 中清理，JWT 彻底失效
 5. **设计权衡**：密钥轮换时已签发的 JWT 可继续使用到宽限期结束，避免业务中断
 
 ### 3.5 PAT 在无 RBAC 插件 Fallback 下的默认授权
@@ -681,23 +840,42 @@ async authenticateBearer(request: Request, options?: { allowJWT?: boolean }) {
 | slug 参数为 "staging" | `slug === "staging"` | 自动转换为 "stg" 匹配 |
 | Legacy 链路 slug 不匹配 | `env.slug !== slug && env.branchName !== branch` | 返回 400 |
 
-### 6.3 sanitizeBranchName 规范化
+### 6.3 sanitizeBranchName 的实际行为
 
-**文件**：`packages/core/src/v3/utils/gitBranch.ts`（推断逻辑）
+**文件**：`packages/core/src/v3/utils/gitBranch.ts:20-31`
 
 ```typescript
-// 分支名规范化：去除危险字符，确保可安全用于查询
-export function sanitizeBranchName(branchName: string | null | undefined): string | undefined {
-  if (!branchName) return undefined;
-  // 实际实现会去除特殊字符、截断长度等
-  return branchName.trim();
+export function sanitizeBranchName(ref: string | null | undefined): string | null {
+  if (!ref) return null;
+  if (ref.startsWith("refs/heads/")) return ref.substring("refs/heads/".length);
+  if (ref.startsWith("refs/remotes/")) return ref.substring("refs/remotes/".length);
+  if (ref.startsWith("refs/tags/")) return ref.substring("refs/tags/".length);
+  if (ref.startsWith("refs/pull/")) return ref.substring("refs/pull/".length);
+  if (ref.startsWith("refs/merge/")) return ref.substring("refs/merge/".length);
+  if (ref.startsWith("refs/release/")) return ref.substring("refs/release/".length);
+  if (ref.startsWith("refs/")) return null;  // 未知 refs 前缀返回 null
+
+  return ref;  // 普通分支名原样返回
 }
 ```
 
-**边界保护**：
-- `null` / `undefined` / 空字符串 → 返回 `undefined`
-- 首尾空白自动去除
-- 防止 SQL 注入和路径遍历攻击
+**核心功能与限制**：
+
+| 输入示例 | 输出 | 说明 |
+|---------|------|------|
+| `null` / `undefined` / `""` | `null` | 空值直接返回 null |
+| `"refs/heads/feature/login"` | `"feature/login"` | 剥离本地分支前缀 |
+| `"refs/remotes/origin/feature/login"` | `"origin/feature/login"` | 剥离远程分支前缀，保留 origin |
+| `"refs/tags/v1.0.0"` | `"v1.0.0"` | 剥离标签前缀 |
+| `"refs/pull/123/head"` | `"123/head"` | 剥离 PR 前缀 |
+| `"refs/unknown/xxx"` | `null` | 未知 refs 前缀拒绝 |
+| `"feature/login"` | `"feature/login"` | 普通分支名原样返回 |
+
+**重要澄清**：
+- ❌ **不是字符清洗器**：不做任何特殊字符过滤、转义或截断
+- ❌ **不验证分支名合法性**：合法性检查由独立的 `isValidGitBranchName()` 函数负责
+- ✅ **Git ref 前缀剥离器**：唯一职责是将完整 Git ref 路径简化为短名
+- ✅ **返回 `string | null`**：不是 `string | undefined`，空值返回 null 而非 undefined
 
 ## 七、完整协作链路图
 
@@ -713,20 +891,29 @@ export function sanitizeBranchName(branchName: string | null | undefined): strin
 │                第一层：认证 (Authentication)                     │
 │  目标：验证"你是谁"                                              │
 │                                                                 │
-│  tr_xxx → findEnvironmentByApiKey(apiKey)                       │
-│          → runtimeEnvironment.projectId → 确定项目归属          │
-│          → 检查 project.deletedAt → 软删除项目拒绝              │
-│          → PREVIEW 环境检查 branchName → 子环境 pivot           │
-│          → 已吊销密钥回退校验（24小时宽限期）                    │
+│  ┌─ apiKey 路由 ─────────────────────────────────────────────┐  │
+│  │ tr_xxx → authenticateBearer()                              │  │
+│  │         → runtimeEnvironment.projectId → 确定项目归属      │  │
+│  │         → 检查 project.deletedAt → 软删除项目拒绝          │  │
+│  │         → PREVIEW 环境检查 branchName → 子环境 pivot       │  │
+│  │         → 已吊销密钥回退校验（24小时宽限期）                │  │
+│  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  JWT → extractJWTSub() → environmentId                          │
-│      → validateJWT(token, env.apiKey) → 签名校验                │
-│      → 签名失败时尝试 revokedApiKeys 回退                        │
-│      → payload.scopes → 构建细粒度能力                          │
+│  ┌─ JWT 认证 ────────────────────────────────────────────────┐  │
+│  │ JWT → extractJWTSub() → environmentId                     │  │
+│  │     → 阶段 1: 主密钥 validateJWT(env.apiKey)               │  │
+│  │     → 阶段 2: 签名失败 → 宽限期 revokedApiKeys 回退        │  │
+│  │     → 阶段 3: 全部失败 → 返回具体错误                       │  │
+│  │     → payload.scopes → buildJwtAbility() 细粒度能力        │  │
+│  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
-│  PAT → 哈希比对 → 验证 token 有效性                             │
-│      → 无 RBAC 插件时返回 permissiveAbility                      │
-│      → lastAccessedAt 5 分钟节流更新                            │
+│  ┌─ PAT 路由 ────────────────────────────────────────────────┐  │
+│  │ PAT → authenticatePat(request, ctx)                        │  │
+│  │     → 哈希比对 → 验证 token 有效性                          │  │
+│  │     → ctx 解析 organizationId/projectId（可选）             │  │
+│  │     → 无 RBAC 插件时返回 permissiveAbility                  │  │
+│  │     → lastAccessedAt 5 分钟节流更新                         │  │
+│  └────────────────────────────────────────────────────────────┘  │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
@@ -737,9 +924,14 @@ export function sanitizeBranchName(branchName: string | null | undefined): strin
 │    ✓ environment.slug === request.slug                           │
 │    ✗ 不匹配 → 400 "Invalid project ref"                          │
 │                                                                 │
-│  apiBuilder 链路：隐式校验                                       │
+│  apiBuilder apiKey 路由：隐式校验                                │
 │    ✓ findResource 使用 environment.projectId 过滤查询            │
 │    ✓ 资源不存在 → 404（不暴露项目存在性）                        │
+│                                                                 │
+│  apiBuilder PAT 路由：上下文绑定                                 │
+│    ✓ 通过 context 回调显式解析目标 projectId                     │
+│    ✓ 无 context 时运行在 identity-only 模式                      │
+│    ✓ RBAC 插件基于 ctx 计算用户在该项目的角色权限                │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
@@ -808,8 +1000,17 @@ A: 使用 PAT（`tr_pat_*`）而非环境级 API Key。PAT 是用户身份令牌
 **Q: 为什么 JWT 用 apiKey 作为签名密钥？**
 A: 密钥轮换自动使所有该环境签发的 JWT 失效，无需额外维护 JWT 黑名单。配合 24 小时宽限期实现平滑过渡。
 
-**Q: Legacy 和 apiBuilder 的 projectRef 校验为什么不一样？**
-A: Legacy URL 包含 `projectRef` 路径参数，必须显式校验防止跨项目调用；apiBuilder 不暴露 `projectRef`，通过认证结果隐式绑定，更安全且减少冗余。
+**Q: Legacy 和 apiBuilder apiKey 路由的 projectRef 校验为什么不一样？**
+A: Legacy URL 包含 `projectRef` 路径参数，必须显式校验防止跨项目调用；apiBuilder apiKey 路由不暴露 `projectRef`，通过 API Key → Environment → Project 链隐式绑定，更安全且减少冗余。
+
+**Q: apiBuilder 中 PAT 路由为什么需要 context 回调？**
+A: PAT 是用户级令牌，本身不绑定到任何项目/环境。必须通过 context 回调显式解析目标 `organizationId` / `projectId`，才能在有 RBAC 插件时计算用户在该项目中的角色权限。无 context 时 PAT 运行在 identity-only 模式。
+
+**Q: JWT 验证的三个阶段顺序是怎样的？**
+A: 严格按 阶段 1（主密钥验证）→ 阶段 2（宽限期回退）→ 阶段 3（过期失效）的顺序执行。只有前一阶段失败才会进入后一阶段。宽限期回退仅在签名验证失败时触发，不处理 JWT 自身过期（exp claim）。
+
+**Q: sanitizeBranchName 做字符清洗吗？**
+A: 不做。sanitizeBranchName 的唯一职责是剥离 Git ref 前缀（`refs/heads/`、`refs/remotes/` 等），不做任何特殊字符过滤或转义。分支名合法性检查由独立的 `isValidGitBranchName()` 函数负责。
 
 **Q: PREVIEW 环境为什么必须传 x-trigger-branch 头？**
-A: PREVIEW 是父环境，本身不直接承载运行。必须通过 branch 头定位到具体子环境，确保操作的是正确的分支环境。
+A: PREVIEW 是父环境，本身不直接承载运行。必须通过 branch 头定位到具体子环境，确保操作的是正确的分支环境。无 branch 头时明确返回 401。
