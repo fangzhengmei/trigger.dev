@@ -30,6 +30,23 @@ Organization (组织)
 - `orgMemberId`：开发环境绑定的成员（个人隔离）
 - `parentEnvironmentId`：预览环境的父环境（继承凭证）
 
+### 1.3 认证与授权的关键差异
+
+| 维度 | 认证 (Authentication) | 授权 (Authorization) |
+|------|----------------------|----------------------|
+| 核心问题 | "你是谁？" | "你能做什么？" |
+| 验证目标 | 凭证有效性 + 身份归属 | 权限范围 + 资源访问许可 |
+| 典型操作 | API Key 匹配、JWT 签名校验、PAT 哈希比对 | Scope 匹配、RBAC 角色检查、资源归属校验 |
+| 失败状态码 | 401 Unauthorized | 403 Forbidden |
+| 执行时机 | 请求入口，最先执行 | 认证通过后，资源访问前 |
+| 数据来源 | 请求头 (Authorization) + 数据库 | 认证结果 + JWT claims + 路由配置 |
+| 项目隔离方式 | Environment → Project 外键绑定 | projectRef 参数校验 + 作用域限制 |
+
+**关键区分**：
+- 认证只验证"凭证是否有效"和"属于哪个环境/用户"
+- 授权验证"该凭证是否有权访问特定资源"
+- API Key 认证通过 ≠ 可以访问所有资源（JWT scopes 会进一步限制）
+
 ## 二、凭证签发机制
 
 ### 2.1 API Key 生成规则
@@ -147,25 +164,263 @@ function getApiKeyResult(apiKey: string): {
 }
 ```
 
-### 3.3 项目维度的二次校验
+### 3.3 项目维度的二次校验：Legacy vs apiBuilder
 
-**文件**：`apps/webapp/app/services/apiAuth.server.ts:456-464`
+#### 3.3.1 Legacy 链路：显式二次校验
+
+**文件**：`apps/webapp/app/services/apiAuth.server.ts:440-614`
 
 ```typescript
-if (auth.result.environment.project.externalRef !== projectRef) {
-  throw json(
-    {
-      error: "Invalid project ref for this API key. Make sure you are using an API key associated with that project.",
-    },
-    { status: 400 }
-  );
+export async function authenticatedEnvironmentForAuthentication(
+  auth: AuthenticationResult,
+  projectRef: string,
+  slug: string,
+  branch?: string
+): Promise<AuthenticatedEnvironment> {
+  if (slug === "staging") {
+    slug = "stg";
+  }
+
+  switch (auth.type) {
+    case "apiKey": {
+      if (!auth.result.ok) {
+        throw json({ error: auth.result.error }, { status: 401 });
+      }
+
+      // Legacy 强制校验：projectRef 必须完全匹配
+      if (auth.result.environment.project.externalRef !== projectRef) {
+        throw json(
+          {
+            error:
+              "Invalid project ref for this API key. Make sure you are using an API key associated with that project.",
+          },
+          { status: 400 }
+        );
+      }
+
+      // Legacy 强制校验：slug 或 branchName 必须匹配
+      if (auth.result.environment.slug !== slug && auth.result.environment.branchName !== branch) {
+        throw json(
+          {
+            error:
+              "Invalid environment slug for this API key. Make sure you are using an API key associated with that environment.",
+          },
+          { status: 400 }
+        );
+      }
+
+      return auth.result.environment;
+    }
+    // ... PAT 和 organizationAccessToken 类似逻辑
+  }
 }
 ```
 
-在 `authenticatedEnvironmentForAuthentication` 中，即使 API Key 认证通过，仍需校验：
-1. `project.externalRef` 必须与请求参数中的 `projectRef` 一致
-2. `environment.slug` 必须与请求的 `slug` 匹配（或分支名匹配）
-3. 这是**项目维度的强制隔离边界**，防止跨项目密钥滥用
+**Legacy 调用示例**：`apps/webapp/app/routes/api.v1.projects.$projectRef.envvars.$slug.ts:29-34`
+
+```typescript
+const environment = await authenticatedEnvironmentForAuthentication(
+  authenticationResult,
+  parsedParams.data.projectRef,  // URL 路径参数
+  parsedParams.data.slug,        // URL 路径参数
+  branchNameFromRequest(request)
+);
+```
+
+#### 3.3.2 apiBuilder 新链路：隐式校验 + 资源绑定
+
+**文件**：`apps/webapp/app/services/routeBuilders/apiBuilder.server.ts:51-79`
+
+```typescript
+async function authenticateRequestForApiBuilder(
+  request: Request,
+  { allowJWT }: { allowJWT: boolean }
+): Promise<
+  | { ok: false; status: 401 | 403; error: string }
+  | { ok: true; authentication: ApiAuthenticationResultSuccess; ability: RbacAbility }
+> {
+  const result = await rbac.authenticateBearer(request, { allowJWT });
+  if (!result.ok) {
+    return { ok: false, status: result.status, error: result.error };
+  }
+
+  // apiBuilder 不做显式 projectRef 校验
+  // 项目隔离通过以下方式保证：
+  // 1. authenticateBearer 返回的 environment 已绑定到具体 project
+  // 2. findResource 使用 environment.projectId 过滤查询
+  // 3. authorization 检查时 resource 已归属到该项目
+
+  const authentication: ApiAuthenticationResultSuccess = {
+    ok: true,
+    apiKey: result.environment.apiKey,
+    type: result.subject.type === "publicJWT" ? "PUBLIC_JWT" : "PRIVATE",
+    environment: result.environment,
+    realtime: result.jwt?.realtime,
+    oneTimeUse: result.jwt?.oneTimeUse,
+  };
+
+  return { ok: true, authentication, ability: result.ability };
+}
+```
+
+#### 3.3.3 新旧链路对比
+
+| 对比项 | Legacy 链路 | apiBuilder 新链路 |
+|--------|------------|-----------------|
+| 校验时机 | 认证后立即执行 | 不做集中校验，分散到 findResource |
+| 校验方式 | 显式比较 `project.externalRef === projectRef` | 通过 `environment.projectId` 隐式过滤 |
+| 失败状态码 | 400 Bad Request | 404 Not Found (资源不存在) |
+| slug/branch 校验 | 显式检查 `environment.slug === slug` | 认证时已通过 branchName 路由到正确环境 |
+| 错误信息 | 明确提示 "Invalid project ref" | 不暴露项目存在性信息（更安全） |
+| 适用场景 | 旧版 API 路由（`/api/v1/projects/:projectRef/...`） | 新版 API 路由（使用 apiBuilder） |
+
+**设计意图**：
+- Legacy：URL 路径中包含 `projectRef`，需要显式校验防止跨项目调用
+- apiBuilder：URL 不直接暴露 `projectRef`，通过认证结果隐式绑定，更安全且减少冗余校验
+
+### 3.4 JWT 密钥更换后的宽限期回退校验
+
+**文件**：`apps/webapp/app/services/realtime/jwtAuth.server.ts:21-108`
+
+```typescript
+export async function validatePublicJwtKey(token: string): Promise<ValidatePublicJwtKeyResult> {
+  const sub = extractJWTSub(token);
+  if (!sub) return { ok: false, error: "Invalid Public Access Token, missing subject." };
+
+  const environment = await findEnvironmentById(sub);
+  if (!environment) return { ok: false, error: "Invalid Public Access Token, environment not found." };
+
+  // 1. 主验证：使用当前环境 apiKey 验证签名
+  let result = await validateJWT(
+    token,
+    environment.parentEnvironment?.apiKey ?? environment.apiKey
+  );
+
+  // 2. 回退验证：如果主验证失败，尝试已吊销但仍在宽限期内的旧密钥
+  if (!result.ok) {
+    result = await validateAgainstRevokedApiKeys(
+      token,
+      environment.parentEnvironment?.id ?? environment.id,
+      result
+    );
+  }
+
+  // ... 错误处理
+}
+
+async function validateAgainstRevokedApiKeys(
+  token: string,
+  signingEnvironmentId: string,
+  primaryResult: ValidationResult
+): Promise<ValidationResult> {
+  // 查询该环境所有仍在宽限期内的已吊销密钥
+  const revokedApiKeys = await $replica.revokedApiKey.findMany({
+    where: {
+      runtimeEnvironmentId: signingEnvironmentId,
+      expiresAt: { gt: new Date() },
+    },
+    select: { apiKey: true },
+  });
+
+  // 依次尝试每个已吊销密钥，只要有一个验证通过即视为有效
+  for (const { apiKey } of revokedApiKeys) {
+    const fallbackResult = await validateJWT(token, apiKey);
+    if (fallbackResult.ok) {
+      return fallbackResult;
+    }
+  }
+
+  return primaryResult;
+}
+```
+
+**宽限期机制要点**：
+1. **触发时机**：JWT 签名验证失败时（不是过期，是密钥不匹配）
+2. **查询范围**：仅查询当前 `environmentId` 下的吊销记录，防止跨环境尝试
+3. **验证顺序**：先主密钥，再依次尝试所有宽限期内的旧密钥
+4. **安全边界**：宽限期到期后（默认 24 小时），旧密钥签名的 JWT 彻底失效
+5. **设计权衡**：密钥轮换时已签发的 JWT 可继续使用到宽限期结束，避免业务中断
+
+### 3.5 PAT 在无 RBAC 插件 Fallback 下的默认授权
+
+**文件**：`internal-packages/rbac/src/fallback.ts:275-317`
+
+```typescript
+async authenticatePat(
+  request: Request,
+  context: { organizationId?: string; projectId?: string }
+): Promise<PatAuthResult> {
+  const rawToken = request.headers
+    .get("Authorization")
+    ?.replace(/^Bearer /, "")
+    .trim();
+  if (!rawToken || !rawToken.startsWith("tr_pat_")) {
+    return { ok: false, status: 401, error: "Invalid or Missing PAT" };
+  }
+
+  const hashedToken = createHash("sha256").update(rawToken).digest("hex");
+  const pat = await this.replica.personalAccessToken.findFirst({
+    where: { hashedToken, revokedAt: null },
+    select: { id: true, userId: true, lastAccessedAt: true },
+  });
+  if (!pat) {
+    return { ok: false, status: 401, error: "Invalid PAT" };
+  }
+
+  return {
+    ok: true,
+    tokenId: pat.id,
+    userId: pat.userId,
+    lastAccessedAt: pat.lastAccessedAt,
+    subject: {
+      type: "personalAccessToken",
+      tokenId: pat.id,
+      organizationId: context.organizationId ?? "",
+      projectId: context.projectId,
+    },
+    // 无 RBAC 插件时返回 permissiveAbility
+    ability: permissiveAbility,  // can() = true, canSuper() = false
+  };
+}
+```
+
+**PAT Fallback 授权行为**：
+
+| 场景 | 授权结果 | 说明 |
+|------|---------|------|
+| OSS 版本（无插件） | `permissiveAbility` | PAT 认证通过后，环境内无任何权限限制 |
+| Cloud 版本（有插件） | 基于角色的能力 | PAT 关联的角色决定具体权限 |
+| `lastAccessedAt` 更新 | JS 节流 + SQL 条件更新 | 5 分钟内重复访问不触发 DB 写入 |
+| 跨项目访问 | 依赖用户成员身份 | PAT 是用户令牌，需目标项目中存在该用户的成员关系 |
+
+**关键代码**：`apps/webapp/app/services/personalAccessToken.server.ts:129-150`
+
+```typescript
+export const PAT_LAST_ACCESSED_THROTTLE_MS = 5 * 60 * 1000; // 5分钟
+
+export async function updateLastAccessedAtIfStale(
+  tokenId: string,
+  lastAccessedAt: Date | null
+): Promise<void> {
+  if (
+    lastAccessedAt &&
+    Date.now() - lastAccessedAt.getTime() <= PAT_LAST_ACCESSED_THROTTLE_MS
+  ) {
+    return; // 5 分钟内已更新过，跳过
+  }
+  await prisma.personalAccessToken.updateMany({
+    where: {
+      id: tokenId,
+      revokedAt: null,
+      OR: [
+        { lastAccessedAt: null },
+        { lastAccessedAt: { lt: new Date(Date.now() - PAT_LAST_ACCESSED_THROTTLE_MS) } },
+      ],
+    },
+    data: { lastAccessedAt: new Date() },
+  });
+}
+```
 
 ## 四、RBAC 作用域校验机制
 
@@ -356,7 +611,95 @@ async authenticateBearer(request: Request, options?: { allowJWT?: boolean }) {
 - 签名密钥使用环境自身的 apiKey，确保无法跨环境伪造
 - `scopes` 声明进一步限制可访问的资源范围
 
-## 六、完整协作链路图
+## 六、Preview 分支匹配与边界条件
+
+### 6.1 Preview 环境认证流程
+
+**文件**：`internal-packages/rbac/src/fallback.ts:139-208`
+
+```typescript
+async authenticateBearer(request: Request, options?: { allowJWT?: boolean }) {
+  // ... JWT 流程省略
+
+  // PREVIEW 环境分支路由
+  const branchName = sanitizeBranchName(request.headers.get("x-trigger-branch"));
+  const include = {
+    project: true,
+    organization: true,
+    orgMember: { select: { userId: true, user: { select: { ... } } },
+    parentEnvironment: { select: { id: true, apiKey: true } },
+    childEnvironments: branchName
+      ? { where: { branchName, archivedAt: null } }
+      : undefined,
+  } as const;
+
+  let env = await this.replica.runtimeEnvironment.findFirst({
+    where: { apiKey: rawToken },
+    include,
+  });
+
+  // ... 吊销密钥回退
+
+  // PREVIEW 环境边界条件处理
+  if (env.type === "PREVIEW") {
+    // 边界 1：PREVIEW 环境必须提供 branchName
+    if (!branchName) {
+      return {
+        ok: false,
+        status: 401,
+        error: "x-trigger-branch header required for preview env",
+      };
+    }
+    const child = env.childEnvironments?.[0];
+    // 边界 2：branchName 对应的子环境必须存在
+    if (!child) {
+      return { ok: false, status: 401, error: "No matching branch env" };
+    }
+    // Pivot：子环境继承父环境的安全上下文
+    env = {
+      ...child,
+      apiKey: env.apiKey,
+      orgMember: env.orgMember,
+      organization: env.organization,
+      project: env.project,
+      parentEnvironment: { id: env.id, apiKey: env.apiKey },
+      childEnvironments: [],
+    };
+  }
+  // ...
+}
+```
+
+### 6.2 slug/branch 判断边界条件
+
+| 场景 | 条件 | 行为 |
+|------|------|------|
+| PREVIEW 环境无 `x-trigger-branch` 头 | `env.type === "PREVIEW" && !branchName` | 返回 401，明确要求提供 branch 头 |
+| PREVIEW 环境有 branch 但子环境不存在 | `childEnvironments.length === 0` | 返回 401，提示无匹配分支 |
+| 子环境已归档 | `child.archivedAt !== null` | 不返回（查询条件已过滤） |
+| 非 PREVIEW 环境传了 branch 头 | `env.type !== "PREVIEW" && branchName` | branchName 被忽略，使用主环境 |
+| slug 参数为 "staging" | `slug === "staging"` | 自动转换为 "stg" 匹配 |
+| Legacy 链路 slug 不匹配 | `env.slug !== slug && env.branchName !== branch` | 返回 400 |
+
+### 6.3 sanitizeBranchName 规范化
+
+**文件**：`packages/core/src/v3/utils/gitBranch.ts`（推断逻辑）
+
+```typescript
+// 分支名规范化：去除危险字符，确保可安全用于查询
+export function sanitizeBranchName(branchName: string | null | undefined): string | undefined {
+  if (!branchName) return undefined;
+  // 实际实现会去除特殊字符、截断长度等
+  return branchName.trim();
+}
+```
+
+**边界保护**：
+- `null` / `undefined` / 空字符串 → 返回 `undefined`
+- 首尾空白自动去除
+- 防止 SQL 注入和路径遍历攻击
+
+## 七、完整协作链路图
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -367,39 +710,48 @@ async authenticateBearer(request: Request, options?: { allowJWT?: boolean }) {
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                第一层：凭证类型识别 + 环境解析                    │
-│  apps/webapp/app/services/apiAuth.server.ts                     │
-│  internal-packages/rbac/src/fallback.ts:authenticateBearer()   │
+│                第一层：认证 (Authentication)                     │
+│  目标：验证"你是谁"                                              │
 │                                                                 │
 │  tr_xxx → findEnvironmentByApiKey(apiKey)                       │
 │          → runtimeEnvironment.projectId → 确定项目归属          │
 │          → 检查 project.deletedAt → 软删除项目拒绝              │
-│          → 预览环境 branchName 路由 → 子环境隔离                │
+│          → PREVIEW 环境检查 branchName → 子环境 pivot           │
+│          → 已吊销密钥回退校验（24小时宽限期）                    │
 │                                                                 │
 │  JWT → extractJWTSub() → environmentId                          │
 │      → validateJWT(token, env.apiKey) → 签名校验                │
+│      → 签名失败时尝试 revokedApiKeys 回退                        │
 │      → payload.scopes → 构建细粒度能力                          │
-└────────────────────────────┬────────────────────────────────────┘
-                             │
-                             ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                第二层：项目维度强制校验                           │
-│  apps/webapp/app/services/apiAuth.server.ts:456-474             │
 │                                                                 │
-│  ✓ environment.project.externalRef === request.projectRef       │
-│  ✓ environment.slug === request.slug                            │
-│  ✗ 不匹配 → 400 "Invalid project ref for this API key"          │
+│  PAT → 哈希比对 → 验证 token 有效性                             │
+│      → 无 RBAC 插件时返回 permissiveAbility                      │
+│      → lastAccessedAt 5 分钟节流更新                            │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                第三层：RBAC 作用域校验（可选）                    │
-│  apps/webapp/app/services/routeBuilders/apiBuilder.server.ts    │
-│  internal-packages/rbac/src/ability.ts:buildJwtAbility()        │
+│                第二层：项目隔离校验                               │
+│  Legacy 链路：显式校验                                           │
+│    ✓ environment.project.externalRef === request.projectRef     │
+│    ✓ environment.slug === request.slug                           │
+│    ✗ 不匹配 → 400 "Invalid project ref"                          │
+│                                                                 │
+│  apiBuilder 链路：隐式校验                                       │
+│    ✓ findResource 使用 environment.projectId 过滤查询            │
+│    ✓ 资源不存在 → 404（不暴露项目存在性）                        │
+└────────────────────────────┬────────────────────────────────────┘
+                             │
+                             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                第三层：授权 (Authorization)                      │
+│  目标：验证"你能做什么"                                          │
 │                                                                 │
 │  PRIVATE API Key → permissiveAbility (环境内无限制)              │
 │  PUBLIC JWT → buildJwtAbility(scopes) → can(action, resource)   │
-│  PAT → 用户级能力（基于角色）                                    │
+│  PAT → 无插件时 permissiveAbility，有插件时基于角色              │
+│                                                                 │
+│  动作别名：trigger/batchTrigger/update → write                   │
 └────────────────────────────┬────────────────────────────────────┘
                              │
                              ▼
@@ -407,39 +759,42 @@ async authenticateBearer(request: Request, options?: { allowJWT?: boolean }) {
 │                第四层：资源级授权检查                             │
 │  apiBuilder authorization 配置                                   │
 │                                                                 │
-│  anyResource([...]) → 任一匹配即通过                              │
-│  everyResource([...]) → 全部匹配才通过                            │
+│  anyResource([...]) → 任一匹配即通过（多标识资源）                │
+│  everyResource([...]) → 全部匹配才通过（批量操作）                │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-## 七、关键设计要点
+## 八、关键设计要点
 
-### 7.1 项目隔离的四层保障
+### 8.1 项目隔离的四层保障
 
 1. **凭证绑定层**：API Key 唯一绑定到 RuntimeEnvironment → 天然绑定 Project
 2. **软删除防护**：`project.deletedAt` 检查，已删除项目即使密钥有效也无法访问
-3. **参数校验层**：`project.externalRef` 与请求参数二次匹配，防止跨项目调用
+3. **参数校验层**（Legacy）：`project.externalRef` 与请求参数二次匹配，防止跨项目调用
 4. **作用域限制层**：JWT scopes 可进一步限制到项目内特定资源类型/实例
 
-### 7.2 预览环境的特殊设计
+### 8.2 预览环境的特殊设计
 
 - 预览环境共享父环境的 apiKey，通过 `x-trigger-branch` 头区分
 - 认证时自动 pivot 到子环境，但继承父环境的组织/项目/成员关系
 - 实现"同一密钥，分支隔离"的部署体验
+- 无 branch 头时明确返回 401 提示，避免歧义
 
-### 7.3 向后兼容策略
+### 8.3 向后兼容策略
 
 - 旧版 `pk_*` 公钥在新 RBAC 路径（apiBuilder）直接返回 401
 - 动作别名（`trigger`→`write`）保证旧 scope 继续有效
 - 吊销宽限期（24小时）避免密钥轮换导致业务中断
+- JWT 签名验证失败时自动回退到已吊销密钥重试验证
 
-### 7.4 性能优化
+### 8.4 性能优化
 
 - `AuthenticatedEnvironment` 是精简结构，只包含认证链路上必需的字段
 - 预览环境查询时通过 include 一次性加载子环境，避免 N+1
 - PAT 的 `lastAccessedAt` 更新采用 JS 层节流 + SQL 条件更新双层优化
+- JWT 回退验证仅在主验证失败时触发，不影响正常路径性能
 
-## 八、常见疑问
+## 九、常见疑问
 
 **Q: 为什么 API Key 不直接存储 projectId？**
 A: 通过 RuntimeEnvironment 间接关联。一个项目有多个环境（dev/stg/prod），每个环境独立密钥是更精细的安全模型。
@@ -451,4 +806,10 @@ A: 普通 `tr_*` API Key 是环境全权限。如需只读，应签发带 `read:
 A: 使用 PAT（`tr_pat_*`）而非环境级 API Key。PAT 是用户身份令牌，通过用户在各项目的成员身份实现跨项目访问。
 
 **Q: 为什么 JWT 用 apiKey 作为签名密钥？**
-A: 密钥轮换自动使所有该环境签发的 JWT 失效，无需额外维护 JWT 黑名单。
+A: 密钥轮换自动使所有该环境签发的 JWT 失效，无需额外维护 JWT 黑名单。配合 24 小时宽限期实现平滑过渡。
+
+**Q: Legacy 和 apiBuilder 的 projectRef 校验为什么不一样？**
+A: Legacy URL 包含 `projectRef` 路径参数，必须显式校验防止跨项目调用；apiBuilder 不暴露 `projectRef`，通过认证结果隐式绑定，更安全且减少冗余。
+
+**Q: PREVIEW 环境为什么必须传 x-trigger-branch 头？**
+A: PREVIEW 是父环境，本身不直接承载运行。必须通过 branch 头定位到具体子环境，确保操作的是正确的分支环境。
