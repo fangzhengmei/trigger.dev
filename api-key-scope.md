@@ -340,105 +340,64 @@ const patAuth = await rbac.authenticatePat(request, ctx);  // ctx 传入 authent
 - apiKey 路由：URL 不直接暴露 `projectRef`，通过 API Key → Environment → Project 链隐式绑定，更安全
 - PAT 路由：PAT 是跨项目用户令牌，必须显式指定目标项目上下文才能计算权限
 
-### 3.4 JWT 密钥更换后的宽限期回退校验
+### 3.4 JWT 签名密钥轮换与宽限期机制
 
-**文件**：`apps/webapp/app/services/realtime/jwtAuth.server.ts:21-108`
+JWT 使用环境的 `apiKey` 作为签名密钥。当 API Key 轮换时，存在两种不同的宽限期回退机制：
 
-```typescript
-export async function validatePublicJwtKey(token: string): Promise<ValidatePublicJwtKeyResult> {
-  const sub = extractJWTSub(token);
-  if (!sub) return { ok: false, error: "Invalid Public Access Token, missing subject." };
+#### 3.4.1 两种宽限期机制的区别
 
-  const environment = await findEnvironmentById(sub);
-  if (!environment) return { ok: false, error: "Invalid Public Access Token, environment not found." };
+| 机制 | 适用场景 | 触发位置 | 回退目标 |
+|------|---------|---------|---------|
+| **API Key 宽限期** | API Key 认证 | `authenticateBearer`（fallback.ts:168-174） | 使用已吊销的 API Key 直接查询环境 |
+| **JWT 签名密钥宽限期** | JWT 签名验证 | `validatePublicJwtKey`（jwtAuth.server.ts:47-53） | 使用已吊销的 API Key 作为 JWT 签名密钥重试 |
 
-  // 1. 主验证：使用当前环境 apiKey 验证签名
-  let result = await validateJWT(
-    token,
-    environment.parentEnvironment?.apiKey ?? environment.apiKey
-  );
+> **重要说明**：`authenticateBearer` 中的 JWT 路径（fallback.ts:86-132）**没有**签名密钥回退逻辑，签名验证失败直接返回 401。回退逻辑仅存在于 `validatePublicJwtKey` 函数（用于 realtime 认证）。
 
-  // 2. 回退验证：如果主验证失败，尝试已吊销但仍在宽限期内的旧密钥
-  if (!result.ok) {
-    result = await validateAgainstRevokedApiKeys(
-      token,
-      environment.parentEnvironment?.id ?? environment.id,
-      result
-    );
-  }
+### 3.4.2 JWT 签名验证的三阶段流程（validatePublicJwtKey）
 
-  // ... 错误处理
-}
-
-async function validateAgainstRevokedApiKeys(
-  token: string,
-  signingEnvironmentId: string,
-  primaryResult: ValidationResult
-): Promise<ValidationResult> {
-  // 查询该环境所有仍在宽限期内的已吊销密钥
-  const revokedApiKeys = await $replica.revokedApiKey.findMany({
-    where: {
-      runtimeEnvironmentId: signingEnvironmentId,
-      expiresAt: { gt: new Date() },
-    },
-    select: { apiKey: true },
-  });
-
-  // 依次尝试每个已吊销密钥，只要有一个验证通过即视为有效
-  for (const { apiKey } of revokedApiKeys) {
-    const fallbackResult = await validateJWT(token, apiKey);
-    if (fallbackResult.ok) {
-      return fallbackResult;
-    }
-  }
-
-  return primaryResult;
-}
-```
-
-### 3.4.1 JWT 验证的三个阶段（按顺序执行）
+**文件**：`apps/webapp/app/services/realtime/jwtAuth.server.ts:38-78`
 
 ```
 JWT 验证请求
    │
    ▼
-┌─────────────────────────────────────┐
-│ 阶段 1：主密钥验证                   │
-│ 使用 environment.apiKey 验证签名     │
-│ （含父环境 apiKey 回退）             │
-└───────────────┬─────────────────────┘
-                │ 验证成功
-                ├───────────────────► 返回验证通过
-                │ 验证失败
-                ▼
-┌─────────────────────────────────────┐
-│ 阶段 2：宽限期回退验证               │
-│ 查询 revokedApiKey 表中              │
-│ expiresAt > now 的所有旧密钥         │
-│ 依次尝试验证签名                     │
-└───────────────┬─────────────────────┘
-                │ 任一验证成功
-                ├───────────────────► 返回验证通过
-                │ 全部失败
-                ▼
-┌─────────────────────────────────────┐
-│ 阶段 3：过期后失效                   │
-│ 返回具体错误：                       │
-│ - ERR_JWT_EXPIRED：令牌自身过期      │
-│ - ERR_JWT_CLAIM_INVALID：声明无效    │
-│ - 其他：签名验证完全失败             │
-└─────────────────────────────────────┘
+┌──────────────────────────────────────────────────┐
+│ 阶段 1：主密钥验证                                │
+│ 使用 environment.apiKey（或父环境 apiKey）        │
+│ 调用 validateJWT(token, signingKey) 验证签名       │
+└───────────────────────┬──────────────────────────┘
+                        │ 验证成功
+                        ├────────────────────────► 返回验证通过
+                        │ 验证失败（签名不匹配）
+                        ▼
+┌──────────────────────────────────────────────────┐
+│ 阶段 2：宽限期回退（仅签名失败时触发）            │
+│ 查询 revokedApiKey 表：                           │
+│   WHERE runtimeEnvironmentId = 目标环境           │
+│     AND expiresAt > NOW()                        │
+│ 对每个旧密钥调用 validateJWT 重试                 │
+└───────────────────────┬──────────────────────────┘
+                        │ 任一重试成功
+                        ├────────────────────────► 返回验证通过
+                        │ 全部重试失败
+                        ▼
+┌──────────────────────────────────────────────────┐
+│ 阶段 3：验证失败，返回具体错误                    │
+│ - ERR_JWT_EXPIRED：JWT 自身 exp claim 过期        │
+│ - ERR_JWT_CLAIM_INVALID：声明格式错误             │
+│ - 其他：签名验证完全失败（密钥不匹配）             │
+└──────────────────────────────────────────────────┘
 ```
 
-**各阶段详细说明**：
+**各阶段触发条件与行为**：
 
-| 阶段 | 触发条件 | 验证目标 | 成功/失败行为 |
-|------|---------|---------|--------------|
-| **阶段 1：主密钥验证** | 所有 JWT 请求必经 | 当前环境的 `apiKey`（含父环境密钥回退） | 成功 → 直接通过；失败 → 进入阶段 2 |
-| **阶段 2：宽限期回退** | 阶段 1 签名失败 | `revokedApiKey` 表中 `expiresAt > now` 的所有密钥 | 任一成功 → 通过；全部失败 → 进入阶段 3 |
-| **阶段 3：过期后失效** | 阶段 2 全部失败 | 无验证，直接返回错误 | 按错误类型返回 401 |
+| 阶段 | 触发条件 | 操作 | 退出路径 |
+|------|---------|------|---------|
+| **阶段 1：主密钥验证** | 所有 JWT 请求必经 | 用当前环境 `apiKey` 验证签名 | 成功 → 返回通过；签名失败 → 进入阶段 2 |
+| **阶段 2：宽限期回退** | 阶段 1 签名验证失败 | 查询 `revokedApiKey` 表中 `expiresAt > NOW()` 的所有旧密钥，依次重试 | 任一成功 → 返回通过；全部失败 → 进入阶段 3 |
+| **阶段 3：失效** | 阶段 2 全部重试失败 | 按错误类型返回 401 | 直接返回错误 |
 
-**关键代码**：`apps/webapp/app/services/realtime/jwtAuth.server.ts:38-53, 87-108`
+**核心代码**：
 ```typescript
 // 阶段 1：主密钥验证
 let result = await validateJWT(
@@ -458,14 +417,14 @@ if (!result.ok) {
 // 阶段 3：返回具体错误
 if (!result.ok) {
   switch (result.code) {
-    case "ERR_JWT_EXPIRED": { /* 令牌自身过期 */ }
+    case "ERR_JWT_EXPIRED": { /* JWT 自身已过期 */ }
     case "ERR_JWT_CLAIM_INVALID": { /* 声明无效 */ }
-    default: { /* 签名完全失败 */ }
+    default: { /* 签名完全失败，密钥不匹配 */ }
   }
 }
 ```
 
-**回退验证逻辑**：
+**回退验证实现**：
 ```typescript
 async function validateAgainstRevokedApiKeys(
   token: string,
@@ -481,7 +440,7 @@ async function validateAgainstRevokedApiKeys(
     select: { apiKey: true },
   });
 
-  // 依次尝试每个已吊销密钥
+  // 依次尝试每个已吊销密钥作为签名密钥
   for (const { apiKey } of revokedApiKeys) {
     const fallbackResult = await validateJWT(token, apiKey);
     if (fallbackResult.ok) {
@@ -493,11 +452,11 @@ async function validateAgainstRevokedApiKeys(
 }
 ```
 
-**宽限期机制要点**：
-1. **触发时机**：仅在 JWT 签名验证失败时触发（不是令牌过期，是密钥不匹配）
-2. **查询范围**：仅查询当前 `environmentId` 下的吊销记录，防止跨环境尝试
-3. **验证顺序**：严格按 主密钥 → 宽限期密钥 → 错误返回 的顺序执行
-4. **安全边界**：宽限期到期后（默认 24 小时），旧密钥从 `revokedApiKey` 中清理，JWT 彻底失效
+**宽限期关键约束**：
+1. **触发条件严格**：仅当 JWT 签名验证失败时触发，JWT 自身过期（`exp` claim）不触发回退
+2. **范围限制**：仅查询当前 `environmentId` 下的吊销记录，防止跨环境尝试
+3. **顺序保证**：严格按 主密钥 → 宽限期密钥 → 错误返回 的顺序执行
+4. **失效时机**：宽限期到期后（默认 24 小时），`revokedApiKey` 表中该密钥的 `expiresAt` 字段已过，查询不到 → JWT 彻底失效
 5. **设计权衡**：密钥轮换时已签发的 JWT 可继续使用到宽限期结束，避免业务中断
 
 ### 3.5 PAT 在无 RBAC 插件 Fallback 下的默认授权
@@ -902,9 +861,11 @@ export function sanitizeBranchName(ref: string | null | undefined): string | nul
 │  ┌─ JWT 认证 ────────────────────────────────────────────────┐  │
 │  │ JWT → extractJWTSub() → environmentId                     │  │
 │  │     → 阶段 1: 主密钥 validateJWT(env.apiKey)               │  │
-│  │     → 阶段 2: 签名失败 → 宽限期 revokedApiKeys 回退        │  │
+│  │     → 阶段 2: 签名失败时（仅 validatePublicJwtKey）        │  │
+│  │             宽限期 revokedApiKeys 回退重试                 │  │
 │  │     → 阶段 3: 全部失败 → 返回具体错误                       │  │
 │  │     → payload.scopes → buildJwtAbility() 细粒度能力        │  │
+│  │  注意：authenticateBearer 中 JWT 路径无宽限期回退          │  │
 │  └────────────────────────────────────────────────────────────┘  │
 │                                                                 │
 │  ┌─ PAT 路由 ────────────────────────────────────────────────┐  │
@@ -976,15 +937,16 @@ export function sanitizeBranchName(ref: string | null | undefined): string | nul
 
 - 旧版 `pk_*` 公钥在新 RBAC 路径（apiBuilder）直接返回 401
 - 动作别名（`trigger`→`write`）保证旧 scope 继续有效
-- 吊销宽限期（24小时）避免密钥轮换导致业务中断
-- JWT 签名验证失败时自动回退到已吊销密钥重试验证
+- API Key 吊销宽限期（24小时）：旧密钥在宽限期内仍可查询环境
+- JWT 签名密钥宽限期（仅 `validatePublicJwtKey`）：签名失败时回退到已吊销密钥重试
+- `authenticateBearer` 中 JWT 路径无签名密钥回退，签名失败直接返回 401
 
 ### 8.4 性能优化
 
 - `AuthenticatedEnvironment` 是精简结构，只包含认证链路上必需的字段
 - 预览环境查询时通过 include 一次性加载子环境，避免 N+1
 - PAT 的 `lastAccessedAt` 更新采用 JS 层节流 + SQL 条件更新双层优化
-- JWT 回退验证仅在主验证失败时触发，不影响正常路径性能
+- JWT 签名密钥回退验证（仅 `validatePublicJwtKey`）仅在主验证失败时触发，不影响正常路径性能
 
 ## 九、常见疑问
 
@@ -998,7 +960,7 @@ A: 普通 `tr_*` API Key 是环境全权限。如需只读，应签发带 `read:
 A: 使用 PAT（`tr_pat_*`）而非环境级 API Key。PAT 是用户身份令牌，通过用户在各项目的成员身份实现跨项目访问。
 
 **Q: 为什么 JWT 用 apiKey 作为签名密钥？**
-A: 密钥轮换自动使所有该环境签发的 JWT 失效，无需额外维护 JWT 黑名单。配合 24 小时宽限期实现平滑过渡。
+A: 密钥轮换时，新签发的 JWT 使用新密钥签名，旧密钥签发的 JWT 在 24 小时宽限期内仍可通过回退机制验证。宽限期结束后，旧密钥从 `revokedApiKey` 表中过期，所有旧 JWT 自动失效，无需额外维护 JWT 黑名单。
 
 **Q: Legacy 和 apiBuilder apiKey 路由的 projectRef 校验为什么不一样？**
 A: Legacy URL 包含 `projectRef` 路径参数，必须显式校验防止跨项目调用；apiBuilder apiKey 路由不暴露 `projectRef`，通过 API Key → Environment → Project 链隐式绑定，更安全且减少冗余。
@@ -1006,8 +968,14 @@ A: Legacy URL 包含 `projectRef` 路径参数，必须显式校验防止跨项�
 **Q: apiBuilder 中 PAT 路由为什么需要 context 回调？**
 A: PAT 是用户级令牌，本身不绑定到任何项目/环境。必须通过 context 回调显式解析目标 `organizationId` / `projectId`，才能在有 RBAC 插件时计算用户在该项目中的角色权限。无 context 时 PAT 运行在 identity-only 模式。
 
-**Q: JWT 验证的三个阶段顺序是怎样的？**
-A: 严格按 阶段 1（主密钥验证）→ 阶段 2（宽限期回退）→ 阶段 3（过期失效）的顺序执行。只有前一阶段失败才会进入后一阶段。宽限期回退仅在签名验证失败时触发，不处理 JWT 自身过期（exp claim）。
+**Q: JWT 签名验证的三个阶段顺序是怎样的？**
+A: 严格按 阶段 1（主密钥验证）→ 阶段 2（宽限期回退）→ 阶段 3（失效返回错误）的顺序执行。只有前一阶段失败才会进入后一阶段。宽限期回退**仅在签名验证失败时触发**，不处理 JWT 自身过期（`exp` claim）。注意：该三阶段流程仅适用于 `validatePublicJwtKey`（realtime 认证），`authenticateBearer` 中的 JWT 路径无宽限期回退。
+
+**Q: 所有 JWT 认证路径都有宽限期回退吗？**
+A: 不是。只有 `validatePublicJwtKey` 函数（用于 realtime 认证）有签名密钥宽限期回退逻辑。`authenticateBearer` 中的 JWT 路径（apiBuilder 路由）签名验证失败直接返回 401，无回退。但 API Key 自身的吊销宽限期（使用旧 API Key 直接查询环境）在两条路径中都存在。
+
+**Q: JWT 宽限期结束后会怎样？**
+A: 宽限期到期后（默认 24 小时），`revokedApiKey` 表中旧密钥的 `expiresAt` 字段已过，查询不到该密钥。此时用旧密钥签名的 JWT 在阶段 2 回退时找不到可重试的密钥，进入阶段 3 返回错误，JWT 彻底失效。
 
 **Q: sanitizeBranchName 做字符清洗吗？**
 A: 不做。sanitizeBranchName 的唯一职责是剥离 Git ref 前缀（`refs/heads/`、`refs/remotes/` 等），不做任何特殊字符过滤或转义。分支名合法性检查由独立的 `isValidGitBranchName()` 函数负责。
