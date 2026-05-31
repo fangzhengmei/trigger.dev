@@ -2,116 +2,319 @@
 
 ## 一、核心问题背景
 
-用户反映**同一外部事件导致两次 task 运行**，需要深入理解 trigger.dev 的幂等保护覆盖范围，从客户端携带幂等键到服务端处理、再到 dashboard 体现的完整代码链路。
+线上系统出现**同一外部事件触发两次任务运行**，需要沿着代码路径逐层核对幂等链路，搞清楚每个环节的职责边界和判断逻辑，为排查提供可追溯的代码证据。
 
 ---
 
-## 二、幂等键的作用范围与层级
+## 二、SDK 与 Core 的职责划分
 
-### 2.1 数据库层面的唯一性约束
+### 2.1 包依赖关系
 
-**文件位置：** `internal-packages/database/prisma/schema.prisma:1076`
-
-```prisma
-@@unique([runtimeEnvironmentId, taskIdentifier, idempotencyKey])
+```
+@trigger.dev/sdk/v3
+  └─► idempotencyKeys.create / idempotencyKeys.reset  （纯转发层）
+        │
+@trigger.dev/core/v3
+  └─► createIdempotencyKey / resetIdempotencyKey       （实现层）
+        │
+        ├─► idempotency-key-catalog                     （本地注册表）
+        ├─► task-context-api                            （运行时上下文）
+        └─► utils/crypto → digestSHA256                 （哈希计算）
 ```
 
-**作用范围层级：**
-1. **环境隔离** - `runtimeEnvironmentId`：dev/staging/prod 环境完全隔离
-2. **任务隔离** - `taskIdentifier`：不同 task 之间的幂等键互不影响
-3. **键值匹配** - `idempotencyKey`：相同环境 + 相同 task + 相同键值才会去重
+### 2.2 trigger-sdk：纯转发层
 
-### 2.2 SDK 层面的 scope 机制
+**文件位置：** `packages/trigger-sdk/src/v3/idempotencyKeys.ts:1-7`
 
-**文件位置：** `packages/core/src/v3/idempotencyKeys.ts:127-142`
-
-| Scope | Hash 组成 | 适用场景 |
-|-------|----------|----------|
-| `run`（默认） | `key + parentRunId` | 防止父任务重试时重复触发子任务 |
-| `attempt` | `key + parentRunId + attemptNumber` | 允许每次重试都重新触发子任务 |
-| `global` | `key` | 全局去重，跨所有父任务 |
-
-**代码实现：**
 ```typescript
+import { createIdempotencyKey, resetIdempotencyKey, type IdempotencyKey } from "@trigger.dev/core/v3";
+
+export const idempotencyKeys = {
+  create: createIdempotencyKey,
+  reset: resetIdempotencyKey,
+};
+
+export type { IdempotencyKey };
+```
+
+**职责：** 仅做 re-export，零逻辑。用户代码 `import { idempotencyKeys } from "@trigger.dev/sdk/v3"` 实际调用的是 core 中的函数。
+
+### 2.3 core：实现层
+
+**文件位置：** `packages/core/src/v3/idempotencyKeys.ts`
+
+#### 2.3.1 createIdempotencyKey 的完整流程
+
+```typescript
+// 第127-142行
+export async function createIdempotencyKey(
+  key: string | string[],
+  options?: { scope?: IdempotencyKeyScope }
+): Promise<IdempotencyKey> {
+  const scope = options?.scope ?? "run";                          // ① 默认 scope = "run"
+  const keyArray = Array.isArray(key) ? key : [key];             // ② 标准化为数组
+  const userKey = keyArray.join("-");                             // ③ 拼接用户 key
+
+  const idempotencyKey = await generateIdempotencyKey(            // ④ 哈希计算
+    keyArray.concat(injectScope(scope))
+  );
+
+  idempotencyKeyCatalog.registerKeyOptions(idempotencyKey, {      // ⑤ 本地注册
+    key: userKey, scope
+  });
+
+  return idempotencyKey as IdempotencyKey;                        // ⑥ 返回 branded string
+}
+```
+
+#### 2.3.2 injectScope：scope 上下文注入
+
+```typescript
+// 第144-161行
 function injectScope(scope: IdempotencyKeyScope): string[] {
   switch (scope) {
     case "run": {
       if (taskContext?.ctx) {
-        return [taskContext.ctx.run.id];
+        return [taskContext.ctx.run.id];              // 追加 parentRunId
       }
-      break;
+      break;                                          // 无 task context → 不追加
     }
     case "attempt": {
       if (taskContext?.ctx) {
-        return [taskContext.ctx.run.id, taskContext.ctx.attempt.number.toString()];
+        return [
+          taskContext.ctx.run.id,                     // 追加 parentRunId
+          taskContext.ctx.attempt.number.toString()   // 追加 attemptNumber
+        ];
       }
       break;
     }
   }
-  return [];
+  return [];                                          // global → 空数组
 }
 ```
 
+**关键排查线索：** 当在 task 外部调用 `createIdempotencyKey`（如后端 API 路由中），`taskContext?.ctx` 为 undefined，即使 scope 是 `"run"` 也不会追加 parentRunId，此时行为等同于 `"global"`。
+
+#### 2.3.3 generateIdempotencyKey：哈希计算
+
+```typescript
+// 第163-165行
+async function generateIdempotencyKey(keyMaterial: string[]) {
+  return await digestSHA256(keyMaterial.join("-"));
+}
+```
+
+**文件位置：** `packages/core/src/v3/utils/crypto.ts:7-15`
+
+```typescript
+export async function digestSHA256(data: string): Promise<string> {
+  const { subtle } = await import("uncrypto");
+  const hash = await subtle.digest("SHA-256", new TextEncoder().encode(data));
+  return Array.from(new Uint8Array(hash))
+    .map((byte) => byte.toString(16).padStart(2, "0"))
+    .join("");                          // 返回 64 字符 hex string
+}
+```
+
+**计算过程示例：**
+
+| 输入 key | scope | task context | join("-") | SHA-256 |
+|----------|-------|-------------|-----------|---------|
+| `"email-123"` | `global` | 有 | `"email-123"` | `a1b2c3...` |
+| `"email-123"` | `run` | runId=`run_abc` | `"email-123-run_abc"` | `d4e5f6...` |
+| `"email-123"` | `attempt` | runId=`run_abc`, attempt=2 | `"email-123-run_abc-2"` | `g7h8i9...` |
+| `"email-123"` | `run` | **无**（API 路由） | `"email-123"` | `a1b2c3...` ← 同 global！ |
+
+#### 2.3.4 本地 Catalog：原始 key 的注册与提取
+
+**文件位置：** `packages/core/src/v3/idempotency-key-catalog/catalog.ts:1-11`
+
+```typescript
+export type IdempotencyKeyScope = "run" | "attempt" | "global";
+
+export type IdempotencyKeyOptions = {
+  key: string;
+  scope: IdempotencyKeyScope;
+};
+
+export interface IdempotencyKeyCatalog {
+  registerKeyOptions(hash: string, options: IdempotencyKeyOptions): void;
+  getKeyOptions(hash: string): IdempotencyKeyOptions | undefined;
+}
+```
+
+**作用：** catalog 是进程内内存注册表，用于 `resetIdempotencyKey` 时从 64 字符哈希反查原始 key 和 scope，避免用户手动传回 scope 参数。**跨进程不可用**——在另一个进程中拿到哈希字符串，catalog 里查不到。
+
+#### 2.3.5 服务端存储：idempotencyKeyOptions 字段
+
+V2 引擎在创建 run 时，额外将原始 key 和 scope 存入数据库 `idempotencyKeyOptions` JSON 字段：
+
+**文件位置：** `packages/core/src/v3/schemas/api.ts:152-156`
+
+```typescript
+export const IdempotencyKeyOptionsSchema = z.object({
+  key: z.string(),
+  scope: z.enum(["run", "attempt", "global"]),
+});
+```
+
+**文件位置：** `internal-packages/run-engine/src/engine/index.ts:619`
+
+```typescript
+// taskRun.create data 中包含：
+idempotencyKeyOptions,
+```
+
+**文件位置：** `packages/core/src/v3/serverOnly/idempotencyKeys.ts`
+
+```typescript
+export function getUserProvidedIdempotencyKey(run: {
+  idempotencyKey: string | null | undefined;
+  idempotencyKeyOptions: unknown;
+}): string | undefined {
+  const parsed = IdempotencyKeyOptionsSchema.safeParse(run.idempotencyKeyOptions);
+  if (parsed.success) {
+    return parsed.data.key;               // 优先返回原始 key
+  }
+  return run.idempotencyKey ?? undefined;  // 降级返回哈希
+}
+```
+
+**排查价值：** 在数据库中直接查看 `idempotencyKeyOptions` 字段即可知道用户传入的原始 key 和 scope，无需逆向 SHA-256。
+
 ---
 
-## 三、完整代码链路分析
+## 三、TriggerTaskService 的 V1/V2 分流
 
-### 3.1 客户端：幂等键创建与携带
+### 3.1 分流入口
 
-**入口文件：** `packages/trigger-sdk/src/v3/idempotencyKeys.ts`
-
-**创建流程：**
-1. 调用 `idempotencyKeys.create(key, { scope })`
-2. 根据 scope 注入上下文信息（runId / attemptNumber）
-3. SHA256 哈希生成 64 字符幂等键
-4. 原始 key 和 scope 存入本地 catalog 供后续 reset 使用
-
-**触发时携带：**
-```typescript
-// 方式1：trigger 单任务
-await childTask.trigger(payload, { 
-  idempotencyKey: key,
-  idempotencyKeyTTL: "300s"
-});
-
-// 方式2：triggerAndWait
-await childTask.triggerAndWait(payload, { idempotencyKey: key });
-
-// 方式3：batchTrigger
-await tasks.batchTrigger("task-id", [
-  { payload, options: { idempotencyKey: key } }
-]);
-```
-
-### 3.2 API 层：TriggerTaskService
-
-**文件位置：** `apps/webapp/app/v3/services/triggerTask.server.ts:53-122`
-
-```
-客户端请求
-    ↓
-TriggerTaskService.call()
-    ↓
-determineEngineVersion() → V2
-    ↓
-RunEngineTriggerTaskService.call()
-```
-
-### 3.3 核心处理：IdempotencyKeyConcern
-
-**文件位置：** `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts:13-137`
-
-**这是幂等保护的核心逻辑：**
+**文件位置：** `apps/webapp/app/v3/services/triggerTask.server.ts:53-79`
 
 ```typescript
-async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernResult> {
-  // 1. 提取幂等键和过期时间
+export class TriggerTaskService extends WithRunEngine {
+  public async call(
+    taskId: string,
+    environment: AuthenticatedEnvironment,
+    body: TriggerTaskRequestBody,
+    options: TriggerTaskServiceOptions = {},
+    version?: RunEngineVersion
+  ): Promise<TriggerTaskServiceResult | undefined> {
+    return await this.traceWithEnv("call()", environment, async (span) => {
+      const v = await determineEngineVersion({            // ← 决定 V1 还是 V2
+        environment,
+        workerVersion: body.options?.lockToVersion,
+        engineVersion: version,
+      });
+
+      switch (v) {
+        case "V1": {
+          return await this.callV1(taskId, environment, body, options);
+        }
+        case "V2": {
+          return await this.callV2(taskId, environment, body, options);
+        }
+      }
+    });
+  }
+}
+```
+
+### 3.2 determineEngineVersion 决策链
+
+**文件位置：** `apps/webapp/app/v3/engineVersion.server.ts:17-76`
+
+```
+determineEngineVersion({ environment, workerVersion, engineVersion })
+    │
+    ├─► ① 显式指定 engineVersion → 直接使用
+    │
+    ├─► ② project.engine === V1 → 全部走 V1
+    │
+    ├─► ③ 指定了 workerVersion → 查该 worker 的 engine 字段
+    │
+    ├─► ④ DEV 环境 → 查最新 BackgroundWorker 的 engine 字段
+    │
+    ├─► ⑤ DEPLOYED 环境 → 查当前部署的 engine 版本
+    │
+    └─► ⑥ 兜底 → 使用 project.engine
+```
+
+**排查注意：** 同一个 project 可能部分 worker 是 V1、部分是 V2。V1 和 V2 的幂等逻辑有差异。
+
+### 3.3 V1 vs V2 幂等处理的差异
+
+| 特性 | V1 (`TriggerTaskServiceV1`) | V2 (`RunEngineTriggerTaskService`) |
+|------|---------------------------|-------------------------------------|
+| **文件位置** | `apps/webapp/app/v3/services/triggerTaskV1.server.ts` | `apps/webapp/app/runEngine/services/triggerTask.server.ts` |
+| **幂等检查位置** | 内联在 `call()` 方法中 | 独立 `IdempotencyKeyConcern` 类 |
+| **幂等键 TTL 过期** | ✅ 检查 `idempotencyKeyExpiresAt` | ✅ 检查 `idempotencyKeyExpiresAt` |
+| **状态清除** | ❌ **未实现** `shouldIdempotencyKeyBeCleared` | ✅ 检查 `shouldIdempotencyKeyBeCleared` |
+| **过期时清除字段** | 仅清 `idempotencyKey`（保留 `idempotencyKeyExpiresAt`） | 同时清 `idempotencyKey` 和 `idempotencyKeyExpiresAt` |
+| **P2002 重试** | 手动解析 `error.meta.target` 三元组 | 抛出 `RunDuplicateIdempotencyKeyError` |
+| **Run TTL 调度** | `ExpireEnqueuedRunService.enqueue()` | `ttlSystem.scheduleExpireRun()` |
+| **idempotencyKeyOptions** | ❌ 不存储 | ✅ 存入数据库 |
+
+#### V1 幂等代码（关键缺陷）
+
+**文件位置：** `apps/webapp/app/v3/services/triggerTaskV1.server.ts:70-113`
+
+```typescript
+const idempotencyKey = options.idempotencyKey ?? body.options?.idempotencyKey;
+const idempotencyKeyExpiresAt =
+  options.idempotencyKeyExpiresAt ??
+  resolveIdempotencyKeyTTL(body.options?.idempotencyKeyTTL) ??
+  new Date(Date.now() + 24 * 60 * 60 * 1000 * 30);
+
+const existingRun = idempotencyKey
+  ? await this._prisma.taskRun.findFirst({
+      where: {
+        runtimeEnvironmentId: environment.id,
+        idempotencyKey,
+        taskIdentifier: taskId,
+      },
+    })
+  : undefined;
+
+if (existingRun) {
+  if (
+    existingRun.idempotencyKeyExpiresAt &&
+    existingRun.idempotencyKeyExpiresAt < new Date()
+  ) {
+    // TTL 过期：清除 key
+    await this._prisma.taskRun.update({
+      where: { id: existingRun.id },
+      data: { idempotencyKey: null },       // ← 注意：只清 key，没清 ExpiresAt
+    });
+  } else {
+    // ← 没有 shouldIdempotencyKeyBeCleared 检查！
+    return { run: existingRun, isCached: true };
+  }
+}
+```
+
+**V1 的关键缺陷：** 不检查 `shouldIdempotencyKeyBeCleared`。当 run 处于 FAILED 或 EXPIRED 状态时，V1 仍然会命中缓存返回旧 run，而不是清除幂等键创建新 run。这可能导致：
+- 失败的 run 阻止重试（幂等键未被清除）
+- EXPIRED 的 run 阻止重新触发
+
+#### V2 幂等代码（完整逻辑）
+
+**文件位置：** `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts:20-137`
+
+```typescript
+async handleTriggerRequest(
+  request: TriggerTaskRequest,
+  parentStore: string | undefined
+): Promise<IdempotencyKeyConcernResult> {
   const idempotencyKey = request.options?.idempotencyKey ?? request.body.options?.idempotencyKey;
-  const idempotencyKeyExpiresAt = request.options?.idempotencyKeyExpiresAt 
-    ?? resolveIdempotencyKeyTTL(request.body.options?.idempotencyKeyTTL) 
-    ?? new Date(Date.now() + 24 * 60 * 60 * 1000 * 30); // 默认30天
+  const idempotencyKeyExpiresAt =
+    request.options?.idempotencyKeyExpiresAt ??
+    resolveIdempotencyKeyTTL(request.body.options?.idempotencyKeyTTL) ??
+    new Date(Date.now() + 24 * 60 * 60 * 1000 * 30);
 
-  // 2. 查询已存在的 run
+  if (!idempotencyKey) {
+    return { isCached: false, idempotencyKey, idempotencyKeyExpiresAt };
+  }
+
   const existingRun = await this.prisma.taskRun.findFirst({
     where: {
       runtimeEnvironmentId: request.environment.id,
@@ -122,9 +325,8 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
   });
 
   if (existingRun) {
-    // 3. 检查【幂等键】是否过期（idempotencyKeyExpiresAt 字段）
+    // ① 幂等键 TTL 过期检查
     if (existingRun.idempotencyKeyExpiresAt && existingRun.idempotencyKeyExpiresAt < new Date()) {
-      // 幂等键过期：清除键，允许新 run
       await this.prisma.taskRun.updateMany({
         where: { id: existingRun.id, idempotencyKey },
         data: { idempotencyKey: null, idempotencyKeyExpiresAt: null },
@@ -132,17 +334,21 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
       return { isCached: false, idempotencyKey, idempotencyKeyExpiresAt };
     }
 
-    // 4. 检查【run 状态】是否需要清除幂等键（失败或 run 过期）
+    // ② Run 状态检查（V1 缺少此步骤！）
     if (shouldIdempotencyKeyBeCleared(existingRun.status)) {
-      // 清除键，允许新 run
-      await this.prisma.taskRun.updateMany({...});
+      await this.prisma.taskRun.updateMany({
+        where: { id: existingRun.id, idempotencyKey },
+        data: { idempotencyKey: null, idempotencyKeyExpiresAt: null },
+      });
       return { isCached: false, idempotencyKey, idempotencyKeyExpiresAt };
     }
 
-    // 5. 命中缓存：返回已有 run
-    // triggerAndWait 场景：用 waitpoint 阻塞父 run
+    // ③ 命中缓存：triggerAndWait 场景处理
     if (resumeParentOnCompletion && parentRunId) {
-      const associatedWaitpoint = await this.engine.getOrCreateRunWaitpoint({...});
+      let associatedWaitpoint = existingRun.associatedWaitpoint;
+      if (!associatedWaitpoint) {
+        associatedWaitpoint = await this.engine.getOrCreateRunWaitpoint({...});
+      }
       await this.engine.blockRunWithWaitpoint({...});
     }
 
@@ -153,7 +359,147 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
 }
 ```
 
-### 3.4 状态判断逻辑：关键发现！
+---
+
+## 四、两种 TTL 的优先级计算与排查影响
+
+### 4.1 幂等键 TTL（idempotencyKeyExpiresAt）
+
+**计算位置：** `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts:25-28`（V2）
+和 `apps/webapp/app/v3/services/triggerTaskV1.server.ts:71-74`（V1）
+
+```
+idempotencyKeyExpiresAt 优先级：
+  ① request.options.idempotencyKeyExpiresAt   → 服务端直接传入 Date 对象
+  ② resolveIdempotencyKeyTTL(body.options?.idempotencyKeyTTL)  → 客户端 TTL 字符串
+  ③ new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)          → 兜底 30 天
+```
+
+**TTL 字符串解析：** `apps/webapp/app/utils/idempotencyKeys.server.ts:10-41`
+
+```typescript
+export function resolveIdempotencyKeyTTL(ttl: string | undefined | null): Date | undefined {
+  if (!ttl) return undefined;
+  const match = ttl.match(/^(\d+)([smhd])$/);  // 只支持 整数+s/m/h/d
+  if (!match) return undefined;                  // 无效格式静默返回 undefined → 走兜底 30 天
+  // ...
+}
+```
+
+**排查注意：**
+- 传入 `"5min"` 或 `"1.5h"` 等非标准格式 → 静默降级为 30 天
+- 传入 `"0s"` → 立即过期
+- 不传 `idempotencyKeyTTL` → 30 天
+
+### 4.2 Run TTL（控制 EXPIRED 状态）
+
+**V2 计算位置：** `apps/webapp/app/runEngine/services/triggerTask.server.ts:282-291`
+
+```typescript
+// Resolve TTL with precedence: per-trigger > task-level > dev default
+let ttl: string | undefined;
+
+if (body.options?.ttl !== undefined) {
+  ttl =
+    typeof body.options.ttl === "number"
+      ? stringifyDuration(body.options.ttl)     // ① 客户端显式指定（数字 → 字符串）
+      : body.options.ttl;                       // ① 客户端显式指定（字符串）
+} else {
+  ttl = taskTtl ?? (environment.type === "DEVELOPMENT" ? "10m" : undefined);
+  // ② task 定义中配置的 TTL
+  // ③ DEV 环境兜底 10 分钟
+  // ④ PROD 环境无兜底 → ttl = undefined → 永不过期
+}
+```
+
+**V1 计算位置：** `apps/webapp/app/v3/services/triggerTaskV1.server.ts:78-81`
+
+```typescript
+const ttl =
+  typeof body.options?.ttl === "number"
+    ? stringifyDuration(body.options?.ttl)
+    : body.options?.ttl ?? (environment.type === "DEVELOPMENT" ? "10m" : undefined);
+```
+
+**V1 缺少 task-level TTL**，直接跳到环境默认值。
+
+### 4.3 Run TTL 如何触发 EXPIRED
+
+**V1 路径：**
+
+```
+触发 run → status = PENDING
+    ↓
+ExpireEnqueuedRunService.enqueue(runId, expireAt)   ← 创建延迟任务
+    ↓
+[等待 run.ttl 时间]
+    ↓
+ExpireEnqueuedRunService.call(runId)
+    ↓
+检查: status === "PENDING" && lockedAt === null
+    ↓ 满足条件
+FinalizeTaskRunService.call({ status: "EXPIRED" })
+```
+
+**V2 路径：**
+
+```
+触发 run → status = PENDING
+    ↓
+[DEV 环境] ttlSystem.scheduleExpireRun({ runId, ttl })   ← 单独调度
+[PROD 环境] enqueueRun({ includeTtl: true })              ← 批量 TTL 由队列排序集处理
+    ↓
+[等待 run.ttl 时间]
+    ↓
+ttlSystem.expireRun({ runId })
+    ↓
+检查: status === "PENDING" && lockedAt === null && !isExecuting
+    ↓ 满足条件
+prisma.taskRun.update({ status: "EXPIRED" })
+```
+
+### 4.4 EXPIRED 触发的完整前置条件
+
+| 条件 | 代码位置 | 说明 |
+|------|---------|------|
+| `status === "PENDING"` | `ttlSystem.ts:45` | 只有过期 PENDING 状态的 run |
+| `lockedAt === null` | `ttlSystem.ts:52` | 已被 worker 锁定的不会被过期 |
+| `!isExecuting` | `ttlSystem.ts:31` | 正在执行的不会被过期 |
+| `ttl` 字段有值 | V1: `triggerTaskV1.server.ts:523`; V2: `triggerTask.server.ts:806` | 无 ttl 则不调度过期 |
+
+**排查关键影响：**
+- Run 进入 `EXECUTING` 后即使超过 run.ttl 也**不会**变成 EXPIRED
+- Worker 锁定（`lockedAt !== null`）的 run 也**不会**变成 EXPIRED
+- PROD 环境默认 `ttl = undefined`，run **永远不会** EXPIRED
+- DEV 环境默认 `ttl = "10m"`，10 分钟内未被 worker 拉取就会 EXPIRED
+
+### 4.5 EXPIRED → 幂等键清除 → 允许重触发的连锁反应
+
+```
+Run 在 DEV 环境队列中等待超过 10 分钟
+    ↓
+ttlSystem 检查: PENDING + unlocked + not executing → 全部满足
+    ↓
+Run status 变为 EXPIRED
+    ↓
+[同事件再次触发]
+    ↓
+IdempotencyKeyConcern.handleTriggerRequest()
+    ↓
+findFirst 查到 EXPIRED 状态的 existingRun
+    ↓
+shouldIdempotencyKeyBeCleared("EXPIRED") → true   ← 单独判断，不在 FAILED_RUN_STATUSES 中
+    ↓
+清除 idempotencyKey + idempotencyKeyExpiresAt
+    ↓
+创建新 run ✓  ← 幂等键已被清除，不会阻止新 run
+```
+
+---
+
+## 五、shouldIdempotencyKeyBeCleared 状态分类详解
+
+### 5.1 代码定义
 
 **文件位置：** `apps/webapp/app/v3/taskStatus.ts:133-134`
 
@@ -163,93 +509,103 @@ export function shouldIdempotencyKeyBeCleared(status: TaskRunStatus): boolean {
 }
 ```
 
-#### 3.4.1 FAILED_RUN_STATUSES vs shouldIdempotencyKeyBeCleared
+### 5.2 FAILED_RUN_STATUSES 定义
 
-**真实关系图：**
-
-```
-shouldIdempotencyKeyBeCleared(status)
-    │
-    ├─► isFailedRunStatus(status)
-    │      └─► FAILED_RUN_STATUSES = [
-    │            "INTERRUPTED",
-    │            "COMPLETED_WITH_ERRORS",
-    │            "SYSTEM_FAILURE",
-    │            "CRASHED",
-    │            "TIMED_OUT"
-    │          ]
-    │
-    └─► status === "EXPIRED"  ← 单独判断，不在 FAILED_RUN_STATUSES 中！
-```
-
-**重要纠正：**
-- ❌ `EXPIRED` **不在** `FAILED_RUN_STATUSES` 中
-- ✅ `EXPIRED` 是通过 `|| status === "EXPIRED"` **单独追加**的判断条件
-
-#### 3.4.2 两种"过期"概念的区别
-
-| 概念 | 字段/状态 | 含义 | 触发时机 |
-|------|-----------|------|---------|
-| **幂等键过期** | `idempotencyKeyExpiresAt` | 幂等键本身的有效期 | 超过设置的 TTL（如 30天） |
-| **Run 状态过期** | `status === "EXPIRED"` | Run 在队列中待太久被系统终止 | 超过 run.ttl（如 10分钟） |
-
-**Run EXPIRED 状态的触发条件：**
-**文件位置：** `internal-packages/run-engine/src/engine/systems/ttlSystem.ts:25-134`
+**文件位置：** `apps/webapp/app/v3/taskStatus.ts:54-60`
 
 ```typescript
-// 只有满足以下条件才会标记为 EXPIRED：
-1. run.status === "PENDING"  ← 必须是待执行状态
-2. run.lockedAt === null     ← 没有被锁定
-3. isExecuting === false     ← 没有在执行
+export const FAILED_RUN_STATUSES = [
+  "INTERRUPTED",
+  "COMPLETED_WITH_ERRORS",
+  "SYSTEM_FAILURE",
+  "CRASHED",
+  "TIMED_OUT",
+] satisfies TaskRunStatus[];
 ```
 
-**设计意图：** 防止任务在队列中无限等待，释放资源。
+**注意：** `EXPIRED` 不在此列表中！它是 `shouldIdempotencyKeyBeCleared` 通过 `|| status === "EXPIRED"` 单独追加的。
 
-#### 3.4.3 完整状态分类表
+### 5.3 完整状态分类矩阵
 
-| 状态 | FINAL | FAILED | 清除幂等键 | 说明 |
-|------|-------|--------|-----------|------|
-| `COMPLETED_SUCCESSFULLY` | ✅ | ❌ | ❌ | 成功完成，保留幂等键 |
-| `CANCELED` | ✅ | ❌ | ❌ | 手动取消，保留幂等键 |
-| `INTERRUPTED` | ✅ | ✅ | ✅ | 被中断，清除键 |
-| `COMPLETED_WITH_ERRORS` | ✅ | ✅ | ✅ | 执行出错，清除键 |
-| `SYSTEM_FAILURE` | ✅ | ✅ | ✅ | 系统失败，清除键 |
-| `CRASHED` | ✅ | ✅ | ✅ | 崩溃，清除键 |
-| `TIMED_OUT` | ✅ | ✅ | ✅ | 执行超时，清除键 |
-| **`EXPIRED`** | ✅ | **❌** | **✅** | 队列超时，**单独判断** |
-| `PENDING` | ❌ | ❌ | ❌ | 待执行 |
-| `EXECUTING` | ❌ | ❌ | ❌ | 执行中 |
-| `RETRYING_AFTER_FAILURE` | ❌ | ❌ | ❌ | 重试中 |
+| 状态 | FINAL | FAILED | FATAL | 清除幂等键 | 原因 |
+|------|-------|--------|-------|-----------|------|
+| `COMPLETED_SUCCESSFULLY` | ✅ | ❌ | ❌ | ❌ | 成功，保留保护 |
+| `CANCELED` | ✅ | ❌ | ❌ | ❌ | 用户主动取消，保留保护 |
+| `INTERRUPTED` | ✅ | ✅ | ❌ | ✅ | `isFailedRunStatus` → true |
+| `COMPLETED_WITH_ERRORS` | ✅ | ✅ | ❌ | ✅ | `isFailedRunStatus` → true |
+| `SYSTEM_FAILURE` | ✅ | ✅ | ✅ | ✅ | `isFailedRunStatus` → true |
+| `CRASHED` | ✅ | ✅ | ✅ | ✅ | `isFailedRunStatus` → true |
+| `TIMED_OUT` | ✅ | ✅ | ❌ | ✅ | `isFailedRunStatus` → true |
+| **`EXPIRED`** | ✅ | **❌** | ❌ | **✅** | **`status === "EXPIRED"` 单独判断** |
+| `PENDING` | ❌ | ❌ | ❌ | ❌ | 进行中 |
+| `EXECUTING` | ❌ | ❌ | ❌ | ❌ | 进行中 |
+| `RETRYING_AFTER_FAILURE` | ❌ | ❌ | ❌ | ❌ | 进行中 |
+| `WAITING_TO_RESUME` | ❌ | ❌ | ❌ | ❌ | 等待恢复 |
 
-### 3.5 RunEngine：数据库写入与并发保护
+### 5.4 设计意图解读
 
-**文件位置：** `internal-packages/run-engine/src/engine/index.ts:447-850`
+- **成功/取消 → 保留幂等键：** 防止重复执行已完成的任务
+- **失败类 → 清除幂等键：** 允许在失败后重试，幂等保护不应阻碍错误恢复
+- **EXPIRED → 清除幂等键：** 队列超时通常是因为外部原因（worker 未运行），应允许重新触发
+- **进行中 → 保留幂等键：** 防止并发重复
 
-**并发保护机制：**
+---
 
-1. **数据库唯一约束** - `@@unique([runtimeEnvironmentId, taskIdentifier, idempotencyKey])`
-2. **Prisma 异常捕获** - 捕获 `P2002` 唯一约束冲突
-3. **自动重试** - 抛出 `RunDuplicateIdempotencyKeyError` 后上层自动重试
+## 六、并发触发场景分析
+
+### 6.1 V2 并发保护的三层机制
+
+```
+并发请求 A 和 B（相同 idempotencyKey）
+    │
+    ├─► 第1层：IdempotencyKeyConcern.findFirst（读屏障）
+    │      A 查不到 existingRun → isCached: false
+    │      B 查不到 existingRun → isCached: false
+    │      ↓ （两个请求都通过）
+    │
+    ├─► 第2层：数据库唯一约束（写屏障）
+    │      A 写入 taskRun 成功
+    │      B 写入 taskRun → P2002 错误
+    │      ↓
+    └─► 第3层：异常捕获与重试（容错）
+           V2: RunDuplicateIdempotencyKeyError
+           V1: 手动解析 error.meta.target 三元组
+           ↓
+           重试 call() → 这次第1层会命中 existingRun
+```
+
+### 6.2 V1 的 P2002 重试代码
+
+**文件位置：** `apps/webapp/app/v3/services/triggerTaskV1.server.ts:606-659`
 
 ```typescript
-try {
-  taskRun = await prisma.taskRun.create({...});
-} catch (error) {
+catch (error) {
   if (error instanceof Prisma.PrismaClientKnownRequestError) {
     if (error.code === "P2002") {
-      // ...检查是否是 oneTimeUseToken 冲突
-      
-      // 幂等键冲突：抛出特定异常
-      throw new RunDuplicateIdempotencyKeyError(
-        `Run with idempotency key ${idempotencyKey} already exists`
-      );
+      const target = error.meta?.target;
+      if (Array.isArray(target) && target[0]?.includes("oneTimeUseToken")) {
+        // oneTimeUseToken 冲突 → 抛异常
+      } else if (
+        Array.isArray(target) &&
+        target.length == 3 &&
+        target[0] == "runtimeEnvironmentId" &&
+        target[1] == "taskIdentifier" &&
+        target[2] == "idempotencyKey"
+      ) {
+        // 幂等键三元组冲突 → 重试
+        return await this.call(taskId, environment, body, options, attempt + 1);
+      } else {
+        // 其他唯一约束冲突 → 抛异常
+      }
     }
   }
   throw error;
 }
 ```
 
-**上层重试逻辑：** `apps/webapp/app/runEngine/services/triggerTask.server.ts:574-584`
+### 6.3 V2 的 P2002 重试代码
+
+**文件位置：** `apps/webapp/app/runEngine/services/triggerTask.server.ts:574-584`
 
 ```typescript
 catch (error) {
@@ -267,143 +623,23 @@ catch (error) {
 }
 ```
 
-### 3.6 Trace 与日志：Dashboard 体现
-
-**文件位置：** `apps/webapp/app/runEngine/concerns/traceEvents.server.ts:62-126`
-
-**去重命中时的 trace 记录：**
-
-```typescript
-async traceIdempotentRun(request, parentStore, options, callback) {
-  return await repository.traceEvent(
-    `${request.taskId} (cached)`,  // 显示 cached 标记
-    {
-      attributes: {
-        properties: {
-          [SemanticInternalAttributes.ORIGINAL_RUN_ID]: existingRun.friendlyId,
-        },
-        style: {
-          icon: "task-cached",  // 使用缓存图标
-        },
-        runId: existingRun.friendlyId,
-      },
-      incomplete,
-      isError,
-      immediate: true,
-    },
-    async (event, traceContext, traceparent) => {
-      // 记录去重日志消息
-      await repository.recordEvent(
-        `There's an existing run for idempotencyKey: ${idempotencyKey}`,
-        {...}
-      );
-      return await callback(...);
-    }
-  );
-}
-```
+**V2 改进：** P2002 检测在 `engine.trigger()` 内完成，抛出语义明确的 `RunDuplicateIdempotencyKeyError`，上层不需要手动解析 `error.meta.target`。
 
 ---
 
-## 四、过期策略（TTL）
+## 七、与重试机制的交互
 
-### 4.1 两种 TTL 的区别
-
-| TTL 类型 | 字段名 | 作用 | 默认值 |
-|----------|--------|------|--------|
-| **幂等键 TTL** | `idempotencyKeyTTL` | 控制幂等键多久后失效，失效后可重新触发 | 30 天 |
-| **Run TTL** | `ttl` | 控制 run 在队列中最多等待多久，超时后状态变为 EXPIRED | dev: 10m, prod: 无 |
-
-### 4.2 幂等键 TTL 解析
-
-**文件位置：** `apps/webapp/app/utils/idempotencyKeys.server.ts:10-41`
-
-```typescript
-export function resolveIdempotencyKeyTTL(ttl: string | undefined | null): Date | undefined {
-  const match = ttl.match(/^(\d+)([smhd])$/);
-  // s=秒, m=分, h=时, d=天
-}
-```
-
-### 4.3 幂等键 TTL 默认值与优先级
-
-**文件位置：** `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts:25-28`
-
-```
-优先级：
-1. request.options.idempotencyKeyExpiresAt （直接指定过期时间）
-2. resolveIdempotencyKeyTTL(request.body.options.idempotencyKeyTTL) （TTL 字符串）
-3. 默认 30 天
-```
-
-### 4.4 幂等键过期后的行为
-
-1. **查询时检测过期** - `handleTriggerRequest` 中先检查 `idempotencyKeyExpiresAt`
-2. **清除旧键** - 更新数据库将过期 run 的 `idempotencyKey` 设为 null
-3. **允许新 run** - 返回 `isCached: false`，创建新 run
-
----
-
-## 五、并发触发场景分析
-
-### 5.1 并发保护的三层机制
-
-```
-并发请求
-    │
-    ├─► 第1层：IdempotencyKeyConcern 查询（读屏障）
-    │      两个请求都没查到 existingRun
-    │      ↓
-    ├─► 第2层：数据库唯一约束（写屏障）
-    │      第一个请求写入成功
-    │      第二个请求触发 P2002 错误
-    │      ↓
-    └─► 第3层：异常捕获与重试（容错）
-           抛出 RunDuplicateIdempotencyKeyError
-           上层自动重试
-           重试时命中第1层缓存
-```
-
-### 5.2 Racepoint 系统（可选）
-
-**文件位置：** `apps/webapp/app/runEngine/services/triggerTask.server.ts:252-257`
-
-```typescript
-if (idempotencyKey) {
-  await this.triggerRacepointSystem.waitForRacepoint({
-    racepoint: "idempotencyKey",
-    id: idempotencyKey,
-  });
-}
-```
-
-**作用：** 在某些测试或特定场景下，可以通过 Racepoint 控制并发时序。
-
-### 5.3 triggerAndWait 场景的并发
-
-当使用 `triggerAndWait` 命中缓存时：
-
-1. 获取或创建已有 run 的 waitpoint
-2. 用 waitpoint 阻塞父 run
-3. 子 run 完成后自动唤醒父 run
-
----
-
-## 六、与重试机制的交互
-
-### 6.1 父任务重试 vs 子任务幂等
-
-**场景：** 父任务失败重试，子任务使用幂等键
+### 7.1 父任务重试 vs 子任务幂等
 
 ```
 父任务 Attempt 1
-    ├─► trigger 子任务（idempotencyKey="send-email-123"）
+    ├─► trigger 子任务（idempotencyKey=SHA256("email-123-run_abc")）
     │    创建子 run #child-001
-    └─► 父任务失败 ← 在这里失败
+    └─► 父任务失败
 
 父任务 Attempt 2（重试）
-    └─► trigger 子任务（相同 idempotencyKey）
-         │
+    └─► trigger 子任务（idempotencyKey=SHA256("email-123-run_abc")）
+         │  ← scope="run" 时 hash 相同，因为 parentRunId 未变
          ├─► 查询 existingRun → 找到 #child-001
          ├─► 检查状态 → 进行中/成功
          └─► 返回已有 run，不创建新 run
@@ -411,69 +647,35 @@ if (idempotencyKey) {
 结果：子任务只执行一次 ✓
 ```
 
-### 6.2 scope 对重试的影响
+### 7.2 scope 对重试的影响
 
-| Scope | 重试时行为 |
-|-------|-----------|
-| `run` | 重用同一个子 run |
-| `attempt` | 每次重试创建新的子 run |
-| `global` | 全局唯一，跨所有父 run |
+| Scope | Hash 计算 | 重试时 Hash 是否相同 | 重试时行为 |
+|-------|----------|---------------------|-----------|
+| `run` | `key + parentRunId` | ✅ 相同（parentRunId 不变） | 重用同一个子 run |
+| `attempt` | `key + parentRunId + attemptNumber` | ❌ 不同（attemptNumber 变了） | 每次重试创建新的子 run |
+| `global` | `key` | ✅ 相同 | 全局唯一，跨所有父 run |
 
-### 6.3 子任务失败后的重试
-
-**关键逻辑：** `shouldIdempotencyKeyBeCleared()`
+### 7.3 子任务失败后的重试
 
 ```
 子任务失败（COMPLETED_WITH_ERRORS / CRASHED 等）
     ↓
-父任务重试时再次 trigger
+V2: shouldIdempotencyKeyBeCleared(FAILED) → true → 清除幂等键
+V1: 不检查此条件 → 返回 isCached: true（Bug！）
     ↓
-查询 existingRun → 找到失败的 run
-    ↓
-shouldIdempotencyKeyBeCleared(FAILED) → true
-    ↓
-清除旧 run 的幂等键
-    ↓
-创建新的子 run ✓
+下次触发时：
+V2: 创建新 run ✓
+V1: 返回失败的旧 run ✗
 ```
 
-**设计意图：** 失败的任务应该允许重试，幂等保护不应该阻碍错误恢复。
-
-### 6.4 子任务队列超时（EXPIRED）后的重试
+### 7.4 子任务队列超时（EXPIRED）后的重试
 
 ```
-子任务在队列中等待太久（超过 run.ttl）
+子任务 PENDING → 超过 run.ttl → EXPIRED
     ↓
-子任务 status → EXPIRED
-    ↓
-父任务重试时再次 trigger
-    ↓
-查询 existingRun → 找到 EXPIRED 的 run
-    ↓
-shouldIdempotencyKeyBeCleared(EXPIRED) → true  ← 单独判断生效！
-    ↓
-清除旧 run 的幂等键
-    ↓
-创建新的子 run ✓
+V2: shouldIdempotencyKeyBeCleared("EXPIRED") → true → 清除幂等键 → 允许新 run
+V1: 不检查此条件 → 返回 EXPIRED 的旧 run（Bug！）
 ```
-
----
-
-## 七、批量触发（Batch）中的幂等
-
-### 7.1 Batch 级别幂等键
-
-**文件位置：** `internal-packages/database/prisma/schema.prisma:1921`
-
-```prisma
-@@unique([runtimeEnvironmentId, idempotencyKey])
-```
-
-### 7.2 Batch 内单个 item 的幂等键
-
-**文件位置：** `apps/webapp/app/runEngine/services/batchTrigger.server.ts`
-
-每个 batch item 单独处理幂等键，处理逻辑与单个 trigger 一致。
 
 ---
 
@@ -487,18 +689,63 @@ shouldIdempotencyKeyBeCleared(EXPIRED) → true  ← 单独判断生效！
 export async function resetIdempotencyKey(
   taskIdentifier: string,
   idempotencyKey: IdempotencyKey | string | string[],
-  options?: ResetIdempotencyKeyOptions
+  options?: ResetIdempotencyKeyOptions,
+  requestOptions?: ZodFetchOptions
 ): Promise<{ id: string }> {
-  // 根据 scope 重新计算 hash
-  // 调用 API 清除数据库中的幂等键
+  const client = apiClientManager.clientOrThrow();
+
+  // 如果已是 64 字符哈希 → 直接使用
+  if (typeof idempotencyKey === "string" && idempotencyKey.length === 64) {
+    return client.resetIdempotencyKey(taskIdentifier, idempotencyKey, requestOptions);
+  }
+
+  // 尝试从 catalog 提取原始 key 和 scope
+  const attachedOptions = typeof idempotencyKey === "string"
+    ? getIdempotencyKeyOptions(idempotencyKey)
+    : undefined;
+
+  const scope = attachedOptions?.scope ?? options?.scope ?? "run";
+  const keyArray = Array.isArray(idempotencyKey)
+    ? idempotencyKey
+    : [attachedOptions?.key ?? String(idempotencyKey)];
+
+  // 重建 scope 后缀（与创建时相同的逻辑）
+  let scopeSuffix: string[] = [];
+  switch (scope) {
+    case "run": {
+      const parentRunId = options?.parentRunId ?? taskContext?.ctx?.run.id;
+      if (!parentRunId) throw new Error("parentRunId required for 'run' scope");
+      scopeSuffix = [parentRunId];
+      break;
+    }
+    case "attempt": {
+      const parentRunId = options?.parentRunId ?? taskContext?.ctx?.run.id;
+      const attemptNumber = options?.attemptNumber ?? taskContext?.ctx?.attempt.number;
+      if (!parentRunId || attemptNumber === undefined) throw new Error("...");
+      scopeSuffix = [parentRunId, attemptNumber.toString()];
+      break;
+    }
+  }
+
+  const hash = await generateIdempotencyKey(keyArray.concat(scopeSuffix));
+  return client.resetIdempotencyKey(taskIdentifier, hash, requestOptions);
 }
 ```
 
-### 8.2 Reset 的使用场景
+### 8.2 服务端 Reset API
 
-1. **成功后需要重新执行** - 成功的 run 默认保留幂等键
-2. **手动测试** - Dashboard 中手动重置
-3. **业务逻辑需要** - 特定条件下允许重复执行
+**文件位置：** `apps/webapp/app/v3/services/resetIdempotencyKey.server.ts`
+
+```typescript
+// 将 run 的 idempotencyKey 和 idempotencyKeyExpiresAt 设为 null
+await this._prisma.taskRun.update({
+  where: { id: run.id },
+  data: {
+    idempotencyKey: null,
+    idempotencyKeyExpiresAt: null,
+  },
+});
+```
 
 ---
 
@@ -509,123 +756,146 @@ export async function resetIdempotencyKey(
 ```
 发现重复运行
     │
-    ├─► 维度1：Scope 检查
+    ├─► 维度1：引擎版本检查
     │    │
-    │    ├─► 是否使用了 scope: "global"？
-    │    │    ├─► 否（默认 run scope）
-    │    │    │    └─► 是否来自不同的父 run？
-    │    │    │         ├─► 是 → 【原因】不同父 run + run scope = 不同 hash
-    │    │    │         └─► 否 → 继续排查
-    │    │    └─► 是 → 继续排查
+    │    ├─► 确认 engineVersion 是 V1 还是 V2？
+    │    │    │
+    │    │    ├─► V1 → 缺少 shouldIdempotencyKeyBeCleared 检查
+    │    │    │    ├─► 旧 run 是否 FAILED/EXPIRED？
+    │    │    │    │    ├─► 是 → 【原因】V1 Bug：失败 run 仍返回 isCached=true
+    │    │    │    │    └─► 否 → 继续排查
+    │    │    │    └─► 旧 run 过期时是否只清了 key 没清 ExpiresAt？
+    │    │    │
+    │    │    └─► V2 → 继续排查
     │    │
-    │    └─► 是否是从后端代码（非 task 内）触发？
-    │         ├─► 是 → 所有 scope 行为相同，继续排查
-    │         └─► 否 → 继续排查
+    │    └─► 检查数据库中 run.engine 字段确认版本
     │
-    ├─► 维度2：第一次 Run 状态检查
+    ├─► 维度2：Scope 检查
+    │    │
+    │    ├─► 查看 idempotencyKeyOptions.scope（V2）或推断 scope
+    │    │    │
+    │    │    ├─► scope="run" 且来自不同父 run？
+    │    │    │    └─► 【原因】不同 parentRunId → 不同 hash
+    │    │    │
+    │    │    ├─► scope="run" 且在 task 外部调用？
+    │    │    │    └─► 【注意】taskContext 为空，scope 行为等同 global
+    │    │    │
+    │    │    ├─► scope="attempt" 且父任务重试？
+    │    │    │    └─► 【原因】attemptNumber 变了 → 不同 hash
+    │    │    │
+    │    │    └─► scope="global" → 继续排查
+    │    │
+    │    └─► 比较两个 run 的 idempotencyKey 哈希是否一致
+    │
+    ├─► 维度3：Run 状态检查
     │    │
     │    ├─► 第一次 run 的 status 是什么？
     │    │    │
-    │    │    ├─► COMPLETED_SUCCESSFULLY / CANCELED
-    │    │    │    └─► 【排除】这些状态保留幂等键，不会导致重复
-    │    │    │
-    │    │    ├─► INTERRUPTED / COMPLETED_WITH_ERRORS / 
-    │    │    │   SYSTEM_FAILURE / CRASHED / TIMED_OUT
-    │    │    │    └─► 【原因】FAILED 状态会清除幂等键
+    │    │    ├─► FAILED 类（INTERRUPTED/CRASHED/TIMED_OUT 等）
+    │    │    │    └─► V2: shouldIdempotencyKeyBeCleared → 清除 → 允许新 run
+    │    │    │    └─► V1: 不检查 → 可能阻止新 run
     │    │    │
     │    │    ├─► EXPIRED
-    │    │    │    └─► 【原因】Run 队列超时会清除幂等键（单独判断）
+    │    │    │    ├─► 检查 run.ttl 是否合理
+    │    │    │    ├─► DEV 环境默认 10m，worker 未运行会触发
+    │    │    │    └─► V2: 清除幂等键；V1: 不清除
     │    │    │
-    │    │    └─► PENDING / EXECUTING / RETRYING_AFTER_FAILURE
-    │    │         └─► 继续排查
+    │    │    ├─► COMPLETED_SUCCESSFULLY / CANCELED
+    │    │    │    └─► 【排除】这些状态保留幂等键，不应导致重复
+    │    │    │
+    │    │    └─► PENDING / EXECUTING（进行中又创建新 run？）
+    │    │         └─► 【重点排查并发链路】
     │    │
-    │    └─► 检查 idempotencyKeyExpiresAt 字段
-    │         └─► 是否已过期？
-    │              ├─► 是 → 【原因】幂等键 TTL 过期
-    │              └─► 否 → 继续排查
+    │    └─► 检查 idempotencyKeyExpiresAt 是否已过期？
+    │         ├─► 是 → 【原因】幂等键 TTL 过期
+    │         └─► 否 → 继续排查
     │
-    ├─► 维度3：环境与任务隔离检查
+    ├─► 维度4：环境与任务隔离
     │    │
-    │    ├─► 两次触发的 runtimeEnvironmentId 是否相同？
-    │    │    ├─► 否 → 【原因】环境不同，幂等键隔离
-    │    │    └─► 是 → 继续排查
+    │    ├─► runtimeEnvironmentId 是否相同？
+    │    │    └─► 否 → 【原因】环境隔离
     │    │
-    │    └─► 两次触发的 taskIdentifier 是否相同？
-    │         ├─► 否 → 【原因】任务不同，幂等键隔离
-    │         └─► 是 → 继续排查
+    │    └─► taskIdentifier 是否相同？
+    │         └─► 否 → 【原因】任务隔离
     │
-    ├─► 维度4：幂等键值检查
+    ├─► 维度5：Run TTL 与 EXPIRED 的排查
     │    │
-    │    ├─► 两次的 idempotencyKey（哈希后）是否完全相同？
-    │    │    ├─► 否 → 【原因】键值不同
-    │    │    └─► 是 → 继续排查
+    │    ├─► Run 的 ttl 字段值是什么？
+    │    │    ├─► undefined → PROD 默认，永不过期
+    │    │    ├─► "10m" → DEV 默认
+    │    │    └─► 自定义值 → 检查是否合理
     │    │
-    │    └─► 是否使用了数组 key？
-    │         └─► 检查数组元素顺序和类型是否一致
+    │    ├─► Run 变为 EXPIRED 的时序
+    │    │    ├─► 是否在 PENDING 状态超时？
+    │    │    ├─► Worker 是否在运行？
+    │    │    └─► lockedAt 是否为 null？
+    │    │
+    │    └─► EXPIRED 发生后幂等键是否被清除？
+    │         ├─► V2: shouldIdempotencyKeyBeCleared("EXPIRED") = true
+    │         └─► V1: 不清除（Bug）
     │
-    └─► 维度5：并发与日志检查
+    └─► 维度6：并发与日志检查
          │
          ├─► 日志中是否有 RunDuplicateIdempotencyKeyError？
-         │    ├─► 有 → 【正常】并发保护生效，重试后命中缓存
-         │    └─► 无 → 继续排查
+         │    ├─► 有 → 并发保护生效，重试后命中缓存（正常）
+         │    └─► 无但出现了两个 run → 可能在 V1 路径
          │
-         ├─► 检查数据库唯一约束是否生效
-         │    └─► 确认 schema 中 @@unique 约束存在
+         ├─► 数据库唯一约束是否生效？
+         │    └─► 确认 @@unique 约束存在
          │
-         └─► 极端情况：重试逻辑异常
-              └─► 检查 RunDuplicateIdempotencyKeyError 捕获是否完整
+         └─► 检查重试逻辑是否正确处理 P2002
 ```
 
 ### 9.2 常见重复原因速查表
 
-| 现象 | 可能原因 | 验证方法 | 解决方案 |
-|------|---------|---------|---------|
-| 不同父 run 触发相同子任务都创建了新 run | 使用了默认 `run` scope | 检查 scope 设置 | 需要全局去重则使用 `scope: "global"` |
-| 子任务失败后重试创建了新 run | FAILED 状态会清除幂等键 | 检查第一次 run 状态 | 设计预期，如需保留需手动处理 |
-| 子任务队列超时后创建了新 run | EXPIRED 状态会清除幂等键 | 检查第一次 run.status === "EXPIRED" | 调整 run.ttl 或幂等键 TTL |
-| 一段时间后相同 key 创建了新 run | 幂等键 TTL 过期 | 检查 idempotencyKeyExpiresAt | 调整 idempotencyKeyTTL |
-| dev 和 prod 环境都创建了 run | 环境间幂等键隔离 | 检查 runtimeEnvironmentId | 设计预期 |
-| 不同 task 用相同 key 都运行了 | 任务间幂等键隔离 | 检查 taskIdentifier | 设计预期 |
+| 现象 | 引擎版本 | 可能原因 | 验证方法 | 解决方案 |
+|------|---------|---------|---------|---------|
+| 失败的旧 run 仍阻止新 trigger | V1 | V1 不检查 `shouldIdempotencyKeyBeCleared` | 检查旧 run.status 是否 FAILED | 升级到 V2 |
+| EXPIRED run 阻止新 trigger | V1 | 同上 | 检查旧 run.status 是否 EXPIRED | 升级到 V2 |
+| 不同父 run 触发都创建了新 run | V1/V2 | 使用了默认 `run` scope | 检查 idempotencyKeyOptions.scope | 需要全局去重用 `scope: "global"` |
+| DEV 环境 10 分钟后出现新 run | V1/V2 | Run TTL 过期 → EXPIRED → 清除幂等键 | 检查 run.ttl 和 run.status | 调整 run.ttl 或确保 worker 运行 |
+| 长时间后相同 key 创建了新 run | V1/V2 | 幂等键 TTL 过期 | 检查 idempotencyKeyExpiresAt | 调整 idempotencyKeyTTL |
+| dev 和 prod 环境都创建了 run | V1/V2 | 环境隔离 | 检查 runtimeEnvironmentId | 设计预期 |
+| 不同 task 用相同 key 都运行了 | V1/V2 | 任务隔离 | 检查 taskIdentifier | 设计预期 |
+| 无效 TTL 格式导致 30 天后重复 | V1/V2 | `resolveIdempotencyKeyTTL` 静默返回 undefined | 检查 TTL 字符串格式 | 使用标准格式 `5m`/`1h`/`7d` |
 
-### 9.3 幂等保护的边界
+---
+
+## 十、幂等保护边界总结
 
 **幂等保护不覆盖的场景：**
-1. ✗ **不同 task** - taskIdentifier 不同，即使 key 相同
-2. ✗ **不同环境** - runtimeEnvironmentId 不同
-3. ✗ **父 run 不同且 scope=run** - hash 中包含 parentRunId
-4. ✗ **第一次 run 失败后** - FAILED 状态清除幂等键
-5. ✗ **第一次 run EXPIRED 后** - 队列超时清除幂等键
-6. ✗ **幂等键 TTL 过期后** - idempotencyKeyExpiresAt 过期
+1. ✗ **不同 task** - `taskIdentifier` 不同，即使 key 相同
+2. ✗ **不同环境** - `runtimeEnvironmentId` 不同
+3. ✗ **父 run 不同且 scope=run** - hash 中包含 `parentRunId`
+4. ✗ **父 run 重试且 scope=attempt** - hash 中包含 `attemptNumber`
+5. ✗ **第一次 run FAILED 后（V2）** - `shouldIdempotencyKeyBeCleared` 清除幂等键
+6. ✗ **第一次 run EXPIRED 后（V2）** - 单独判断清除幂等键
+7. ✗ **幂等键 TTL 过期后** - `idempotencyKeyExpiresAt` 超期
+8. ✗ **V1 引擎** - 不检查 `shouldIdempotencyKeyBeCleared`
 
 ---
 
-## 十、代码关键点总结
+## 十一、代码关键点索引
 
-| 模块 | 文件位置 | 核心逻辑 |
-|------|----------|----------|
-| SDK 创建 | `packages/core/src/v3/idempotencyKeys.ts` | scope + SHA256 哈希 |
-| 核心检查 | `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts` | 查询 existingRun + 双重过期检查 |
-| 状态判断 | `apps/webapp/app/v3/taskStatus.ts:133` | FAILED + EXPIRED（**单独判断**） |
-| 并发写保护 | `internal-packages/run-engine/src/engine/index.ts` | Prisma P2002 捕获 |
-| 自动重试 | `apps/webapp/app/runEngine/services/triggerTask.server.ts:574` | RunDuplicateIdempotencyKeyError |
-| TTL 解析 | `apps/webapp/app/utils/idempotencyKeys.server.ts` | smhd 单位解析 |
-| Dashboard 显示 | `apps/webapp/app/runEngine/concerns/traceEvents.server.ts` | cached 标记 + 日志 |
-| DB 约束 | `internal-packages/database/prisma/schema.prisma` | 三元组唯一索引 |
-| Run EXPIRED 逻辑 | `internal-packages/run-engine/src/engine/systems/ttlSystem.ts` | PENDING 状态超时处理 |
-
----
-
-## 十一、排查步骤（按优先级）
-
-如果遇到重复运行问题，按以下顺序排查：
-
-1. **检查 scope** - 是否使用了正确的 scope（global/run/attempt）
-2. **检查第一次 run 状态** - 是否是 FAILED/EXPIRED 状态导致幂等键被清除
-3. **检查幂等键 TTL** - idempotencyKeyExpiresAt 是否已过期
-4. **检查 run TTL** - 第一次 run 是否因为队列超时变成 EXPIRED
-5. **检查 taskIdentifier** - 是否是同一个 task
-6. **检查环境** - 是否在同一个 environment
-7. **检查幂等键值** - 确认两次请求的 key 哈希后完全相同
-8. **检查并发日志** - 查看是否有 `RunDuplicateIdempotencyKeyError` 及重试日志
-9. **检查数据库约束** - 确认 @@unique 约束是否生效
-
+| 模块 | 文件位置 | 核心逻辑 | 行号 |
+|------|----------|----------|------|
+| SDK 转发层 | `packages/trigger-sdk/src/v3/idempotencyKeys.ts` | 纯 re-export | 1-7 |
+| Core 创建 | `packages/core/src/v3/idempotencyKeys.ts` | scope 注入 + SHA256 哈希 | 127-142 |
+| Core hash | `packages/core/src/v3/idempotencyKeys.ts` | `generateIdempotencyKey` | 163-165 |
+| Crypto | `packages/core/src/v3/utils/crypto.ts` | `digestSHA256` | 7-15 |
+| Catalog 接口 | `packages/core/src/v3/idempotency-key-catalog/catalog.ts` | `registerKeyOptions/getKeyOptions` | 1-11 |
+| 服务端解析 | `packages/core/src/v3/serverOnly/idempotencyKeys.ts` | 从 DB 提取原始 key 和 scope | 10-68 |
+| API Schema | `packages/core/src/v3/schemas/api.ts` | `IdempotencyKeyOptionsSchema` | 153-156 |
+| V1/V2 分流 | `apps/webapp/app/v3/services/triggerTask.server.ts` | `determineEngineVersion` + switch | 53-79 |
+| 引擎版本决策 | `apps/webapp/app/v3/engineVersion.server.ts` | 6 层决策链 | 17-76 |
+| V1 幂等逻辑 | `apps/webapp/app/v3/services/triggerTaskV1.server.ts` | 内联，缺状态检查 | 70-113 |
+| V2 幂等逻辑 | `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts` | `IdempotencyKeyConcern` | 20-137 |
+| V2 TTL 解析 | `apps/webapp/app/runEngine/services/triggerTask.server.ts` | 3 级 Run TTL 优先级 | 282-291 |
+| 状态分类 | `apps/webapp/app/v3/taskStatus.ts` | `shouldIdempotencyKeyBeCleared` | 133-134 |
+| V1 EXPIRED | `apps/webapp/app/v3/services/expireEnqueuedRun.server.ts` | `FinalizeTaskRunService` | 25-99 |
+| V2 EXPIRED | `internal-packages/run-engine/src/engine/systems/ttlSystem.ts` | PENDING+unlocked 检查 | 25-134 |
+| V2 写入保护 | `internal-packages/run-engine/src/engine/index.ts` | P2002 → `RunDuplicateIdempotencyKeyError` | 700-733 |
+| V2 重试 | `apps/webapp/app/runEngine/services/triggerTask.server.ts` | 捕获后重试 | 574-584 |
+| V1 重试 | `apps/webapp/app/v3/services/triggerTaskV1.server.ts` | 手动解析 meta.target | 606-659 |
+| DB 唯一约束 | `internal-packages/database/prisma/schema.prisma` | `@@unique([envId, taskId, key])` | 1076 |
+| TTL 解析函数 | `apps/webapp/app/utils/idempotencyKeys.server.ts` | `resolveIdempotencyKeyTTL` | 10-41 |
