@@ -1,6 +1,14 @@
-# Run Replay 与自动 Retry 状态机重建分析（代码验证版）
+# Run Replay 与自动 Retry 状态机重建分析（最终验证版）
 
-> **⚠️ 重要提示**：本文档经过源码验证，修正了部分之前的错误结论。标记为 ❌ 的是之前的错误理解，✅ 是验证后的正确结论。
+> **⚠️ 版本历史**：
+> - v1.0：初始分析（存在部分不准确结论）
+> - v2.0：代码验证版（修正 5 个关键错误结论）
+> - v3.0：最终验证版（✅ 本次更新：详细阐述 checkpoint 双分支差异、补充 waitpoint 完整代码证据、修正重试影响分析）
+
+> **核心修正点（本次更新）**：
+> 1. **Checkpoint 恢复链路分支**：明确 QUEUED_EXECUTING → 重新入队 与 EXECUTING → SUSPENDED 两条路径的差异
+> 2. **Waitpoint 重试处理**：区分 blocking waitpoint（删除）与 completed waitpoint（保留）的代码证据
+> 3. **孤儿任务风险**：指出 blocking waitpoint 删除后子任务可能仍在执行的问题
 
 ---
 
@@ -212,46 +220,107 @@ worker 拉取 run → startRunAttempt()
 └──────────────────────────────────────────────────────────┘
 ```
 
-### 3.3 ✅ Waitpoint 重试处理机制（重要修正）
+### 3.3 ✅ Waitpoint 重试处理机制（重要修正 · 完整代码证据）
 
 **代码位置**：
-- `runAttemptSystem.ts:897-901` - 失败时清除 blocking waitpoints
-- `waitpointSystem.ts:53-68` - `clearBlockingWaitpoints` 实现
-- `dequeueSystem.ts:457-458` - 新 snapshot 保留 completedWaitpoints
+| 操作 | 文件 | 行号 |
+|------|------|------|
+| 失败时清除 blocking waitpoints | `runAttemptSystem.ts` | 897-901 |
+| clearBlockingWaitpoints 实现 | `waitpointSystem.ts` | 53-68 |
+| 新 snapshot 保留 completedWaitpoints（dequeue） | `dequeueSystem.ts` | 457-458 |
+| 新 snapshot 保留 completedWaitpoints（requeue） | `runAttemptSystem.ts` | 1276-1277 |
 
-**两种 Waitpoint 的区别**：
+---
 
-| 类型 | 存储位置 | 重试时处理 | 说明 |
-|------|---------|-----------|------|
-| **Blocking Waitpoints** | `taskRunWaitpoint` 表 | ❌ 全部删除 | 当前正在等待的子任务关联 |
-| **Completed Waitpoints** | `snapshot.completedWaitpoints` | ✅ 保留并传递 | 历史已完成的子任务引用 |
+#### 3.3.1 两种 Waitpoint 的本质区别
+
+| 维度 | Blocking Waitpoints | Completed Waitpoints |
+|------|--------------------|---------------------|
+| **存储位置** | `taskRunWaitpoint` 关联表 | `snapshot.completedWaitpoints`（通过 join 关联） |
+| **数据结构** | 多对多关联表（run ↔ waitpoint） | Waitpoint 实体数组，通过 snapshot 关联 |
+| **表示含义** | run **当前正在等待**的子任务 | run **历史上已完成**的子任务 |
+| **生命周期** | 子任务完成后删除 | 永久保留在 snapshot 链上 |
+| **重试时处理** | ❌ 全部删除 | ✅ 完整保留并传递 |
+| **代码证据** | `waitpointSystem.ts:53-68` | `dequeueSystem.ts:457-458` |
+
+---
+
+#### 3.3.2 失败重试时的处理流程（✅ 代码验证）
 
 ```typescript
-// 失败时清除阻塞 waitpoints
+// ============================================
+// 步骤 1：清除 blocking waitpoints
+// ============================================
+// runAttemptSystem.ts:897-901
+// remove waitpoints blocking the run
 const deletedCount = await this.waitpointSystem.clearBlockingWaitpoints({ runId, tx });
-// 清除 taskRunWaitpoint 表中该 run 的所有记录
+if (deletedCount > 0) {
+  this.$.logger.debug("Cleared blocking waitpoints", { runId, deletedCount });
+}
 
-// 出队时保留 completedWaitpoints
+// waitpointSystem.ts:53-68
+public async clearBlockingWaitpoints({
+  runId,
+  tx,
+}: {
+  runId: string;
+  tx?: PrismaClientOrTransaction;
+}) {
+  const prisma = tx ?? this.$.prisma;
+  // 直接删除 taskRunWaitpoint 表中该 run 的所有记录
+  const deleted = await prisma.taskRunWaitpoint.deleteMany({
+    where: {
+      taskRunId: runId,
+    },
+  });
+  return deleted.count;
+}
+
+// ============================================
+// 步骤 2：保留 completedWaitpoints（通过 snapshot 传递）
+// ============================================
+// dequeueSystem.ts:457-458
 completedWaitpoints: {
   connect: snapshot.completedWaitpoints.map((w) => ({ id: w.id })),
 }
 // 通过 connect 关联已有的 waitpoint 记录
+// 新 snapshot 与这些 waitpoint 建立关联关系
+
+// runAttemptSystem.ts:1276-1277（重试入队时也保留）
+completedWaitpoints,
+// 直接传递给新 snapshot
 ```
+
+---
+
+#### 3.3.3 对重试执行的实际影响
+
+| 场景 | blockingWaitpoints | completedWaitpoints | 行为结果 |
+|------|-------------------|---------------------|---------|
+| 首次执行 | 空 | 空 | 所有子任务正常执行 |
+| 失败后重试（无 checkpoint） | 空（已删除） | 保留之前已完成的 | SDK 层根据 completedWaitpoints 判断是否跳过 |
+| 失败后重试（有 checkpoint） | 保留 checkpoint 时的状态 | 保留 checkpoint 时已完成的 | 从断点继续执行 |
+| Replay | 空 | 空（新 run） | 所有子任务重新执行 |
+
+---
 
 > **❌ 之前的错误结论**：认为重试时所有 waitpoints 都会被保留
 > 
-> **✅ 正确结论**：
-> - `taskRunWaitpoint`（阻塞关联）：失败后被清除，新 attempt 不会等待之前的未完成子任务
-> - `snapshot.completedWaitpoints`（历史记录）：通过 snapshot 保留，新 attempt 知道哪些子任务已完成
+> **✅ 正确结论（代码验证版）**：
+> 1. **Blocking waitpoints**（`taskRunWaitpoint` 表）：失败后被 **全部清除**，新 attempt 不会等待之前未完成的子任务
+> 2. **Completed waitpoints**（snapshot 关联）：通过 snapshot 链 **完整保留**，新 attempt 可以知道哪些子任务已完成
+> 3. **关键影响**：阻塞关联的删除意味着失败后不会等待之前发起的子任务，但子任务本身可能仍在执行（孤儿任务风险）
 
-### 3.4 Checkpoint（检查点）恢复机制
+### 3.4 Checkpoint（检查点）恢复机制（✅ 双分支完整链路）
 
-**代码位置**：`internal-packages/run-engine/src/engine/systems/checkpointSystem.ts:21-366`
+**代码位置**：`internal-packages/run-engine/src/engine/systems/checkpointSystem.ts:36-249`
 
 Checkpoint 是一种特殊的状态保存机制，用于在长时间运行任务中保存进程内存状态，支持从断点恢复而非从头开始。
 
+#### 3.4.1 Checkpoint 创建后的两条分支
+
 ```
-执行中触发 checkpoint（仅在可 checkpoint 状态）
+执行中触发 checkpoint（仅在可 checkpoint 状态：RUN_CREATED/QUEUED/EXECUTING/EXECUTING_WITH_WAITPOINTS/QUEUED_EXECUTING）
     ↓
 创建 TaskRunCheckpoint 记录：
 - type: checkpoint 类型
@@ -261,18 +330,112 @@ Checkpoint 是一种特殊的状态保存机制，用于在长时间运行任务
     ↓
 更新 run 状态为 WAITING_TO_RESUME
     ↓
-创建 SUSPENDED 状态的 ExecutionSnapshot
-    ↓
-释放并发资源
-    ↓
-┌──────────────────────────────────────────────┐
-│ 恢复流程：                                    │
-│ worker 拉取 → 检测到 snapshot.checkpointId   │
-│ → 从 imageRef 恢复进程内存                    │
-│ → continueRunExecution() → 状态变为 EXECUTING │
-│ → completedWaitpoints 保留，继续执行          │
-└──────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────────────┐
+│ 分支判断：snapshot.executionStatus === "QUEUED_EXECUTING" ?            │
+└────────────────────────────────────────────────────────────────────────┘
+                          │
+          ┌───────────────┴───────────────┐
+          ▼                               ▼
+┌───────────────────────┐     ┌──────────────────────────────┐
+│ 分支 A：QUEUED_EXECUTING │     │ 分支 B：其他状态（默认）      │
+│ → 重新入队路径         │     │ → SUSPENDED 路径             │
+└───────────────────────┘     └──────────────────────────────┘
 ```
+
+---
+
+#### ✅ 分支 A：QUEUED_EXECUTING → 重新入队路径
+
+**代码位置**：`checkpointSystem.ts:175-208`
+
+```typescript
+if (snapshot.executionStatus === "QUEUED_EXECUTING") {
+  // Enqueue the run again
+  const newSnapshot = await this.enqueueSystem.enqueueRun({
+    run,
+    env: run.runtimeEnvironment,
+    snapshot: {
+      status: "QUEUED",  // ← 状态变为 QUEUED
+      description: "Run was QUEUED, because it was queued and executing and a checkpoint was created",
+      metadata: snapshot.metadata,
+    },
+    previousSnapshotId: snapshot.id,
+    batchId: snapshot.batchId ?? undefined,
+    completedWaitpoints: snapshot.completedWaitpoints.map((waitpoint) => ({
+      id: waitpoint.id,
+      index: waitpoint.index,
+    })),
+    checkpointId: taskRunCheckpoint.id,  // ← checkpointId 保留
+  });
+  // ...
+}
+```
+
+**恢复流程**：
+1. 状态变为 `QUEUED`（可 dequeue 状态）
+2. 通过 `enqueueRun` 进入正常队列流程
+3. Worker 正常 dequeue 后从 checkpoint 恢复执行
+4. `completedWaitpoints` 完整保留
+
+---
+
+#### ✅ 分支 B：其他状态 → SUSPENDED 路径
+
+**代码位置**：`checkpointSystem.ts:209-247`
+
+```typescript
+// create a new execution snapshot, with the checkpoint
+const newSnapshot = await this.executionSnapshotSystem.createExecutionSnapshot(prisma, {
+  run,
+  snapshot: {
+    executionStatus: "SUSPENDED",  // ← 状态变为 SUSPENDED
+    description: "Run was suspended after creating a checkpoint.",
+    metadata: snapshot.metadata,
+  },
+  previousSnapshotId: snapshot.id,
+  batchId: snapshot.batchId ?? undefined,
+  completedWaitpoints: snapshot.completedWaitpoints.map((waitpoint) => ({
+    id: waitpoint.id,
+    index: waitpoint.index,
+  })),
+  checkpointId: taskRunCheckpoint.id,  // ← checkpointId 保留
+  // ...
+});
+```
+
+**恢复流程**：
+```
+SUSPENDED 状态（不可直接 dequeue）
+    ↓
+Worker 从 checkpoint 镜像恢复进程内存（checkpointClient.restoreRun）
+    ↓
+调用 API：POST /engine/v1/worker-actions/runs/:runId/snapshots/:snapshotId/continue
+    ↓
+continueRunExecution() 验证：
+  - 检查 snapshotId 是否匹配最新
+  - 检查状态是否为 PENDING_EXECUTING（需要先 dequeue）
+    ↓
+状态变为 EXECUTING
+    ↓
+completedWaitpoints 保留，继续执行
+```
+
+---
+
+#### 两条分支对比表
+
+| 维度 | 分支 A：QUEUED_EXECUTING | 分支 B：SUSPENDED |
+|------|------------------------|------------------|
+| **触发条件** | checkpoint 时状态为 QUEUED_EXECUTING | checkpoint 时为其他可 checkpoint 状态 |
+| **新状态** | QUEUED | SUSPENDED |
+| **是否可直接 dequeue** | ✅ 是（QUEUED 在 dequeueable 列表） | ❌ 否（SUSPENDED 不在 dequeueable 列表） |
+| **恢复方式** | 正常出队流程 | Worker 恢复镜像后调用 continueRunExecution API |
+| **checkpointId 保留** | ✅ 是 | ✅ 是 |
+| **completedWaitpoints 保留** | ✅ 是 | ✅ 是 |
+| **调用系统** | enqueueSystem.enqueueRun() | executionSnapshotSystem.createExecutionSnapshot() |
+| **代码位置** | `checkpointSystem.ts:175-208` | `checkpointSystem.ts:209-247` |
+
+---
 
 **✅ Checkpoint 状态边界验证**：
 ```typescript
@@ -283,6 +446,9 @@ if (!isCheckpointable(snapshot.executionStatus)) {
     error: `Status ${snapshot.executionStatus} is not checkpointable`,
   };
 }
+
+// 可 checkpoint 状态：statuses.ts:21-32
+// RUN_CREATED / QUEUED / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING
 ```
 
 ### 3.5 Replay 状态重建流程
@@ -617,25 +783,64 @@ model TaskRun {
 
 ---
 
-## 七、结论修正汇总
+## 七、结论修正汇总（v3.0 最终验证版）
 
-### 7.1 ❌ 错误结论 vs ✅ 正确结论
+### 7.1 ❌ 错误结论 vs ✅ 正确结论（完整列表）
 
-| # | 之前的错误结论 | 验证后的正确结论 | 证据 |
-|---|--------------|----------------|------|
-| 1 | SUSPENDED 状态可以创建 checkpoint | SUSPENDED 状态**不能**创建 checkpoint | `checkpoints.test.ts:759` |
-| 2 | PENDING_EXECUTING 状态可以创建 checkpoint | PENDING_EXECUTING 状态**不能**创建 checkpoint | `statuses.ts:21-32` |
-| 3 | Replay 仅适用于已完成/失败的 run | Replay 适用于**任何状态**的 run，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
-| 4 | 重试时所有 waitpoints 都保留 | 重试时 `taskRunWaitpoint`（阻塞）被清除，只有 `snapshot.completedWaitpoints` 保留 | `runAttemptSystem.ts:898` + `dequeueSystem.ts:457` |
-| 5 | FINISHED 状态的 run 会被 replay 拒绝 | FINISHED 状态的 run **可以**被 replay | Replay 服务无状态检查 |
+| # | 阶段 | 之前的错误结论 | 验证后的正确结论 | 核心证据 |
+|---|------|--------------|----------------|----------|
+| 1 | v2.0 | SUSPENDED 状态可以创建 checkpoint | SUSPENDED 状态**不能**创建 checkpoint | `checkpoints.test.ts:759` |
+| 2 | v2.0 | PENDING_EXECUTING 状态可以创建 checkpoint | PENDING_EXECUTING 状态**不能**创建 checkpoint | `statuses.ts:21-32` |
+| 3 | v2.0 | Replay 仅适用于已完成/失败的 run | Replay 适用于**任何状态**的 run，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
+| 4 | v2.0 | 重试时所有 waitpoints 都保留 | 重试时 `taskRunWaitpoint`（阻塞）被清除，只有 `snapshot.completedWaitpoints` 保留 | `runAttemptSystem.ts:898` + `dequeueSystem.ts:457` |
+| 5 | v2.0 | FINISHED 状态的 run 会被 replay 拒绝 | FINISHED 状态的 run **可以**被 replay | Replay 服务无状态检查 |
+| 6 | **v3.0** | Checkpoint 后统一走 SUSPENDED 路径 | Checkpoint 后有**两条分支**：QUEUED_EXECUTING → 重新入队；其他状态 → SUSPENDED | `checkpointSystem.ts:175-247` |
+| 7 | **v3.0** | SUSPENDED 状态可正常 dequeue | SUSPENDED 状态**不可直接 dequeue**，需要 Worker 恢复镜像后调用 continue API | `statuses.ts:3-6` + `workerGroupTokenService.server.ts:505-520` |
+| 8 | **v3.0** | 重试后子任务不会继续执行 | 重试后 blocking waitpoint 被删除，但**子任务本身可能仍在执行（孤儿任务风险）** | `waitpointSystem.ts:53-68` |
 
-### 7.2 关键边界条件总结
+---
 
-1. **Checkpoint 创建边界**：仅 5 种状态可创建
-2. **自动 Retry 触发边界**：仅执行中失败后触发
-3. **Replay 触发边界**：**无状态限制**，仅检查环境未归档
-4. **Waitpoint 清理边界**：阻塞关联清除，历史记录保留
-5. **最终状态边界**：8 种 final 状态不再自动 retry，但仍可 replay
+### 7.2 ✅ Checkpoint 双分支机制总结（v3.0 新增）
+
+```
+                            ┌─────────────────────────────────────────────┐
+                            │              Checkpoint 创建后               │
+                            └─────────────────────────────────────────────┘
+                                             │
+                        ┌────────────────────┴────────────────────┐
+                        ▼                                         ▼
+            ┌────────────────────────┐             ┌──────────────────────────┐
+            │ QUEUED_EXECUTING 状态 │             │ 其他状态（EXECUTING 等）  │
+            └────────────────────────┘             └──────────────────────────┘
+                        │                                         │
+                        ▼                                         ▼
+            ┌────────────────────────┐             ┌──────────────────────────┐
+            │ 调用 enqueueRun()      │             │ 创建 SUSPENDED snapshot  │
+            │ → 状态变为 QUEUED      │             │ → run 状态 WAITING_TO_RESUME │
+            │ → 可正常 dequeue       │             │ → 不可直接 dequeue        │
+            └────────────────────────┘             └──────────────────────────┘
+                        │                                         │
+                        ▼                                         ▼
+            ┌────────────────────────┐             ┌──────────────────────────┐
+            │ Worker 正常出队执行     │             │ Worker 恢复镜像后调用     │
+            │ 从 checkpoint 恢复      │             │ continueRunExecution API │
+            └────────────────────────┘             └──────────────────────────┘
+```
+
+---
+
+### 7.3 关键边界条件总结（最终版）
+
+| 维度 | 边界条件 | 代码证据 |
+|------|---------|----------|
+| **Checkpoint 创建** | 仅 5 种状态可创建：RUN_CREATED/QUEUED/EXECUTING/EXECUTING_WITH_WAITPOINTS/QUEUED_EXECUTING | `statuses.ts:21-32` |
+| **Checkpoint 分支** | 两条分支：QUEUED_EXECUTING → 重新入队；其他 → SUSPENDED | `checkpointSystem.ts:175-247` |
+| **Dequeue 状态** | 仅 QUEUED/QUEUED_EXECUTING 可 dequeue | `statuses.ts:3-6` |
+| **自动 Retry 触发** | 仅执行中失败后触发 | `runAttemptSystem.ts:891-893` |
+| **Replay 触发** | **无状态限制**，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
+| **Waitpoint 清理** | blocking 关联清除，completed 历史保留 | `waitpointSystem.ts:53-68` + `dequeueSystem.ts:457-458` |
+| **最终状态** | 8 种 final 状态不再自动 retry，但仍可 replay | `statuses.ts:44-57` |
+| **孤儿任务风险** | 重试后子任务可能仍在执行，需注意幂等性 | `waitpointSystem.ts:61-65` |
 
 ---
 
