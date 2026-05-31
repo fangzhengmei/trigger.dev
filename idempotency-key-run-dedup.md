@@ -695,7 +695,7 @@ V1: 不检查此条件 → 返回 EXPIRED 的旧 run（Bug！）
 
 ### 8.2 fallback 判定路径
 
-当 `idempotencyKeyOptions` 缺失时，系统按以下路径判定 scope 和去重行为：
+**当 `idempotencyKeyOptions` 缺失时，scope 不可观测、无法从哈希逆推出**——因为 SHA-256 是单向哈希，无法从 64 字符输出反推出原始输入的 scope 信息。此时系统按以下路径判定 scope 和去重行为：
 
 ```
 查询 run 记录
@@ -706,16 +706,35 @@ V1: 不检查此条件 → 返回 EXPIRED 的旧 run（Bug！）
     │
     └─► fallback：只有 idempotencyKey 哈希值
          │
-         ├─► 【Scope 判定】无法从哈希反推 scope → 视为 global scope
-         │      因为 global scope 的哈希 = SHA256(userKey)，不包含 parentRunId/attemptNumber
+         ├─► 【Scope 判定】scope 不可观测、无法从哈希逆推出
+         │      │
+         │      ├─► 重置场景（resetIdempotencyKey）：
+         │      │    ├─► catalog 中有记录？→ 使用 catalog.scope
+         │      │    ├─► options.scope 有值？→ 使用 options.scope
+         │      │    └─► 都没有？→ 强制 fallback 为 "run"，需显式传 parentRunId
+         │      │
+         │      └─► 去重/显示场景（trigger/查询）：
+         │           ├─► 数据库唯一约束：三元组 [envId, taskId, hash] → 正常去重，与 scope 无关
+         │           ├─► TTL 过期检查：正常检查 idempotencyKeyExpiresAt，与 scope 无关
+         │           ├─► 状态清除检查：V2 正常检查 shouldIdempotencyKeyBeCleared，与 scope 无关
+         │           └─► Dashboard 显示：只能显示哈希，无法显示原始 key
          │
-         ├─► 【去重行为判定】
-         │    ├─► 数据库唯一约束：三元组 [envId, taskId, hash] → 正常去重
-         │    ├─► TTL 过期检查：正常检查 idempotencyKeyExpiresAt
-         │    └─► 状态清除检查：V2 正常检查 shouldIdempotencyKeyBeCleared（V1 不检查）
-         │
-         └─► 【reset 时判定】见 8.3 节
+         └─► 【去重行为判定】
+              ├─► 数据库唯一约束：三元组 [envId, taskId, hash] → 正常去重
+              ├─► TTL 过期检查：正常检查 idempotencyKeyExpiresAt
+              └─► 状态清除检查：V2 正常检查 shouldIdempotencyKeyBeCleared（V1 不检查）
 ```
+
+**scope 不可观测时的关键判断分支：**
+
+| 场景 | scope 推断逻辑 | 对行为的影响 |
+|------|---------------|-------------|
+| **trigger 时** | scope 信息已编码在哈希中，无需再次推断 | ✅ 去重正常，哈希本身已包含 scope 影响 |
+| **reset 传哈希** | `isIdempotencyKey(hash)` → true → 直接使用哈希，无需 scope | ✅ 正常 |
+| **reset 传原始 key** | catalog 有 → catalog.scope；否则 options.scope；否则 fallback "run" | ⚠️ catalog 失效时需显式传 scope，否则可能 hash 不匹配 |
+| **查询/显示** | 从 `idempotencyKeyOptions` 反查，缺失则无法推断 | ❌ Dashboard 只显示哈希，无法显示原始 key |
+
+**⚠️ 注意：** 当 scope 不可观测时，**不要主观推断为 global scope**。哈希本身可能是 run scope（如 SHA256("key-run_abc")）或 attempt scope（如 SHA256("key-run_abc-2")），只是我们无法从哈希反推。正确的说法是：**scope 已编码在哈希中，但无法从哈希逆向解析出 scope 值**。
 
 ### 8.3 resetIdempotencyKey 的 fallback 逻辑
 
@@ -814,10 +833,10 @@ const existingRun = await this.prisma.taskRun.findFirst({
 **判定结果：**
 | 维度 | 行为 |
 |------|------|
-| **Scope 判定** | 无法反推 → 视为 global scope（因为 hash 不包含 scope 信息） |
+| **Scope 判定** | scope 不可观测、无法从哈希逆推出。若调用了 `createIdempotencyKey` 则 idempotencyKeyOptions 存在，可从中获取 scope；否则 scope 已编码在哈希中但无法逆向解析 |
 | **去重行为** | ✅ 正常：三元组匹配 + TTL 检查 + 状态检查 |
 | **Reset 行为** | ✅ 正常：直接传 64 字符哈希走路径①，无需 scope |
-| **Dashboard 显示** | ❌ 只显示哈希，不显示原始 key |
+| **Dashboard 显示** | idempotencyKeyOptions 存在时显示原始 key，否则只显示哈希 |
 
 **createIdempotencyKey 对 64 字符的处理：**
 **文件位置：** `packages/core/src/v3/idempotencyKeys.ts:127-142`
@@ -872,10 +891,10 @@ idempotencyKeyOptions,         // 来自 API body.options.idempotencyKeyOptions
 **判定结果：**
 | 维度 | 行为 |
 |------|------|
-| **Scope 判定** | 客户端自行决定 scope 行为。如果客户端不追加 parentRunId/attemptNumber，行为等同于 global |
+| **Scope 判定** | 客户端自行决定 scope 行为。如果客户端不追加 parentRunId/attemptNumber，哈希等同于 global scope；scope 信息已编码在哈希中，但服务端无法从哈希逆向解析 |
 | **去重行为** | ✅ 正常：三元组匹配 + TTL 检查 + 状态检查（V2） |
-| **idempotencyKeyOptions** | ❌ 缺失（客户端没传） |
-| **Reset 行为** | ✅ 正常：直接传 64 字符哈希走路径① |
+| **idempotencyKeyOptions** | ❌ 缺失（非 SDK 客户端不会传此字段），因此 scope 不可观测、无法从哈希逆推出 |
+| **Reset 行为** | ✅ 正常：直接传 64 字符哈希走路径①，无需 scope |
 | **Dashboard 显示** | ❌ 只显示哈希，不显示原始 key |
 
 **非 SDK 客户端的 scope 实现建议：**
@@ -946,9 +965,182 @@ await idempotencyKeys.reset("task-id", "email-123", {
 
 ---
 
-## 十、batchTriggerV3 相同 key 跨 task 的误配风险分析
+## 十、isIdempotencyKey 仅按长度 64 判定的风险分析
 
-### 10.1 batchTriggerV3 的幂等处理逻辑
+### 10.1 `isIdempotencyKey` 的实现
+
+**文件位置：** `packages/core/src/v3/idempotencyKeys.ts:38-47`
+
+```typescript
+export function isIdempotencyKey(
+  value: string | string[] | IdempotencyKey
+): value is IdempotencyKey {
+  // Cannot check the brand at runtime because it doesn't exist (it's a TypeScript-only construct)
+  // Check for primitive strings only (we no longer use String objects)
+  if (typeof value === "string") {
+    return value.length === 64;       // ⚠️ 仅按长度判定！不校验 hex 格式
+  }
+  return false;
+}
+```
+
+**判定逻辑：** 只要 `typeof === "string" && length === 64`，就返回 `true`。**完全不校验是否为有效的 hex 字符串**。
+
+### 10.2 影响范围：哪些地方调用了 `isIdempotencyKey`？
+
+**调用点 1：`makeIdempotencyKey`**
+**文件位置：** `packages/core/src/v3/idempotencyKeys.ts:76-90`
+
+```typescript
+export async function makeIdempotencyKey(
+  idempotencyKey?: IdempotencyKey | string | string[]
+): Promise<IdempotencyKey | undefined> {
+  if (!idempotencyKey) return;
+
+  if (isIdempotencyKey(idempotencyKey)) {
+    return idempotencyKey;                // ⚠️ 如果误判，直接返回，不会重新哈希
+  }
+
+  return await createIdempotencyKey(idempotencyKey, {
+    scope: "run",                         // 默认 scope = "run"
+  });
+}
+```
+
+**调用点 2：`resetIdempotencyKey`**
+**文件位置：** `packages/core/src/v3/idempotencyKeys.ts:223-226`
+
+```typescript
+if (typeof idempotencyKey === "string" && idempotencyKey.length === 64) {
+  return client.resetIdempotencyKey(taskIdentifier, idempotencyKey, requestOptions);
+}
+// ⚠️ 同样只按长度判定，不校验 hex
+```
+
+**调用点 3：`createIdempotencyKey` 返回值类型转换**
+```typescript
+return idempotencyKey as IdempotencyKey;  // TypeScript branded type，运行时不存在
+```
+
+### 10.3 误判案例
+
+**案例 1：用户原始 key 恰好 64 字符（非 hex）**
+
+```typescript
+// 用户代码：原始 key 恰好是 64 字符的字符串
+const userKey = "my-unique-event-id-that-is-exactly-64-characters-long-abc123";
+console.log(userKey.length);  // 64
+
+// 传入 makeIdempotencyKey
+const key = await makeIdempotencyKey(userKey);
+// isIdempotencyKey(userKey) → true（仅按长度判定）
+// → 直接返回 userKey，**不会**进行 SHA-256 哈希！
+// → 实际存储的 idempotencyKey = "my-unique-event-id-that-is-exactly-64-characters-long-abc123"
+// → 而非 SHA256(userKey + scopeSuffix)
+
+// 后果：
+// 1. scope 信息未编码到哈希中，即使 scope="run" 也不会追加 parentRunId
+// 2. 行为等同于 global scope，但用户期望的是 run scope
+// 3. 不同 parentRunId 下使用相同 key 会命中去重，不符合预期
+```
+
+**案例 2：64 字符但包含非 hex 字符**
+
+```typescript
+const userKey = "ZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZZ";
+console.log(userKey.length);  // 64，但 'Z' 不是合法 hex 字符
+
+// 传入 resetIdempotencyKey
+await idempotencyKeys.reset("task-id", userKey);
+// isIdempotencyKey(userKey) → true（仅按长度判定）
+// → 直接传 userKey 给服务端，服务端数据库中存的是 SHA256(original)
+// → 找不到匹配的 run，重置失败！
+```
+
+**案例 3：数组 key 拼接后恰好 64 字符**
+
+```typescript
+const keyArray = ["prefix", "user-key-that-is-64-characters-long-when-concatenated-with-prefix-"];
+const joined = keyArray.join("-");  // 恰好 64 字符
+
+// 传入 makeIdempotencyKey
+const key = await makeIdempotencyKey(keyArray);
+// isIdempotencyKey(keyArray) → false（是数组，不是字符串）
+// → 正常调用 createIdempotencyKey，scope 正常注入 ✅
+
+// 但如果先 join 再传：
+const key = await makeIdempotencyKey(joined);
+// isIdempotencyKey(joined) → true（长度 64）
+// → 直接返回，不会重新哈希 ❌
+```
+
+### 10.4 仅按长度判定的深层风险
+
+| 风险类型 | 影响 | 发生概率 |
+|---------|------|---------|
+| **scope 失效** | 期望 run/attempt scope 但实际行为等同 global | 中（用户 key 恰好 64 字符时） |
+| **去重失效** | 相同原始 key 在不同 scope 下误判为同一个哈希 | 中 |
+| **reset 失败** | 64 字符非 hex key 无法找到匹配 run | 低 |
+| **数据库约束冲突** | 非 hex 64 字符 key 可能与真实哈希冲突 | 极低（2^64 空间，碰撞概率可忽略） |
+
+### 10.5 为什么不校验 hex？
+
+代码注释明确说明：
+```
+// Cannot check the brand at runtime because it doesn't exist (it's a TypeScript-only construct)
+```
+
+`IdempotencyKey` 是 TypeScript branded type，运行时不存在。但**完全可以增加 hex 校验**，例如：
+
+```typescript
+// 建议的修复
+function isHex(value: string): boolean {
+  return /^[0-9a-fA-F]{64}$/.test(value);
+}
+
+export function isIdempotencyKey(value): value is IdempotencyKey {
+  if (typeof value === "string") {
+    return value.length === 64 && isHex(value);  // 增加 hex 校验
+  }
+  return false;
+}
+```
+
+**未实现的原因推测：** 性能考虑（正则校验）、向后兼容（已有非 hex 64 字符 key 在生产环境中运行）。
+
+### 10.6 排查建议
+
+**当出现"期望去重但实际创建了新 run"或"期望创建新 run但命中缓存"时，检查：**
+
+1. **检查用户 key 的长度**
+   ```sql
+   -- 查询数据库中的 idempotencyKey
+   SELECT idempotencyKey, idempotencyKeyOptions, length(idempotencyKey)
+   FROM task_run
+   WHERE idempotencyKey IS NOT NULL
+   LIMIT 10;
+   ```
+   - 如果 `idempotencyKey` 包含非 `[0-9a-f]` 字符 → **误判风险**
+   - 如果 `idempotencyKey` 可读（如 "my-unique-event-id..."）→ **误判确认**
+
+2. **检查 idempotencyKeyOptions 是否存在**
+   - `idempotencyKeyOptions` 存在 → 正常调用了 `createIdempotencyKey`
+   - `idempotencyKeyOptions` 缺失但 idempotencyKey 是可读字符串 → **误判确认**
+
+3. **检查 scope 是否符合预期**
+   - 如果 `idempotencyKeyOptions` 缺失且 idempotencyKey 非 hex → scope 未注入，行为等同 global
+   - 与用户期望的 scope（run/attempt）对比是否一致
+
+4. **临时解决方案**
+   - 避免使用恰好 64 字符的原始 key
+   - 如果必须使用，先手动调用 `idempotencyKeys.create(key, {scope})` 再传给 trigger
+   - 或者在原始 key 前后添加前缀/后缀，改变长度
+
+---
+
+## 十一、batchTriggerV3 相同 key 跨 task 的误配风险分析
+
+### 11.1 batchTriggerV3 的幂等处理逻辑
 
 **文件位置：** `apps/webapp/app/v3/services/batchTriggerV3.server.ts:323-418`
 
@@ -1005,7 +1197,7 @@ async #prepareRunData(environment, body) {
 }
 ```
 
-### 10.2 误配风险：相同 key 跨不同 task
+### 11.2 误配风险：相同 key 跨不同 task
 
 **风险场景：** batch 中包含多个不同 task，不同 task 使用相同的 idempotencyKey。
 
@@ -1039,7 +1231,7 @@ await tasks.batchTrigger([
 - **不会创建 send-sms 的 run** → **send-sms 任务被静默跳过！**
 - 数据库唯一约束是 `[envId, taskId, key]`，send-sms 其实可以创建新 run，但 batch 逻辑误判为缓存命中
 
-### 10.3 风险验证：代码证据
+### 11.3 风险验证：代码证据
 
 **`cachedRuns` 的结构中没有 taskIdentifier：**
 **文件位置：** `batchTriggerV3.server.ts:363-368`
@@ -1062,7 +1254,7 @@ const cachedRun = cachedRuns.find(
 );
 ```
 
-### 10.4 batchTriggerV3 的其他幂等缺陷
+### 11.4 batchTriggerV3 的其他幂等缺陷
 
 **缺陷 1：缺少 `shouldIdempotencyKeyBeCleared` 检查**
 **文件位置：** `batchTriggerV3.server.ts:381-391`
@@ -1097,7 +1289,7 @@ if (expiredRunIds.size) {
 
 与 V1 相同，只清 key 没清 ExpiresAt 字段。
 
-### 10.5 误配风险速查表
+### 11.5 误配风险速查表
 
 | 场景 | 是否误配 | 后果 |
 |------|---------|------|
@@ -1108,9 +1300,9 @@ if (expiredRunIds.size) {
 
 ---
 
-## 十一、幂等键的 Reset 机制
+## 十二、幂等键的 Reset 机制
 
-### 11.1 SDK 层面的 reset
+### 12.1 SDK 层面的 reset
 
 **文件位置：** `packages/core/src/v3/idempotencyKeys.ts:215-269`
 
@@ -1161,7 +1353,7 @@ export async function resetIdempotencyKey(
 }
 ```
 
-### 11.2 服务端 Reset API
+### 12.2 服务端 Reset API
 
 **文件位置：** `apps/webapp/app/v3/services/resetIdempotencyKey.server.ts`
 
@@ -1178,9 +1370,9 @@ await this._prisma.taskRun.update({
 
 ---
 
-## 十二、多维度排查决策树
+## 十三、多维度排查决策树
 
-### 12.1 问题定位决策树
+### 13.1 问题定位决策树
 
 ```
 发现重复运行
@@ -1294,12 +1486,28 @@ await this._prisma.taskRun.update({
               │    │    │    └─► 【已知缺陷】batchTriggerV3 与 V1 行为相同
               │    │    │
               │    │    └─► 是否是 batchTriggerAndWait（有 dependentAttempt）？
-              │    │         └─► 【排除】该场景跳过缓存检查，不会有误配
-              │    │
-              │    └─► 否 → 继续排查
+              │         └─► 【排除】该场景跳过缓存检查，不会有误配
+              │
+              └─► 维度8：64 字符长度判定检查
+                   │
+                   ├─► 数据库中 idempotencyKey 是否为纯 hex 格式（0-9a-f）？
+                   │    │
+                   │    ├─► 否，包含非 hex 字符（如 Z、-、_ 等）
+                   │    │    └─► 【原因】isIdempotencyKey 仅按长度 64 判定，非 hex 64 字符被误判为已哈希
+                   │    │         ├─► 检查是否恰好 64 字符的原始 key
+                   │    │         └─► scope 未注入，行为等同 global
+                   │    │
+                   │    └─► 是 → 继续排查
+                   │
+                   ├─► idempotencyKey 是否可读（如 "my-event-id-..."）？
+                   │    └─► 【原因】可读字符串说明是原始 key 直接存入，未经过 SHA-256
+                   │
+                   └─► idempotencyKeyOptions 是否存在？
+                        ├─► 不存在但 idempotencyKey 非 hex → 【原因】makeIdempotencyKey 误判，跳过哈希
+                        └─► 存在 → 正常调用 createIdempotencyKey，继续排查
 ```
 
-### 12.2 常见重复原因速查表
+### 13.2 常见重复原因速查表
 
 | 现象 | 引擎版本 | 可能原因 | 验证方法 | 解决方案 |
 |------|---------|---------|---------|---------|
@@ -1315,10 +1523,12 @@ await this._prisma.taskRun.update({
 | batch 中 FAILED run 仍阻止重试 | V1/V2 | **batchTriggerV3 缺陷**：缺 `shouldIdempotencyKeyBeCleared` 检查 | 检查旧 run.status 是否 FAILED + 触发方式是否 batch | 升级修复，或避免 batch 场景重试 |
 | 跨进程 reset 失败报错 | V1/V2 | **catalog 失效**：scope fallback 为 run 需 parentRunId | 检查 reset 调用是否跨进程，参数是否完整 | 传 64 字符哈希，或显式传 scope 和 parentRunId |
 | `createIdempotencyKey(已哈希key)` 去重失败 | V1/V2 | **双重哈希**：create 没 64 字符检测，reset 有 | 检查是否传入已有的 64 字符哈希给 create | 直接传哈希给 trigger，不要传给 createIdempotencyKey |
+| **64 字符原始 key 去重异常** | V1/V2 | **isIdempotencyKey 误判**：仅按长度判定，非 hex 64 字符被当作已哈希 | 查询数据库 idempotencyKey 是否可读/非 hex | 避免 64 字符原始 key，或先调用 createIdempotencyKey |
+| **reset 传 64 字符非 hex key 失败** | V1/V2 | **isIdempotencyKey 误判**：非 hex 字符串被当作已哈希直接使用 | 检查 reset 传入的 key 是否包含非 hex 字符 | 确保传入的是真实的 SHA-256 哈希 |
 
 ---
 
-## 十三、幂等保护边界总结
+## 十四、幂等保护边界总结
 
 **幂等保护不覆盖的场景：**
 1. ✗ **不同 task** - `taskIdentifier` 不同，即使 key 相同
@@ -1333,10 +1543,12 @@ await this._prisma.taskRun.update({
 10. ✗ **batchTriggerV3 FAILED run** - 缺少 `shouldIdempotencyKeyBeCleared` 检查，失败 run 阻止重试
 11. ✗ **跨进程 catalog 失效 + reset 传原始 key** - scope fallback 为 run，缺少 parentRunId 抛出异常
 12. ✗ **createIdempotencyKey 传入已哈希的 64 字符 key** - 被双重哈希，去重失效
+13. ✗ **原始 key 恰好 64 字符（非 hex）** - `isIdempotencyKey` 误判，跳过哈希，scope 失效
+14. ✗ **reset 传入 64 字符非 hex 字符串** - `isIdempotencyKey` 误判为已哈希，直接使用导致重置失败
 
 ---
 
-## 十四、代码关键点索引
+## 十五、代码关键点索引
 
 | 模块 | 文件位置 | 核心逻辑 | 行号 |
 |------|----------|----------|------|
@@ -1345,6 +1557,8 @@ await this._prisma.taskRun.update({
 | Core hash | `packages/core/src/v3/idempotencyKeys.ts` | `generateIdempotencyKey` | 163-165 |
 | Core reset 64 字符检测 | `packages/core/src/v3/idempotencyKeys.ts` | 64 字符直接使用，不哈希 | 223-226 |
 | Core reset fallback | `packages/core/src/v3/idempotencyKeys.ts` | scope fallback + 重建 hash | 237-268 |
+| **isIdempotencyKey 判定** | `packages/core/src/v3/idempotencyKeys.ts` | 仅按长度 64，不校验 hex | 38-47 |
+| **makeIdempotencyKey** | `packages/core/src/v3/idempotencyKeys.ts` | 调用 isIdempotencyKey 决定是否哈希 | 76-90 |
 | Crypto | `packages/core/src/v3/utils/crypto.ts` | `digestSHA256` | 7-15 |
 | Catalog 接口 | `packages/core/src/v3/idempotency-key-catalog/catalog.ts` | `registerKeyOptions/getKeyOptions` | 1-11 |
 | 服务端解析 | `packages/core/src/v3/serverOnly/idempotencyKeys.ts` | 从 DB 提取原始 key 和 scope | 10-68 |
