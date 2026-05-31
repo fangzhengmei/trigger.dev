@@ -1,14 +1,16 @@
-# Run Replay 与自动 Retry 状态机重建分析（最终验证版）
+# Run Replay 与自动 Retry 状态机重建分析（口径统一版）
 
 > **⚠️ 版本历史**：
 > - v1.0：初始分析（存在部分不准确结论）
 > - v2.0：代码验证版（修正 5 个关键错误结论）
-> - v3.0：最终验证版（✅ 本次更新：详细阐述 checkpoint 双分支差异、补充 waitpoint 完整代码证据、修正重试影响分析）
+> - v3.0：最终验证版（阐述 checkpoint 双分支差异、补充 waitpoint 完整代码证据）
+> - **v4.0：口径统一版（✅ 本次更新）**：消除自动 retry 触发状态的前后口径冲突，明确 4 种状态的触发边界，补充完整代码证据链
 
-> **核心修正点（本次更新）**：
-> 1. **Checkpoint 恢复链路分支**：明确 QUEUED_EXECUTING → 重新入队 与 EXECUTING → SUSPENDED 两条路径的差异
-> 2. **Waitpoint 重试处理**：区分 blocking waitpoint（删除）与 completed waitpoint（保留）的代码证据
-> 3. **孤儿任务风险**：指出 blocking waitpoint 删除后子任务可能仍在执行的问题
+> **核心修正点（v4.0）**：
+> 1. **口径冲突修正**：之前「仅执行中失败后触发」的表述不准确，实际是 **4 种状态可触发自动 retry**
+> 2. **边界明确**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING 四种状态的具体失败场景
+> 3. **代码证据链**：补充 3 个核心入口的代码验证（attemptFailed 检查、startRunAttempt 前置检查、重试决策逻辑）
+> 4. **重试方式差异**：明确 RETRY_QUEUED 与 RETRY_IMMEDIATELY 两种方式的触发条件与适用场景
 
 ---
 
@@ -94,22 +96,112 @@ export function isCheckpointable(status: TaskRunExecutionStatus): boolean {
 > 
 > **✅ 正确结论**：SUSPENDED 状态后无法创建新的 checkpoint，测试用例明确验证了 "Status SUSPENDED is not checkpointable"
 
-### 2.2 自动 Retry 可触发状态矩阵
+### 2.2 自动 Retry 可触发状态矩阵（✅ 完整代码验证 · 口径统一版）
 
-**✅ 验证代码**：`internal-packages/run-engine/src/engine/systems/runAttemptSystem.ts:891-893`
+> **⚠️ 口径统一说明**：
+> - 之前的表述「仅执行中失败后触发」是不完整的，实际覆盖 4 种状态
+> - 正确表述：**在 4 种执行相关状态下发生失败时可触发自动 retry**
+> - 唯一明确禁止的状态：`FINISHED`（代码有显式检查）
 
-| ExecutionStatus | 是否可自动 Retry | 说明 |
-|----------------|-----------------|------|
-| `RUN_CREATED` | ❌ 否 | 尚未执行 |
-| `DELAYED` | ❌ 否 | 延迟中 |
-| `QUEUED` | ❌ 否 | 队列中 |
-| `PENDING_EXECUTING` | ✅ 是 | 出队后执行失败 |
-| `EXECUTING` | ✅ 是 | 执行中失败 |
-| `EXECUTING_WITH_WAITPOINTS` | ✅ 是 | 等待子任务时失败 |
-| `QUEUED_EXECUTING` | ✅ 是 | checkpoint 后重试失败 |
-| `SUSPENDED` | ❌ 否 | 已暂停（需 resume 而非 retry） |
-| `PENDING_CANCEL` | ❌ 否 | 待取消 |
-| `FINISHED` | ❌ 否 | 已完成后不可自动 retry |
+---
+
+#### 2.2.1 状态矩阵与代码证据
+
+| ExecutionStatus | 是否可自动 Retry | 触发场景 | 代码证据 |
+|----------------|-----------------|---------|----------|
+| `RUN_CREATED` | ❌ 否 | 尚未执行，无 attempt 可失败 | - |
+| `DELAYED` | ❌ 否 | 延迟中，无 attempt 可失败 | - |
+| `QUEUED` | ❌ 否 | 队列中，尚未分配 worker | - |
+| `PENDING_EXECUTING` | ✅ 是 | 出队后 worker 初始化阶段失败（如 OOM、代码加载失败） | `runAttemptSystem.ts:861-893` |
+| `EXECUTING` | ✅ 是 | 业务代码执行中抛出异常 | `runAttemptSystem.ts:861-893` |
+| `EXECUTING_WITH_WAITPOINTS` | ✅ 是 | 等待子任务时 worker 崩溃或超时 | `runAttemptSystem.ts:861-893` |
+| `QUEUED_EXECUTING` | ✅ 是 | checkpoint 后重新入队，执行阶段失败 | `runAttemptSystem.ts:861-893` + `checkpointSystem.ts:175-208` |
+| `SUSPENDED` | ❌ 否 | 已暂停，需通过 resume 流程恢复而非 retry | - |
+| `PENDING_CANCEL` | ❌ 否 | 待取消状态，由取消流程处理 | `runAttemptSystem.ts:368` |
+| `FINISHED` | ❌ 否 | **显式检查禁止**，已完成后不可自动 retry | `runAttemptSystem.ts:891-893` |
+
+---
+
+#### 2.2.2 ✅ 核心代码验证证据
+
+**入口 1：attemptFailed() 入口检查**
+```typescript
+// runAttemptSystem.ts:891-893
+if (latestSnapshot.executionStatus === "FINISHED") {
+  throw new ServiceValidationError("Run is already finished", 400);
+}
+// ✅ 证明：唯一显式禁止的状态是 FINISHED
+```
+
+**入口 2：startRunAttempt() 前置检查**
+```typescript
+// runAttemptSystem.ts:368-370
+if (isFinishedOrPendingFinished(latestSnapshot.executionStatus)) {
+  throw new ServiceValidationError("Task run is already finished", 400);
+}
+
+// statuses.ts:34-37
+export function isFinishedOrPendingFinished(status: TaskRunExecutionStatus): boolean {
+  const finishedStatuses: TaskRunExecutionStatus[] = ["FINISHED", "PENDING_CANCEL"];
+  return finishedStatuses.includes(status);
+}
+// ✅ 证明：startRunAttempt 时会排除 FINISHED 和 PENDING_CANCEL
+```
+
+**入口 3：重试决策（不限制当前状态）**
+```typescript
+// retrying.ts:46-178
+export async function retryOutcomeFromCompletion(
+  prisma: PrismaClientOrTransaction,
+  { runId, attemptNumber, error, retryUsingQueue, retrySettings }: Params
+): Promise<RetryOutcome> {
+  // 只检查：
+  // 1. 是否是取消错误 → cancel_run
+  // 2. 是否是 OOM 错误 → 特殊升级机器逻辑
+  // 3. 错误是否可重试
+  // 4. attempt 次数是否超限
+  // 5. 是否有重试配置
+  // ✅ 证明：重试决策本身不对当前 executionStatus 做限制
+}
+```
+
+---
+
+#### 2.2.3 ✅ 四种可重试状态的失败路径详解
+
+| 状态 | 失败发生阶段 | 失败类型 | 触发方式 |
+|------|-------------|---------|---------|
+| **PENDING_EXECUTING** | Worker 出队后，执行用户代码前 | - OOM（内存不足）<br>- 代码加载/导入失败<br>- 初始化异常<br>- Worker 进程崩溃 | 正常 attemptFailed() 调用 |
+| **EXECUTING** | 执行用户业务代码中 | - 业务代码抛出异常<br>- 运行时错误<br>- Worker 超时/崩溃 | 正常 attemptFailed() 调用 |
+| **EXECUTING_WITH_WAITPOINTS** | 等待子任务完成时 | - Worker 崩溃<br>- 等待超时<br>- 检测到子任务失败 | 正常 attemptFailed() 调用 |
+| **QUEUED_EXECUTING** | checkpoint 后重新入队的执行阶段 | - 恢复 checkpoint 失败<br>- 断点续跑时代码异常<br>- Worker 崩溃 | forceRequeue=true 调用 attemptFailed() |
+
+---
+
+#### 2.2.4 ✅ 重试后的两种执行方式
+
+```typescript
+// runAttemptSystem.ts:1073-1133
+if (forceRequeue || retryResult.method === "queue" || 长延迟) {
+  // 方式 1：RETRY_QUEUED（重新入队）
+  // → NACK 消息重新入队
+  // → 创建状态为 QUEUED 的 snapshot
+  // → 等待 worker 重新拉取
+  // 适用场景：
+  //   - forceRequeue=true（QUEUED_EXECUTING 状态失败）
+  //   - OOM 错误需要升级机器
+  //   - 重试延迟超过阈值
+} else {
+  // 方式 2：RETRY_IMMEDIATELY（立即重试）
+  // → 直接创建状态为 EXECUTING 的新 snapshot
+  // → 通知当前 worker 继续执行
+  // → 无需重新入队
+  // 适用场景：
+  //   - 重试延迟短（< retryWarmStartThresholdMs）
+}
+```
+
+> **关键提示**：重试方式与当前失败时的状态无关，只与失败类型、延迟配置有关
 
 ### 2.3 Replay 可触发状态矩阵
 
@@ -783,7 +875,7 @@ model TaskRun {
 
 ---
 
-## 七、结论修正汇总（v3.0 最终验证版）
+## 七、结论修正汇总（v4.0 口径统一版）
 
 ### 7.1 ❌ 错误结论 vs ✅ 正确结论（完整列表）
 
@@ -794,13 +886,68 @@ model TaskRun {
 | 3 | v2.0 | Replay 仅适用于已完成/失败的 run | Replay 适用于**任何状态**的 run，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
 | 4 | v2.0 | 重试时所有 waitpoints 都保留 | 重试时 `taskRunWaitpoint`（阻塞）被清除，只有 `snapshot.completedWaitpoints` 保留 | `runAttemptSystem.ts:898` + `dequeueSystem.ts:457` |
 | 5 | v2.0 | FINISHED 状态的 run 会被 replay 拒绝 | FINISHED 状态的 run **可以**被 replay | Replay 服务无状态检查 |
-| 6 | **v3.0** | Checkpoint 后统一走 SUSPENDED 路径 | Checkpoint 后有**两条分支**：QUEUED_EXECUTING → 重新入队；其他状态 → SUSPENDED | `checkpointSystem.ts:175-247` |
-| 7 | **v3.0** | SUSPENDED 状态可正常 dequeue | SUSPENDED 状态**不可直接 dequeue**，需要 Worker 恢复镜像后调用 continue API | `statuses.ts:3-6` + `workerGroupTokenService.server.ts:505-520` |
-| 8 | **v3.0** | 重试后子任务不会继续执行 | 重试后 blocking waitpoint 被删除，但**子任务本身可能仍在执行（孤儿任务风险）** | `waitpointSystem.ts:53-68` |
+| 6 | v3.0 | Checkpoint 后统一走 SUSPENDED 路径 | Checkpoint 后有**两条分支**：QUEUED_EXECUTING → 重新入队；其他状态 → SUSPENDED | `checkpointSystem.ts:175-247` |
+| 7 | v3.0 | SUSPENDED 状态可正常 dequeue | SUSPENDED 状态**不可直接 dequeue**，需要 Worker 恢复镜像后调用 continue API | `statuses.ts:3-6` + `workerGroupTokenService.server.ts:505-520` |
+| 8 | v3.0 | 重试后子任务不会继续执行 | 重试后 blocking waitpoint 被删除，但**子任务本身可能仍在执行（孤儿任务风险）** | `waitpointSystem.ts:53-68` |
+| 9 | **v4.0** | 自动 retry「仅执行中失败后触发」 | **4 种状态可触发自动 retry**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING，唯一显式禁止 FINISHED | `runAttemptSystem.ts:891-893` + `retrying.ts:46-178` |
 
 ---
 
-### 7.2 ✅ Checkpoint 双分支机制总结（v3.0 新增）
+### 7.2 ✅ 自动 Retry 触发边界汇总（v4.0 新增 · 口径统一）
+
+```
+                          ┌─────────────────────────────────────────────────┐
+                          │           attemptFailed() 入口                  │
+                          └─────────────────────────────────────────────────┘
+                                             │
+                        ┌────────────────────┴────────────────────┐
+                        ▼                                         ▼
+            ┌────────────────────────┐             ┌──────────────────────────┐
+            │ latestSnapshot.status  │             │   retryOutcomeFromCompletion  │
+            │ === FINISHED ?         │             │   （重试决策逻辑）           │
+            └────────────────────────┘             └──────────────────────────┘
+                        │                                         │
+          ┌─────────────┴─────────────┐                           │
+          ▼                           ▼                           │
+    ┌───────────┐              ┌─────────────┐                   │
+    │ 抛出错误  │              │ 继续检查     │                   │
+    └───────────┘              └─────────────┘                   │
+                                          │                      │
+                        ┌─────────────────┴──────────┐           │
+                        ▼                            ▼           │
+            ┌─────────────────────┐       ┌──────────────────┐  │
+            │ startRunAttempt()    │       │  重试类型判断：   │  │
+            │ 前置检查：            │       │  - OOM 升级机器  │  │
+            │ isFinishedOrPending   │       │  - 错误可重试性  │  │
+            │ → 排除 FINISHED 和    │       │  - 次数限制      │  │
+            │   PENDING_CANCEL      │       │  - 配置存在性    │  │
+            └─────────────────────┘       └──────────────────┘  │
+                                                                  │
+                        ┌─────────────────────────────────────────┘
+                        ▼
+            ┌─────────────────────────────────────┐
+            │  最终只有以下状态可成功重试：         │
+            │  1. PENDING_EXECUTING               │
+            │  2. EXECUTING                       │
+            │  3. EXECUTING_WITH_WAITPOINTS       │
+            │  4. QUEUED_EXECUTING                │
+            └─────────────────────────────────────┘
+```
+
+---
+
+### 7.3 ✅ 四种可重试状态的典型失败场景（v4.0 新增）
+
+| 状态 | 典型失败场景 | 触发方式 | 重试后状态 |
+|------|-------------|---------|-----------|
+| **PENDING_EXECUTING** | 1. Worker 出队后 OOM<br>2. 代码 import 失败<br>3. 初始化阶段异常<br>4. Worker 进程崩溃 | `attemptFailed()` | EXECUTING / QUEUED |
+| **EXECUTING** | 1. 业务代码抛出异常<br>2. 运行时错误<br>3. Worker 超时<br>4. Worker 崩溃 | `attemptFailed()` | EXECUTING / QUEUED |
+| **EXECUTING_WITH_WAITPOINTS** | 1. 等待子任务时 Worker 崩溃<br>2. 等待超时被强制失败<br>3. 检测到子任务失败 | `attemptFailed()` | EXECUTING / QUEUED |
+| **QUEUED_EXECUTING** | 1. Checkpoint 恢复失败<br>2. 断点续跑时代码异常<br>3. Worker 崩溃 | `attemptFailed(forceRequeue=true)` | QUEUED（重新入队） |
+
+---
+
+### 7.4 ✅ Checkpoint 双分支机制总结（v3.0 新增）
 
 ```
                             ┌─────────────────────────────────────────────┐
@@ -829,20 +976,20 @@ model TaskRun {
 
 ---
 
-### 7.3 关键边界条件总结（最终版）
+### 7.5 关键边界条件总结（v4.0 口径统一版）
 
 | 维度 | 边界条件 | 代码证据 |
 |------|---------|----------|
 | **Checkpoint 创建** | 仅 5 种状态可创建：RUN_CREATED/QUEUED/EXECUTING/EXECUTING_WITH_WAITPOINTS/QUEUED_EXECUTING | `statuses.ts:21-32` |
 | **Checkpoint 分支** | 两条分支：QUEUED_EXECUTING → 重新入队；其他 → SUSPENDED | `checkpointSystem.ts:175-247` |
 | **Dequeue 状态** | 仅 QUEUED/QUEUED_EXECUTING 可 dequeue | `statuses.ts:3-6` |
-| **自动 Retry 触发** | 仅执行中失败后触发 | `runAttemptSystem.ts:891-893` |
+| **自动 Retry 触发** | **4 种状态可触发**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING，唯一显式禁止 FINISHED | `runAttemptSystem.ts:891-893` + `retrying.ts:46-178` |
 | **Replay 触发** | **无状态限制**，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
 | **Waitpoint 清理** | blocking 关联清除，completed 历史保留 | `waitpointSystem.ts:53-68` + `dequeueSystem.ts:457-458` |
 | **最终状态** | 8 种 final 状态不再自动 retry，但仍可 replay | `statuses.ts:44-57` |
 | **孤儿任务风险** | 重试后子任务可能仍在执行，需注意幂等性 | `waitpointSystem.ts:61-65` |
 
----
+
 
 ## 八、关键代码文件索引
 
