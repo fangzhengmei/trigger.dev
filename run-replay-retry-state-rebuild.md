@@ -1,16 +1,17 @@
-# Run Replay 与自动 Retry 状态机重建分析（口径统一版）
+# Run Replay 与自动 Retry 状态机重建分析（v5.0 失败路径拆分版）
 
 > **⚠️ 版本历史**：
 > - v1.0：初始分析（存在部分不准确结论）
 > - v2.0：代码验证版（修正 5 个关键错误结论）
 > - v3.0：最终验证版（阐述 checkpoint 双分支差异、补充 waitpoint 完整代码证据）
-> - **v4.0：口径统一版（✅ 本次更新）**：消除自动 retry 触发状态的前后口径冲突，明确 4 种状态的触发边界，补充完整代码证据链
+> - v4.0：口径统一版（消除自动 retry 触发状态的前后口径冲突）
+> - **v5.0：失败路径拆分版（✅ 本次更新）**：拆分 attemptFailed 直接路径与心跳超时重入队路径，明确 QUEUED_EXECUTING 的约束语义
 
-> **核心修正点（v4.0）**：
-> 1. **口径冲突修正**：之前「仅执行中失败后触发」的表述不准确，实际是 **4 种状态可触发自动 retry**
-> 2. **边界明确**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING 四种状态的具体失败场景
-> 3. **代码证据链**：补充 3 个核心入口的代码验证（attemptFailed 检查、startRunAttempt 前置检查、重试决策逻辑）
-> 4. **重试方式差异**：明确 RETRY_QUEUED 与 RETRY_IMMEDIATELY 两种方式的触发条件与适用场景
+> **核心修正点（v5.0）**：
+> 1. **两类失败路径拆分**：路径 A（attemptFailed 直接处理 EXECUTING / EXECUTING_WITH_WAITPOINTS）vs 路径 B（PENDING_EXECUTING 心跳超时 → tryNackAndRequeue 重入队）
+> 2. **QUEUED_EXECUTING 约束语义**：不是独立的可重试执行状态，而是 checkpoint 产生的中间状态，不参与心跳检测
+> 3. **关键差异**：路径 A 递增 attemptNumber + 累加费用；路径 B 不递增 attemptNumber + 不累加费用
+> 4. **心跳超时配置**：5 种状态有不同超时值，QUEUED_EXECUTING 不注册心跳
 
 ---
 
@@ -98,9 +99,10 @@ export function isCheckpointable(status: TaskRunExecutionStatus): boolean {
 
 ### 2.2 自动 Retry 可触发状态矩阵（✅ 完整代码验证 · 口径统一版）
 
-> **⚠️ 口径统一说明**：
-> - 之前的表述「仅执行中失败后触发」是不完整的，实际覆盖 4 种状态
-> - 正确表述：**在 4 种执行相关状态下发生失败时可触发自动 retry**
+> **⚠️ 口径统一说明（v5.0 更新）**：
+> - 之前将 4 种状态统一描述为「可自动 retry」是不精确的
+> - 正确拆分：**EXECUTING / EXECUTING_WITH_WAITPOINTS** 走 attemptFailed 路径；**PENDING_EXECUTING** 走心跳超时 → tryNackAndRequeue 路径
+> - **QUEUED_EXECUTING** 不是独立的可重试状态，是 checkpoint 产生的中间状态
 > - 唯一明确禁止的状态：`FINISHED`（代码有显式检查）
 
 ---
@@ -112,10 +114,10 @@ export function isCheckpointable(status: TaskRunExecutionStatus): boolean {
 | `RUN_CREATED` | ❌ 否 | 尚未执行，无 attempt 可失败 | - |
 | `DELAYED` | ❌ 否 | 延迟中，无 attempt 可失败 | - |
 | `QUEUED` | ❌ 否 | 队列中，尚未分配 worker | - |
-| `PENDING_EXECUTING` | ✅ 是 | 出队后 worker 初始化阶段失败（如 OOM、代码加载失败） | `runAttemptSystem.ts:861-893` |
+| `PENDING_EXECUTING` | ✅ 是 | 出队后心跳超时，走 tryNackAndRequeue 重入队 | `index.ts:1959-2008` |
 | `EXECUTING` | ✅ 是 | 业务代码执行中抛出异常 | `runAttemptSystem.ts:861-893` |
 | `EXECUTING_WITH_WAITPOINTS` | ✅ 是 | 等待子任务时 worker 崩溃或超时 | `runAttemptSystem.ts:861-893` |
-| `QUEUED_EXECUTING` | ✅ 是 | checkpoint 后重新入队，执行阶段失败 | `runAttemptSystem.ts:861-893` + `checkpointSystem.ts:175-208` |
+| `QUEUED_EXECUTING` | ⚠️ 特殊 | checkpoint 产生的中间状态，不参与心跳检测，不直接触发 attemptFailed | `index.ts:1956-1958` + `executionSnapshotSystem.ts:542-561` |
 | `SUSPENDED` | ❌ 否 | 已暂停，需通过 resume 流程恢复而非 retry | - |
 | `PENDING_CANCEL` | ❌ 否 | 待取消状态，由取消流程处理 | `runAttemptSystem.ts:368` |
 | `FINISHED` | ❌ 否 | **显式检查禁止**，已完成后不可自动 retry | `runAttemptSystem.ts:891-893` |
@@ -167,14 +169,170 @@ export async function retryOutcomeFromCompletion(
 
 ---
 
-#### 2.2.3 ✅ 四种可重试状态的失败路径详解
+#### 2.2.3 ✅ 两类失败路径拆分（v5.0 核心修正）
 
-| 状态 | 失败发生阶段 | 失败类型 | 触发方式 |
-|------|-------------|---------|---------|
-| **PENDING_EXECUTING** | Worker 出队后，执行用户代码前 | - OOM（内存不足）<br>- 代码加载/导入失败<br>- 初始化异常<br>- Worker 进程崩溃 | 正常 attemptFailed() 调用 |
-| **EXECUTING** | 执行用户业务代码中 | - 业务代码抛出异常<br>- 运行时错误<br>- Worker 超时/崩溃 | 正常 attemptFailed() 调用 |
-| **EXECUTING_WITH_WAITPOINTS** | 等待子任务完成时 | - Worker 崩溃<br>- 等待超时<br>- 检测到子任务失败 | 正常 attemptFailed() 调用 |
-| **QUEUED_EXECUTING** | checkpoint 后重新入队的执行阶段 | - 恢复 checkpoint 失败<br>- 断点续跑时代码异常<br>- Worker 崩溃 | forceRequeue=true 调用 attemptFailed() |
+> **关键区分**：自动 retry 的触发入口不是统一的 `attemptFailed()`，而是分为两条完全不同的路径。
+> 将二者混写是之前文档的口径冲突根源。
+
+---
+
+##### 路径 A：attemptFailed() 直接处理的执行失败（EXECUTING / EXECUTING_WITH_WAITPOINTS）
+
+**触发条件**：Worker 在执行过程中**主动报告失败**（业务异常、运行时错误等）
+
+```
+Worker 执行中发生失败
+    ↓
+Worker 调用 API：attemptFailed({ runId, snapshotId, completion, ... })
+    ↓
+runAttemptSystem.attemptFailed() (runAttemptSystem.ts:861-1142)
+    ↓
+检查 1：latestSnapshot.id === snapshotId（快照一致性）
+检查 2：latestSnapshot.executionStatus !== "FINISHED"（禁止对已完成 run 重试）
+    ↓
+清除 blocking waitpoints (runAttemptSystem.ts:897-901)
+    ↓
+retryOutcomeFromCompletion() 决策（retrying.ts:46-178）
+    ↓
+┌──────────────────────────────────────────────────────────┐
+│ 三种结果：                                                │
+│ 1. cancel_run → cancelRun()                              │
+│ 2. fail_run → #permanentlyFailRun()                      │
+│ 3. retry → 根据延迟选择：                                 │
+│    - RETRY_IMMEDIATELY（短延迟）→ EXECUTING snapshot     │
+│    - RETRY_QUEUED（长延迟）→ tryNackAndRequeue() → QUEUED│
+└──────────────────────────────────────────────────────────┘
+```
+
+**代码证据**：
+| 步骤 | 代码位置 |
+|------|---------|
+| attemptFailed 入口 | `runAttemptSystem.ts:861-877` |
+| FINISHED 状态检查 | `runAttemptSystem.ts:891-893` |
+| 清除 blocking waitpoints | `runAttemptSystem.ts:897-901` |
+| 重试决策 | `retrying.ts:46-178` |
+| RETRY_IMMEDIATELY 分支 | `runAttemptSystem.ts:1104-1133` |
+| RETRY_QUEUED 分支 | `runAttemptSystem.ts:1073-1101` |
+
+**适用状态**：
+
+| 状态 | 典型失败场景 | 失败类型 |
+|------|-------------|---------|
+| **EXECUTING** | 业务代码抛出异常、运行时错误 | Worker 主动报告 |
+| **EXECUTING_WITH_WAITPOINTS** | 等待子任务时检测到失败 | Worker 主动报告 |
+
+---
+
+##### 路径 B：心跳超时后的重入队路径（PENDING_EXECUTING）
+
+**触发条件**：Worker 出队后**未在超时时间内启动执行**或**心跳中断**
+
+```
+Snapshot 创建时注册心跳定时器
+    ↓
+executionSnapshotSystem.createExecutionSnapshot()
+→ heartbeatSnapshot job 入队（延迟 heartbeatTimeouts.PENDING_EXECUTING 后执行）
+    ↓
+┌───────────────────────────────────────────────────────────────┐
+│ 心跳正常时：Worker 定期调用 heartbeatRun()                    │
+│ → 重置心跳定时器（executionSnapshotSystem.ts:479-485）        │
+└───────────────────────────────────────────────────────────────┘
+    ↓ （超时未心跳）
+Worker 队列执行 heartbeatSnapshot job
+    ↓
+RunEngine.#handleStalledSnapshot() (index.ts:1917-2194)
+    ↓
+switch (latestSnapshot.executionStatus)
+    ↓
+case "PENDING_EXECUTING":
+    ↓
+调用 tryNackAndRequeue() (index.ts:1990)
+    ↓
+┌──────────────────────────────────────────────────────────┐
+│ tryNackAndRequeue() 完整流程 (runAttemptSystem.ts:1197-1297): │
+│                                                            │
+│ 1. runQueue.nackMessage() → NACK 消息重新入队              │
+│    - 成功：继续下一步                                      │
+│    - 失败（超过队列重试上限）：→ systemFailure()，run 最终失败 │
+│                                                            │
+│ 2. 更新 run.status = "PENDING"                             │
+│                                                            │
+│ 3. 创建新 ExecutionSnapshot（status: "QUEUED"）            │
+│    - checkpointId: 保留之前的 checkpoint                    │
+│    - completedWaitpoints: 保留之前的已完成子任务             │
+│    - description: "Requeued the run after a failure"       │
+│                                                            │
+│ 结果：run 重新进入队列，等待下一次 dequeue                  │
+└──────────────────────────────────────────────────────────┘
+```
+
+**代码证据**：
+| 步骤 | 代码位置 |
+|------|---------|
+| 心跳定时器注册 | `executionSnapshotSystem.ts:402-413` |
+| 心跳重置 | `executionSnapshotSystem.ts:479-485` |
+| 心跳超时处理入口 | `index.ts:229-231` |
+| #handleStalledSnapshot | `index.ts:1917-2194` |
+| PENDING_EXECUTING 分支 | `index.ts:1959-2008` |
+| tryNackAndRequeue 实现 | `runAttemptSystem.ts:1197-1297` |
+| NACK 失败降级 | `runAttemptSystem.ts:1240-1246` |
+| 重新创建 QUEUED snapshot | `runAttemptSystem.ts:1263-1278` |
+
+**关键差异**：
+| 维度 | 路径 A（attemptFailed） | 路径 B（心跳超时 → tryNackAndRequeue） |
+|------|----------------------|--------------------------------------|
+| **触发方** | Worker 主动报告 | Engine 心跳检测（Worker 无响应） |
+| **重试决策** | retryOutcomeFromCompletion() | 队列自身的重试限制（nackMessage） |
+| **attemptNumber** | 递增 | **不递增**（未真正开始执行） |
+| **计费** | 累加本次 attempt 费用 | **不累加**（未消耗计算资源） |
+| **waitpoints** | 清除 blocking，保留 completed | 保留 checkpointId + completedWaitpoints |
+| **失败结果** | 可 cancel / fail / retry | NACK 失败 → systemFailure() |
+
+---
+
+##### ✅ QUEUED_EXECUTING 的约束语义（v5.0 明确）
+
+> **❌ 之前的错误理解**：将 QUEUED_EXECUTING 和其他 3 种状态并列，视为「可自动 retry 的执行状态」
+>
+> **✅ 正确理解**：QUEUED_EXECUTING 不是一个「可独立触发重试的执行状态」，而是 **checkpoint 创建后产生的中间状态**
+
+**定义**：`QUEUED_EXECUTING` = 「已在队列中但同时在执行」的状态，**仅**在 checkpoint 创建流程中出现。
+
+**代码证据**：
+```typescript
+// index.ts:1956-1958
+case "QUEUED_EXECUTING": {
+  throw new NotImplementedError("There shouldn't be a heartbeat for QUEUED_EXECUTING");
+}
+// ✅ 证明：QUEUED_EXECUTING 不参与心跳超时检测
+```
+
+```typescript
+// executionSnapshotSystem.ts:542-561
+#getHeartbeatIntervalMs(status: TaskRunExecutionStatus): number | null {
+  switch (status) {
+    case "PENDING_EXECUTING": return this.heartbeatTimeouts.PENDING_EXECUTING;
+    case "EXECUTING": return this.heartbeatTimeouts.EXECUTING;
+    case "EXECUTING_WITH_WAITPOINTS": return this.heartbeatTimeouts.EXECUTING_WITH_WAITPOINTS;
+    case "SUSPENDED": return this.heartbeatTimeouts.SUSPENDED;
+    default: return null; // QUEUED_EXECUTING 走 default → null → 不注册心跳
+  }
+}
+// ✅ 证明：QUEUED_EXECUTING 不注册心跳定时器
+```
+
+**约束语义总结**：
+
+| 维度 | QUEUED_EXECUTING | 其他 3 种执行状态 |
+|------|-----------------|-----------------|
+| **是否注册心跳** | ❌ 否（返回 null） | ✅ 是 |
+| **心跳超时处理** | ❌ 抛出 NotImplementedError | ✅ 正常处理 |
+| **是否可直接 dequeue** | ✅ 是（在 dequeueable 列表中） | ❌ 否 |
+| **产生时机** | 仅 checkpoint 创建后 | Worker 执行过程中 |
+| **失败后路径** | 重新 dequeue → PENDING_EXECUTING → 心跳超时 → tryNackAndRequeue | attemptFailed() |
+| **attemptNumber 递增** | 否（未真正执行） | 是 |
+
+> **排障要点**：线上看到 QUEUED_EXECUTING 状态的 run 长时间无进展时，应检查 dequeue 是否正常，而非追踪心跳。它依赖队列调度（dequeue），不依赖心跳检测。
 
 ---
 
@@ -875,7 +1033,7 @@ model TaskRun {
 
 ---
 
-## 七、结论修正汇总（v4.0 口径统一版）
+## 七、结论修正汇总（v5.0 失败路径拆分版）
 
 ### 7.1 ❌ 错误结论 vs ✅ 正确结论（完整列表）
 
@@ -887,63 +1045,76 @@ model TaskRun {
 | 4 | v2.0 | 重试时所有 waitpoints 都保留 | 重试时 `taskRunWaitpoint`（阻塞）被清除，只有 `snapshot.completedWaitpoints` 保留 | `runAttemptSystem.ts:898` + `dequeueSystem.ts:457` |
 | 5 | v2.0 | FINISHED 状态的 run 会被 replay 拒绝 | FINISHED 状态的 run **可以**被 replay | Replay 服务无状态检查 |
 | 6 | v3.0 | Checkpoint 后统一走 SUSPENDED 路径 | Checkpoint 后有**两条分支**：QUEUED_EXECUTING → 重新入队；其他状态 → SUSPENDED | `checkpointSystem.ts:175-247` |
-| 7 | v3.0 | SUSPENDED 状态可正常 dequeue | SUSPENDED 状态**不可直接 dequeue**，需要 Worker 恢复镜像后调用 continue API | `statuses.ts:3-6` + `workerGroupTokenService.server.ts:505-520` |
+| 7 | v3.0 | SUSPENDED 状态可正常 dequeue | SUSPENDED 状态**不可直接 dequeue**，需要 Worker 恢复镜像后调用 continue API | `statuses.ts:3-6` |
 | 8 | v3.0 | 重试后子任务不会继续执行 | 重试后 blocking waitpoint 被删除，但**子任务本身可能仍在执行（孤儿任务风险）** | `waitpointSystem.ts:53-68` |
-| 9 | **v4.0** | 自动 retry「仅执行中失败后触发」 | **4 种状态可触发自动 retry**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING，唯一显式禁止 FINISHED | `runAttemptSystem.ts:891-893` + `retrying.ts:46-178` |
+| 9 | v4.0 | 自动 retry「仅执行中失败后触发」 | 4 种状态可触发自动 retry | `runAttemptSystem.ts:891-893` |
+| 10 | **v5.0** | 4 种状态统一走 attemptFailed 路径 | **两类路径**：EXECUTING/EXECUTING_WITH_WAITPOINTS 走 attemptFailed；PENDING_EXECUTING 走心跳超时 → tryNackAndRequeue | `index.ts:1917-2194` |
+| 11 | **v5.0** | QUEUED_EXECUTING 是独立的可重试执行状态 | QUEUED_EXECUTING 是 **checkpoint 产生的中间状态**，不参与心跳检测，不直接触发 attemptFailed | `index.ts:1956-1958` + `executionSnapshotSystem.ts:542-561` |
 
 ---
 
-### 7.2 ✅ 自动 Retry 触发边界汇总（v4.0 新增 · 口径统一）
+### 7.2 ✅ 失败路径与心跳分流汇总（v5.0 重写）
 
 ```
-                          ┌─────────────────────────────────────────────────┐
-                          │           attemptFailed() 入口                  │
-                          └─────────────────────────────────────────────────┘
-                                             │
-                        ┌────────────────────┴────────────────────┐
-                        ▼                                         ▼
-            ┌────────────────────────┐             ┌──────────────────────────┐
-            │ latestSnapshot.status  │             │   retryOutcomeFromCompletion  │
-            │ === FINISHED ?         │             │   （重试决策逻辑）           │
-            └────────────────────────┘             └──────────────────────────┘
-                        │                                         │
-          ┌─────────────┴─────────────┐                           │
-          ▼                           ▼                           │
-    ┌───────────┐              ┌─────────────┐                   │
-    │ 抛出错误  │              │ 继续检查     │                   │
-    └───────────┘              └─────────────┘                   │
-                                          │                      │
-                        ┌─────────────────┴──────────┐           │
-                        ▼                            ▼           │
-            ┌─────────────────────┐       ┌──────────────────┐  │
-            │ startRunAttempt()    │       │  重试类型判断：   │  │
-            │ 前置检查：            │       │  - OOM 升级机器  │  │
-            │ isFinishedOrPending   │       │  - 错误可重试性  │  │
-            │ → 排除 FINISHED 和    │       │  - 次数限制      │  │
-            │   PENDING_CANCEL      │       │  - 配置存在性    │  │
-            └─────────────────────┘       └──────────────────┘  │
-                                                                  │
-                        ┌─────────────────────────────────────────┘
-                        ▼
-            ┌─────────────────────────────────────┐
-            │  最终只有以下状态可成功重试：         │
-            │  1. PENDING_EXECUTING               │
-            │  2. EXECUTING                       │
-            │  3. EXECUTING_WITH_WAITPOINTS       │
-            │  4. QUEUED_EXECUTING                │
-            └─────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                          Run 执行中的两种失败路径                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+               ┌────────────────────┴────────────────────┐
+               ▼                                         ▼
+┌──────────────────────────────┐          ┌──────────────────────────────────┐
+│ 路径 A：attemptFailed()      │          │ 路径 B：心跳超时 → #handleStalled  │
+│ Worker 主动报告失败           │          │ Worker 无响应，Engine 检测超时     │
+└──────────────────────────────┘          └──────────────────────────────────┘
+               │                                         │
+               ▼                                         ▼
+┌──────────────────────────────┐          ┌──────────────────────────────────┐
+│ 适用状态：                    │          │ 适用状态：                        │
+│ - EXECUTING                  │          │ - PENDING_EXECUTING（60s 超时）   │
+│ - EXECUTING_WITH_WAITPOINTS  │          │ - EXECUTING（60s 超时）           │
+│                              │          │ - EXECUTING_WITH_WAITPOINTS（60s）│
+│                              │          │ - SUSPENDED（600s 超时）          │
+│                              │          │ - PENDING_CANCEL（60s 超时）      │
+└──────────────────────────────┘          └──────────────────────────────────┘
+               │                                         │
+               ▼                                         ▼
+┌──────────────────────────────┐          ┌──────────────────────────────────┐
+│ 重试决策：                    │          │ PENDING_EXECUTING 心跳超时：       │
+│ retryOutcomeFromCompletion() │          │ → tryNackAndRequeue()             │
+│ → cancel / fail / retry      │          │ → NACK 消息重新入队                │
+│                              │          │ → 创建 QUEUED snapshot            │
+│ attemptNumber 递增 ✅        │          │ → attemptNumber 不变 ❌            │
+│ 累加费用 ✅                   │          │ → 不累加费用 ❌                    │
+└──────────────────────────────┘          └──────────────────────────────────┘
+               │                                         │
+               ▼                                         ▼
+┌──────────────────────────────┐          ┌──────────────────────────────────┐
+│ EXECUTING 心跳超时（路径 B）：│          │ QUEUED_EXECUTING：                │
+│ → attemptFailed(forceRequeue │          │ ⚠️ 不注册心跳                     │
+│   = true)                    │          │ ⚠️ 心跳超时抛 NotImplementedError │
+│ → 同路径 A 决策流程           │          │ ⚠️ 依赖队列调度（dequeue）        │
+│ → 生产环境可视为 OOM 错误    │          │ → dequeue 后变为 PENDING_EXECUTING│
+└──────────────────────────────┘          └──────────────────────────────────┘
 ```
 
 ---
 
-### 7.3 ✅ 四种可重试状态的典型失败场景（v4.0 新增）
+### 7.3 ✅ 心跳超时配置与状态分流表（v5.0 新增）
 
-| 状态 | 典型失败场景 | 触发方式 | 重试后状态 |
-|------|-------------|---------|-----------|
-| **PENDING_EXECUTING** | 1. Worker 出队后 OOM<br>2. 代码 import 失败<br>3. 初始化阶段异常<br>4. Worker 进程崩溃 | `attemptFailed()` | EXECUTING / QUEUED |
-| **EXECUTING** | 1. 业务代码抛出异常<br>2. 运行时错误<br>3. Worker 超时<br>4. Worker 崩溃 | `attemptFailed()` | EXECUTING / QUEUED |
-| **EXECUTING_WITH_WAITPOINTS** | 1. 等待子任务时 Worker 崩溃<br>2. 等待超时被强制失败<br>3. 检测到子任务失败 | `attemptFailed()` | EXECUTING / QUEUED |
-| **QUEUED_EXECUTING** | 1. Checkpoint 恢复失败<br>2. 断点续跑时代码异常<br>3. Worker 崩溃 | `attemptFailed(forceRequeue=true)` | QUEUED（重新入队） |
+**代码位置**：`index.ts:273-279` + `executionSnapshotSystem.ts:542-561`
+
+| ExecutionStatus | 心跳超时值 | 超时处理方式 | 是否注册心跳 |
+|----------------|-----------|-------------|------------|
+| `PENDING_EXECUTING` | 60s | tryNackAndRequeue() 重入队 | ✅ 是 |
+| `EXECUTING` | 60s | attemptFailed(forceRequeue=true)，生产可视为 OOM | ✅ 是 |
+| `EXECUTING_WITH_WAITPOINTS` | 60s | attemptFailed(forceRequeue=true) | ✅ 是 |
+| `SUSPENDED` | 600s | continueRunIfUnblocked() + 指数退避重试 | ✅ 是 |
+| `PENDING_CANCEL` | 60s | cancelRun(finalizeRun=true) 强制取消 | ✅ 是 |
+| `QUEUED_EXECUTING` | - | **抛出 NotImplementedError** | ❌ 否 |
+| `QUEUED` | - | **抛出 NotImplementedError** | ❌ 否 |
+| `RUN_CREATED` | - | **抛出 NotImplementedError** | ❌ 否 |
+| `DELAYED` | - | **抛出 NotImplementedError** | ❌ 否 |
+| `FINISHED` | - | **抛出 NotImplementedError** | ❌ 否 |
 
 ---
 
@@ -983,7 +1154,7 @@ model TaskRun {
 | **Checkpoint 创建** | 仅 5 种状态可创建：RUN_CREATED/QUEUED/EXECUTING/EXECUTING_WITH_WAITPOINTS/QUEUED_EXECUTING | `statuses.ts:21-32` |
 | **Checkpoint 分支** | 两条分支：QUEUED_EXECUTING → 重新入队；其他 → SUSPENDED | `checkpointSystem.ts:175-247` |
 | **Dequeue 状态** | 仅 QUEUED/QUEUED_EXECUTING 可 dequeue | `statuses.ts:3-6` |
-| **自动 Retry 触发** | **4 种状态可触发**：PENDING_EXECUTING / EXECUTING / EXECUTING_WITH_WAITPOINTS / QUEUED_EXECUTING，唯一显式禁止 FINISHED | `runAttemptSystem.ts:891-893` + `retrying.ts:46-178` |
+| **自动 Retry 触发** | **两类路径**：路径 A（attemptFailed：EXECUTING/EXECUTING_WITH_WAITPOINTS）；路径 B（心跳超时：PENDING_EXECUTING → tryNackAndRequeue） | `runAttemptSystem.ts:861-893` + `index.ts:1959-2008` |
 | **Replay 触发** | **无状态限制**，仅检查环境未归档 | `replayTaskRun.server.ts:33-35` |
 | **Waitpoint 清理** | blocking 关联清除，completed 历史保留 | `waitpointSystem.ts:53-68` + `dequeueSystem.ts:457-458` |
 | **最终状态** | 8 种 final 状态不再自动 retry，但仍可 replay | `statuses.ts:44-57` |
@@ -998,11 +1169,17 @@ model TaskRun {
 | Replay 主逻辑 | `apps/webapp/app/v3/services/replayTaskRun.server.ts` | 24-144 |
 | 自动 Retry 决策 | `internal-packages/run-engine/src/engine/retrying.ts` | 46-178 |
 | Run Attempt 管理 | `internal-packages/run-engine/src/engine/systems/runAttemptSystem.ts` | 110-2096 |
-| 执行快照系统 | `internal-packages/run-engine/src/engine/systems/executionSnapshotSystem.ts` | 320-431 |
+| tryNackAndRequeue 实现 | `internal-packages/run-engine/src/engine/systems/runAttemptSystem.ts` | 1197-1297 |
+| 执行快照系统 | `internal-packages/run-engine/src/engine/systems/executionSnapshotSystem.ts` | 320-561 |
+| 心跳定时器管理 | `internal-packages/run-engine/src/engine/systems/executionSnapshotSystem.ts` | 402-531 |
 | Checkpoint 系统 | `internal-packages/run-engine/src/engine/systems/checkpointSystem.ts` | 21-366 |
 | 出队与状态重建 | `internal-packages/run-engine/src/engine/systems/dequeueSystem.ts` | 88-450 |
 | Waitpoint 系统 | `internal-packages/run-engine/src/engine/systems/waitpointSystem.ts` | 42-150 |
 | **状态枚举定义** | `internal-packages/run-engine/src/engine/statuses.ts` | **1-61** |
+| **心跳超时处理** | `internal-packages/run-engine/src/engine/index.ts` | **1917-2194** |
+| **心跳超时配置** | `internal-packages/run-engine/src/engine/index.ts` | **273-283** |
+| **HeartbeatTimeouts 类型** | `internal-packages/run-engine/src/engine/types.ts` | **194-200** |
 | 计费计算 | `internal-packages/run-engine/src/engine/systems/runAttemptSystem.ts` | 2047-2096 |
 | 机器费率 | `internal-packages/run-engine/src/engine/machinePresets.ts` | 54-61 |
 | Checkpoint 测试用例 | `internal-packages/run-engine/src/engine/tests/checkpoints.test.ts` | 632-776 |
+| **心跳测试用例** | `internal-packages/run-engine/src/engine/tests/heartbeats.test.ts` | **1-9** |
