@@ -122,9 +122,9 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
   });
 
   if (existingRun) {
-    // 3. 检查是否过期
+    // 3. 检查【幂等键】是否过期（idempotencyKeyExpiresAt 字段）
     if (existingRun.idempotencyKeyExpiresAt && existingRun.idempotencyKeyExpiresAt < new Date()) {
-      // 过期：清除键，允许新 run
+      // 幂等键过期：清除键，允许新 run
       await this.prisma.taskRun.updateMany({
         where: { id: existingRun.id, idempotencyKey },
         data: { idempotencyKey: null, idempotencyKeyExpiresAt: null },
@@ -132,7 +132,7 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
       return { isCached: false, idempotencyKey, idempotencyKeyExpiresAt };
     }
 
-    // 4. 检查是否需要清除（失败或过期状态）
+    // 4. 检查【run 状态】是否需要清除幂等键（失败或 run 过期）
     if (shouldIdempotencyKeyBeCleared(existingRun.status)) {
       // 清除键，允许新 run
       await this.prisma.taskRun.updateMany({...});
@@ -153,7 +153,7 @@ async handleTriggerRequest(request, parentStore): Promise<IdempotencyKeyConcernR
 }
 ```
 
-### 3.4 状态判断逻辑
+### 3.4 状态判断逻辑：关键发现！
 
 **文件位置：** `apps/webapp/app/v3/taskStatus.ts:133-134`
 
@@ -163,17 +163,63 @@ export function shouldIdempotencyKeyBeCleared(status: TaskRunStatus): boolean {
 }
 ```
 
-**FAILED_RUN_STATUSES 包括：**
-- `INTERRUPTED`
-- `COMPLETED_WITH_ERRORS`
-- `SYSTEM_FAILURE`
-- `CRASHED`
-- `TIMED_OUT`
-- `EXPIRED`
+#### 3.4.1 FAILED_RUN_STATUSES vs shouldIdempotencyKeyBeCleared
 
-**保留幂等键的状态：**
-- 成功：`COMPLETED_SUCCESSFULLY`, `CANCELED`
-- 进行中：`PENDING`, `EXECUTING`, `WAITING_TO_RESUME`, `RETRYING_AFTER_FAILURE` 等
+**真实关系图：**
+
+```
+shouldIdempotencyKeyBeCleared(status)
+    │
+    ├─► isFailedRunStatus(status)
+    │      └─► FAILED_RUN_STATUSES = [
+    │            "INTERRUPTED",
+    │            "COMPLETED_WITH_ERRORS",
+    │            "SYSTEM_FAILURE",
+    │            "CRASHED",
+    │            "TIMED_OUT"
+    │          ]
+    │
+    └─► status === "EXPIRED"  ← 单独判断，不在 FAILED_RUN_STATUSES 中！
+```
+
+**重要纠正：**
+- ❌ `EXPIRED` **不在** `FAILED_RUN_STATUSES` 中
+- ✅ `EXPIRED` 是通过 `|| status === "EXPIRED"` **单独追加**的判断条件
+
+#### 3.4.2 两种"过期"概念的区别
+
+| 概念 | 字段/状态 | 含义 | 触发时机 |
+|------|-----------|------|---------|
+| **幂等键过期** | `idempotencyKeyExpiresAt` | 幂等键本身的有效期 | 超过设置的 TTL（如 30天） |
+| **Run 状态过期** | `status === "EXPIRED"` | Run 在队列中待太久被系统终止 | 超过 run.ttl（如 10分钟） |
+
+**Run EXPIRED 状态的触发条件：**
+**文件位置：** `internal-packages/run-engine/src/engine/systems/ttlSystem.ts:25-134`
+
+```typescript
+// 只有满足以下条件才会标记为 EXPIRED：
+1. run.status === "PENDING"  ← 必须是待执行状态
+2. run.lockedAt === null     ← 没有被锁定
+3. isExecuting === false     ← 没有在执行
+```
+
+**设计意图：** 防止任务在队列中无限等待，释放资源。
+
+#### 3.4.3 完整状态分类表
+
+| 状态 | FINAL | FAILED | 清除幂等键 | 说明 |
+|------|-------|--------|-----------|------|
+| `COMPLETED_SUCCESSFULLY` | ✅ | ❌ | ❌ | 成功完成，保留幂等键 |
+| `CANCELED` | ✅ | ❌ | ❌ | 手动取消，保留幂等键 |
+| `INTERRUPTED` | ✅ | ✅ | ✅ | 被中断，清除键 |
+| `COMPLETED_WITH_ERRORS` | ✅ | ✅ | ✅ | 执行出错，清除键 |
+| `SYSTEM_FAILURE` | ✅ | ✅ | ✅ | 系统失败，清除键 |
+| `CRASHED` | ✅ | ✅ | ✅ | 崩溃，清除键 |
+| `TIMED_OUT` | ✅ | ✅ | ✅ | 执行超时，清除键 |
+| **`EXPIRED`** | ✅ | **❌** | **✅** | 队列超时，**单独判断** |
+| `PENDING` | ❌ | ❌ | ❌ | 待执行 |
+| `EXECUTING` | ❌ | ❌ | ❌ | 执行中 |
+| `RETRYING_AFTER_FAILURE` | ❌ | ❌ | ❌ | 重试中 |
 
 ### 3.5 RunEngine：数据库写入与并发保护
 
@@ -261,7 +307,14 @@ async traceIdempotentRun(request, parentStore, options, callback) {
 
 ## 四、过期策略（TTL）
 
-### 4.1 TTL 解析
+### 4.1 两种 TTL 的区别
+
+| TTL 类型 | 字段名 | 作用 | 默认值 |
+|----------|--------|------|--------|
+| **幂等键 TTL** | `idempotencyKeyTTL` | 控制幂等键多久后失效，失效后可重新触发 | 30 天 |
+| **Run TTL** | `ttl` | 控制 run 在队列中最多等待多久，超时后状态变为 EXPIRED | dev: 10m, prod: 无 |
+
+### 4.2 幂等键 TTL 解析
 
 **文件位置：** `apps/webapp/app/utils/idempotencyKeys.server.ts:10-41`
 
@@ -272,7 +325,7 @@ export function resolveIdempotencyKeyTTL(ttl: string | undefined | null): Date |
 }
 ```
 
-### 4.2 默认值与优先级
+### 4.3 幂等键 TTL 默认值与优先级
 
 **文件位置：** `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts:25-28`
 
@@ -283,7 +336,7 @@ export function resolveIdempotencyKeyTTL(ttl: string | undefined | null): Date |
 3. 默认 30 天
 ```
 
-### 4.3 过期后的行为
+### 4.4 幂等键过期后的行为
 
 1. **查询时检测过期** - `handleTriggerRequest` 中先检查 `idempotencyKeyExpiresAt`
 2. **清除旧键** - 更新数据库将过期 run 的 `idempotencyKey` 设为 null
@@ -386,6 +439,24 @@ shouldIdempotencyKeyBeCleared(FAILED) → true
 
 **设计意图：** 失败的任务应该允许重试，幂等保护不应该阻碍错误恢复。
 
+### 6.4 子任务队列超时（EXPIRED）后的重试
+
+```
+子任务在队列中等待太久（超过 run.ttl）
+    ↓
+子任务 status → EXPIRED
+    ↓
+父任务重试时再次 trigger
+    ↓
+查询 existingRun → 找到 EXPIRED 的 run
+    ↓
+shouldIdempotencyKeyBeCleared(EXPIRED) → true  ← 单独判断生效！
+    ↓
+清除旧 run 的幂等键
+    ↓
+创建新的子 run ✓
+```
+
 ---
 
 ## 七、批量触发（Batch）中的幂等
@@ -431,39 +502,100 @@ export async function resetIdempotencyKey(
 
 ---
 
-## 九、常见问题与可能的重复原因
+## 九、多维度排查决策树
 
-### 9.1 为什么会出现两次运行？
+### 9.1 问题定位决策树
 
-**可能原因 1：scope 不匹配**
-- 预期是全局去重，但使用了默认 `run` scope
-- 不同父 run 使用相同 key 但 scope 是 `run` → 会创建不同 run
+```
+发现重复运行
+    │
+    ├─► 维度1：Scope 检查
+    │    │
+    │    ├─► 是否使用了 scope: "global"？
+    │    │    ├─► 否（默认 run scope）
+    │    │    │    └─► 是否来自不同的父 run？
+    │    │    │         ├─► 是 → 【原因】不同父 run + run scope = 不同 hash
+    │    │    │         └─► 否 → 继续排查
+    │    │    └─► 是 → 继续排查
+    │    │
+    │    └─► 是否是从后端代码（非 task 内）触发？
+    │         ├─► 是 → 所有 scope 行为相同，继续排查
+    │         └─► 否 → 继续排查
+    │
+    ├─► 维度2：第一次 Run 状态检查
+    │    │
+    │    ├─► 第一次 run 的 status 是什么？
+    │    │    │
+    │    │    ├─► COMPLETED_SUCCESSFULLY / CANCELED
+    │    │    │    └─► 【排除】这些状态保留幂等键，不会导致重复
+    │    │    │
+    │    │    ├─► INTERRUPTED / COMPLETED_WITH_ERRORS / 
+    │    │    │   SYSTEM_FAILURE / CRASHED / TIMED_OUT
+    │    │    │    └─► 【原因】FAILED 状态会清除幂等键
+    │    │    │
+    │    │    ├─► EXPIRED
+    │    │    │    └─► 【原因】Run 队列超时会清除幂等键（单独判断）
+    │    │    │
+    │    │    └─► PENDING / EXECUTING / RETRYING_AFTER_FAILURE
+    │    │         └─► 继续排查
+    │    │
+    │    └─► 检查 idempotencyKeyExpiresAt 字段
+    │         └─► 是否已过期？
+    │              ├─► 是 → 【原因】幂等键 TTL 过期
+    │              └─► 否 → 继续排查
+    │
+    ├─► 维度3：环境与任务隔离检查
+    │    │
+    │    ├─► 两次触发的 runtimeEnvironmentId 是否相同？
+    │    │    ├─► 否 → 【原因】环境不同，幂等键隔离
+    │    │    └─► 是 → 继续排查
+    │    │
+    │    └─► 两次触发的 taskIdentifier 是否相同？
+    │         ├─► 否 → 【原因】任务不同，幂等键隔离
+    │         └─► 是 → 继续排查
+    │
+    ├─► 维度4：幂等键值检查
+    │    │
+    │    ├─► 两次的 idempotencyKey（哈希后）是否完全相同？
+    │    │    ├─► 否 → 【原因】键值不同
+    │    │    └─► 是 → 继续排查
+    │    │
+    │    └─► 是否使用了数组 key？
+    │         └─► 检查数组元素顺序和类型是否一致
+    │
+    └─► 维度5：并发与日志检查
+         │
+         ├─► 日志中是否有 RunDuplicateIdempotencyKeyError？
+         │    ├─► 有 → 【正常】并发保护生效，重试后命中缓存
+         │    └─► 无 → 继续排查
+         │
+         ├─► 检查数据库唯一约束是否生效
+         │    └─► 确认 schema 中 @@unique 约束存在
+         │
+         └─► 极端情况：重试逻辑异常
+              └─► 检查 RunDuplicateIdempotencyKeyError 捕获是否完整
+```
 
-**可能原因 2：第一次 run 失败**
-- 第一次 run 失败后幂等键被清除
-- 第二次 trigger 创建新 run
+### 9.2 常见重复原因速查表
 
-**可能原因 3：TTL 过期**
-- 第一次 run 的 TTL 已过期
-- 第二次 trigger 创建新 run
+| 现象 | 可能原因 | 验证方法 | 解决方案 |
+|------|---------|---------|---------|
+| 不同父 run 触发相同子任务都创建了新 run | 使用了默认 `run` scope | 检查 scope 设置 | 需要全局去重则使用 `scope: "global"` |
+| 子任务失败后重试创建了新 run | FAILED 状态会清除幂等键 | 检查第一次 run 状态 | 设计预期，如需保留需手动处理 |
+| 子任务队列超时后创建了新 run | EXPIRED 状态会清除幂等键 | 检查第一次 run.status === "EXPIRED" | 调整 run.ttl 或幂等键 TTL |
+| 一段时间后相同 key 创建了新 run | 幂等键 TTL 过期 | 检查 idempotencyKeyExpiresAt | 调整 idempotencyKeyTTL |
+| dev 和 prod 环境都创建了 run | 环境间幂等键隔离 | 检查 runtimeEnvironmentId | 设计预期 |
+| 不同 task 用相同 key 都运行了 | 任务间幂等键隔离 | 检查 taskIdentifier | 设计预期 |
 
-**可能原因 4：并发极端情况**
-- 极高并发下，请求绕过了第一层查询检查
-- 但数据库唯一约束应该能阻止最终写入（P2002 + 重试）
-- **注意：** 如果重试逻辑有问题，可能导致意外行为
-
-**可能原因 5：不同 task 或不同环境**
-- 相同 key 但 taskIdentifier 不同
-- 相同 key 但 runtimeEnvironmentId 不同
-
-### 9.2 幂等保护的边界
+### 9.3 幂等保护的边界
 
 **幂等保护不覆盖的场景：**
 1. ✗ **不同 task** - taskIdentifier 不同，即使 key 相同
 2. ✗ **不同环境** - runtimeEnvironmentId 不同
 3. ✗ **父 run 不同且 scope=run** - hash 中包含 parentRunId
-4. ✗ **第一次 run 失败后** - 幂等键被清除
-5. ✗ **TTL 过期后**
+4. ✗ **第一次 run 失败后** - FAILED 状态清除幂等键
+5. ✗ **第一次 run EXPIRED 后** - 队列超时清除幂等键
+6. ✗ **幂等键 TTL 过期后** - idempotencyKeyExpiresAt 过期
 
 ---
 
@@ -472,25 +604,28 @@ export async function resetIdempotencyKey(
 | 模块 | 文件位置 | 核心逻辑 |
 |------|----------|----------|
 | SDK 创建 | `packages/core/src/v3/idempotencyKeys.ts` | scope + SHA256 哈希 |
-| 核心检查 | `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts` | 查询 existingRun + 状态判断 |
-| 状态判断 | `apps/webapp/app/v3/taskStatus.ts` | 失败/过期状态清除键 |
+| 核心检查 | `apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts` | 查询 existingRun + 双重过期检查 |
+| 状态判断 | `apps/webapp/app/v3/taskStatus.ts:133` | FAILED + EXPIRED（**单独判断**） |
 | 并发写保护 | `internal-packages/run-engine/src/engine/index.ts` | Prisma P2002 捕获 |
-| 自动重试 | `apps/webapp/app/runEngine/services/triggerTask.server.ts` | RunDuplicateIdempotencyKeyError |
+| 自动重试 | `apps/webapp/app/runEngine/services/triggerTask.server.ts:574` | RunDuplicateIdempotencyKeyError |
 | TTL 解析 | `apps/webapp/app/utils/idempotencyKeys.server.ts` | smhd 单位解析 |
 | Dashboard 显示 | `apps/webapp/app/runEngine/concerns/traceEvents.server.ts` | cached 标记 + 日志 |
 | DB 约束 | `internal-packages/database/prisma/schema.prisma` | 三元组唯一索引 |
+| Run EXPIRED 逻辑 | `internal-packages/run-engine/src/engine/systems/ttlSystem.ts` | PENDING 状态超时处理 |
 
 ---
 
-## 十一、排查建议
+## 十一、排查步骤（按优先级）
 
 如果遇到重复运行问题，按以下顺序排查：
 
 1. **检查 scope** - 是否使用了正确的 scope（global/run/attempt）
-2. **检查第一次 run 状态** - 是否是失败状态导致幂等键被清除
-3. **检查 TTL** - 是否已过期
-4. **检查 taskIdentifier** - 是否是同一个 task
-5. **检查环境** - 是否在同一个 environment
-6. **检查并发日志** - 查看是否有 `RunDuplicateIdempotencyKeyError` 及重试日志
-7. **检查 idempotencyKey 值** - 确认两次请求的 key 完全相同（哈希后）
+2. **检查第一次 run 状态** - 是否是 FAILED/EXPIRED 状态导致幂等键被清除
+3. **检查幂等键 TTL** - idempotencyKeyExpiresAt 是否已过期
+4. **检查 run TTL** - 第一次 run 是否因为队列超时变成 EXPIRED
+5. **检查 taskIdentifier** - 是否是同一个 task
+6. **检查环境** - 是否在同一个 environment
+7. **检查幂等键值** - 确认两次请求的 key 哈希后完全相同
+8. **检查并发日志** - 查看是否有 `RunDuplicateIdempotencyKeyError` 及重试日志
+9. **检查数据库约束** - 确认 @@unique 约束是否生效
 
