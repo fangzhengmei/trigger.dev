@@ -504,4 +504,467 @@ export function removePrivateProperties(attributes: Attributes | undefined | nul
 | [schema.prisma](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/database/prisma/schema.prisma#L1677) | TaskEvent / ImpersonationAuditLog 模型 |
 | [007_add_task_events_v1.sql](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/schema/007_add_task_events_v1.sql) | ClickHouse task_events_v1 DDL + TTL |
 | [010_add_task_events_v2.sql](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/schema/010_add_task_events_v2.sql) | ClickHouse task_events_v2 DDL + TTL |
-| [env.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/env.server.ts#L469-L477) | 批量写入/保留期配置 |
+---
+
+## 9. Dashboard 首页任务 Activity 图 — 环境指标到 ClickHouse 查询的读取链路
+
+### 9.1 前端入口
+
+**路由**：[route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam._index/route.tsx#L109-L135)
+
+Dashboard 首页（环境 `_index` 路由）使用 `TaskListPresenter` 获取任务列表与 Activity 图数据：
+
+```
+loader({ request, params })
+  → requireUserId(request)
+  → findProjectBySlug() — 组织成员验证
+  → findEnvironmentBySlug() — 环境验证
+  → taskListPresenter.call({ organizationId, projectId, environmentId, environmentType })
+  → typeddefer({ tasks, activity, runningStats, durations })
+```
+
+**关键**：`activity` / `runningStats` / `durations` 是 **Promise 不 await**（[L80 注释](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/TaskListPresenter.server.ts#L80)），通过 `typeddefer` 实现流式加载——先返回 tasks 列表，指标数据延迟推送。
+
+### 9.2 Presenter → Repository
+
+**Presenter**：[TaskListPresenter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/TaskListPresenter.server.ts)
+
+```
+TaskListPresenter.call()
+  → findCurrentWorkerFromEnvironment() — 查询当前活跃 Worker
+  → backgroundWorkerTask.findMany() — 获取任务列表（排除 AGENT 类型）
+  → environmentMetricsRepository.getDailyTaskActivity({ ..., days: 6 })    — 7天 Activity
+  → environmentMetricsRepository.getCurrentRunningStats({ ..., days: 6 })  — 队列/运行统计
+  → environmentMetricsRepository.getAverageDurations({ ..., days: 6 })     — 平均耗时
+```
+
+**实例化**（单例模式）：
+```typescript
+const environmentMetricsRepository = new ClickHouseEnvironmentMetricsRepository({
+  clickhouse: clickhouseClient,
+});
+```
+
+### 9.3 Repository → ClickHouse 查询
+
+**Repository**：[environmentMetricsRepository.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/environmentMetricsRepository.server.ts)
+
+三个查询均直接读 ClickHouse `task_runs_v2` 表（非 task_events 表）：
+
+#### Activity 图查询
+
+**ClickHouse SQL**（[taskRuns.ts L424-L453](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/src/taskRuns.ts#L424-L453)）：
+
+```sql
+SELECT
+    task_identifier,
+    status,
+    toDate(created_at) as day,
+    count() as count
+FROM trigger_dev.task_runs_v2 FINAL
+WHERE
+    organization_id = {organizationId:String}
+    AND project_id = {projectId:String}
+    AND environment_id = {environmentId:String}
+    AND created_at >= today() - {days:Int64}
+    AND _is_deleted = 0
+GROUP BY task_identifier, status, day
+ORDER BY task_identifier ASC, day ASC, status ASC
+```
+
+返回后由 `fillInDailyTaskActivity()` 填充缺失日期为 0，按 `TaskRunStatus` 分组。
+
+#### 运行统计查询
+
+**ClickHouse SQL**（[taskRuns.ts L470-L496](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/src/taskRuns.ts#L470-L496)）：
+
+```sql
+SELECT task_identifier, status, count() as count
+FROM trigger_dev.task_runs_v2 FINAL
+WHERE
+    organization_id = ... AND project_id = ... AND environment_id = ...
+    AND status IN ('PENDING','WAITING_FOR_DEPLOY','WAITING_TO_RESUME','QUEUED','EXECUTING','DELAYED')
+    AND _is_deleted = 0
+    AND created_at >= now() - INTERVAL {days:Int64} DAY
+GROUP BY task_identifier, status
+```
+
+前端显示为每个 task 的 queued / running 数量。
+
+#### 平均耗时查询
+
+**ClickHouse SQL**（[taskRuns.ts L512-L536](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/src/taskRuns.ts#L512-L536)）：
+
+```sql
+SELECT task_identifier,
+       avg(toUnixTimestamp(completed_at) - toUnixTimestamp(started_at)) as duration
+FROM trigger_dev.task_runs_v2 FINAL
+WHERE
+    organization_id = ... AND project_id = ... AND environment_id = ...
+    AND created_at >= today() - {days:Int64}
+    AND status IN ('COMPLETED_SUCCESSFULLY','COMPLETED_WITH_ERRORS')
+    AND started_at IS NOT NULL AND completed_at IS NOT NULL
+    AND _is_deleted = 0
+GROUP BY task_identifier
+```
+
+### 9.4 鉴权与隔离
+
+| 层级 | 机制 | 代码位置 |
+|------|------|----------|
+| 路由入口 | `requireUserId` + `findProjectBySlug(organizationSlug, projectParam, userId)` | [route.tsx L110-L127](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam._index/route.tsx#L110-L127) |
+| 数据隔离 | 查询强制带 `organizationId` + `projectId` + `environmentId` | Repository 层三字段 WHERE |
+| 软删除过滤 | `AND _is_deleted = 0` | ClickHouse SQL 内 |
+| 数据源 | 仅 ClickHouse（`task_runs_v2 FINAL`） | 无 PostgreSQL fallback |
+
+---
+
+## 10. 日志页访问开关与 Debug 日志可见性
+
+### 10.1 日志页面访问控制
+
+**路由**：[logs/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.logs/route.tsx#L63-L95)
+
+日志页面有 **独立的访问开关**，不走常规 RBAC，而是检查组织级 Feature Flag：
+
+```typescript
+async function hasLogsPageAccess(
+  userId: string,
+  isAdmin: boolean,
+  isImpersonating: boolean,
+  organizationSlug: string
+): Promise<boolean> {
+  if (isAdmin || isImpersonating) {
+    return true; // 管理员/冒充者直接放行
+  }
+
+  const organization = await prisma.organization.findFirst({
+    where: { slug: organizationSlug, members: { some: { userId } } },
+    select: { featureFlags: true },
+  });
+
+  const flags = organization?.featureFlags as Record<string, unknown>;
+  return validateFeatureFlagValue(FEATURE_FLAG.hasLogsPageAccess, flags?.hasLogsPageAccess)
+    .success && result.data === true;
+}
+```
+
+**Feature Flag 定义**：[featureFlags.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/featureFlags.ts#L7)
+
+| 访问者类型 | 是否可访问日志页 | 条件 |
+|------------|-----------------|------|
+| 平台 Admin（`user.admin=true`） | ✅ | 直接放行 |
+| 冒充会话（Impersonation） | ✅ | 直接放行 |
+| 普通组织成员 | ⚠️ | 需要 `hasLogsPageAccess` Feature Flag = true |
+| 非成员 | ❌ | 组织查询不命中 |
+
+**无权限时**：直接重定向到首页 (`redirect("/")`)。
+
+### 10.2 日志页保留期限制
+
+Loader 中读取用户订阅计划确定保留期：
+
+```typescript
+const plan = await getCurrentPlan(project.organizationId);
+const retentionLimitDays = plan?.v3Subscription?.plan?.limits.logRetentionDays.number ?? 30;
+```
+
+此值传入 `LogsListPresenter.call()` 用于裁剪查询时间范围。
+
+### 10.3 Debug 日志可见性 — 三层控制
+
+#### 层级 1：写入时全局开关
+
+**环境变量**：`EVENT_REPOSITORY_DEBUG_LOGS_DISABLED`
+
+在 [env.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/env.server.ts#L1487) 中定义。设为 `true` 时，`recordRunDebugLog()` 静默返回——debug 事件 **不被写入**。
+
+#### 层级 2：Run 详情页 Debug 开关
+
+**路由**：[runs.$runParam/route.tsx L248-L265](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs.$runParam/route.tsx#L248-L265)
+
+```typescript
+// 服务端 loader
+const showDebug = url.searchParams.get("showDebug") === "true";
+presenter.call({ userId, showDeletedLogs: !!impersonationId, showDebug, ... });
+```
+
+**UI 端**（[L714-L786](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs.$runParam/route.tsx#L714-L786)）：
+
+```typescript
+const isAdmin = useHasAdminAccess(); // user.admin || isImpersonating
+
+{isAdmin && (
+  <Switch
+    variant="small"
+    label="Debug"
+    checked={showDebug}
+    onCheckedChange={(checked) => {
+      replace({ showDebug: checked ? "true" : "false" });
+    }}
+  />
+)}
+```
+
+**效果**：
+- 非 Admin 用户：**看不到 Debug 开关**，`showDebug` 默认为 `false`
+- Admin / 冒充用户：可见并操作 Debug 开关
+
+`showDebug=true` → `includeDebugLogs: true` → 查询不再过滤 `kind=LOG`（PG）或 `kind=DEBUG_EVENT`（CH）
+
+#### 层级 3：查询层过滤
+
+**PostgreSQL 路径**（[taskEventStore.server.ts L126-L132](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/taskEventStore.server.ts#L126-L132)）：
+
+```typescript
+const filterDebug = options?.includeDebugLogs === false || options?.includeDebugLogs === undefined;
+// filterDebug = true → WHERE kind != 'LOG'
+```
+
+**ClickHouse 路径**（[clickhouseEventRepository.server.ts L1292-L1294](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1292-L1294)）：
+
+```typescript
+if (options?.includeDebugLogs === false) {
+  queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" });
+}
+```
+
+**注意**：`includeDebugLogs` 默认为 `undefined`，等价于 `false`——debug 日志 **默认不返回**。
+
+### 10.4 已删除日志可见性
+
+**Presenter**：[RunPresenter.server.ts L115-L146](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/RunPresenter.server.ts#L115-L146)
+
+```typescript
+const showLogs = showDeletedLogs || !run.logsDeletedAt;
+```
+
+| 条件 | `showDeletedLogs` 来源 | `run.logsDeletedAt` | 结果 |
+|------|----------------------|---------------------|------|
+| 正常用户查看 | `false`（无 impersonationId） | `null`（未删除） | ✅ 显示日志 |
+| 正常用户查看已删除 | `false` | 有值 | ❌ trace=undefined |
+| Admin 冒充会话 | `true`（有 impersonationId） | 有值 | ✅ 显示已删除日志 |
+
+`showDeletedLogs=true` 时还会将 `logsDeletedAt` 设为 `null` 返回前端（隐藏"日志已删除"提示）。
+
+---
+
+## 11. 运行详情 vs 导出 API 的鉴权差异
+
+### 11.1 鉴权模型对比
+
+| 维度 | Dashboard 运行详情 | 导出 API |
+|------|-------------------|----------|
+| **认证方式** | Session Cookie（`requireUserId`） | API Key / JWT / PAT（Bearer Token） |
+| **路由构建器** | `dashboardBuilder` → `authenticateAndAuthorize` | `apiBuilder` → `authenticateRequestForApiBuilder` |
+| **身份来源** | `userId` → Session | `environment` → API Key 绑定的环境 |
+| **授权粒度** | 组织成员关系 + RBAC ability | JWT scope / PAT cap-and-floor ability |
+| **资源定位** | `findFirstOrThrow({ userId, projectSlug })` | `findFirst({ friendlyId, runtimeEnvironmentId })` |
+| **隔离层级** | 组织 + 项目 | 环境 |
+
+### 11.2 Dashboard 运行详情鉴权链
+
+```
+浏览器请求
+  → requireUserId(request) — Session 认证
+  → getImpersonationId(request) — 检测冒充会话
+  → findProjectBySlug(orgSlug, projectSlug, userId) — 组织成员验证
+  → RunPresenter.call({ userId, ... }) — Run 查询（含组织成员关系 JOIN）
+  → Run 数据返回
+```
+
+**权限结果**：
+- ✅ 组织成员 → 可看该组织下所有项目的 Run
+- ❌ 非成员 → `findFirstOrThrow` 抛 404
+- ⚠️ Admin 冒充 → 额外看到 `showDeletedLogs` + Debug 开关
+
+### 11.3 API 导出鉴权链
+
+#### `/api/v1/runs/$runId/events`（事件列表）
+
+**代码**：[api.v1.runs.$runId.events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.events.ts)
+
+```
+API 请求
+  → createLoaderApiRoute({ allowJWT: true })
+    → authenticateRequestForApiBuilder(request, { allowJWT })
+      → rbac.authenticateBearer(request, { allowJWT }) — 插件认证
+        → 返回 { authentication, ability }
+    → findResource: ApiRetrieveRunPresenter.findRun(runId, auth.environment)
+      → 按 environment.id 定位 Run
+    → authorization: ability.can("read", anyResource([
+        { type: "runs", id: run.friendlyId },
+        { type: "tasks", id: run.taskIdentifier },
+        ...run.runTags.map(tag => ({ type: "tags", id: tag })),
+        run.batch ? { type: "batch", id: batch.friendlyId } : ...
+      ]))
+    → eventRepository.getRunEvents() — 无 includeDebugLogs（默认不过滤）
+```
+
+#### `/api/v1/runs/$runId/trace`（Trace 详情）
+
+**代码**：[api.v1.runs.$runId.trace.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.trace.ts)
+
+```
+同上认证流程
+  → eventRepository.getTraceDetailedSummary() — 无 includeDebugLogs
+```
+
+### 11.4 关键鉴权差异
+
+| 差异点 | Dashboard | API |
+|--------|-----------|-----|
+| **身份绑定** | User → Organization → Project | API Key → Environment |
+| **可见范围** | 同组织所有环境 | 仅 API Key 所属环境 |
+| **Debug 日志** | 非Admin默认不返回 | **始终返回**（未传 includeDebugLogs） |
+| **已删除日志** | 非冒充用户不可见 | **始终可见**（无 logsDeletedAt 检查） |
+| **JWT 细粒度** | 不适用 | 支持 `read:runs:run_xxx` 限定单 Run |
+| **跨环境** | 同组织可跨环境切换 | 不可，API Key 绑定单一环境 |
+
+### 11.5 日志下载鉴权
+
+**代码**：[resources.runs.$runParam.logs.download.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/resources.runs.$runParam.logs.download.ts)
+
+```
+Session 认证（requireUser）
+  → prisma.taskRun.findFirst({
+      where: {
+        friendlyId: runParam,
+        project: { organization: { members: { some: { userId: user.id } } } }
+      }
+    })
+  → eventRepository.getRunEvents()
+  → 遍历事件时:
+    if (!user.admin && event.kind === TaskEventKind.LOG) {
+      return; // 非 Admin 跳过 LOG 类型事件
+    }
+  → Gzip 流式输出
+```
+
+**角色差异**：
+
+| 角色 | Debug/LOG 日志 | 其他事件 |
+|------|---------------|----------|
+| Admin（`user.admin=true`） | ✅ 包含 | ✅ 包含 |
+| 普通组织成员 | ❌ 跳过 | ✅ 包含 |
+
+---
+
+## 12. 不同角色能看到哪些事件或日志 — 完整矩阵
+
+### 12.1 角色定义
+
+| 角色 | 判定方式 | 说明 |
+|------|---------|------|
+| **平台 Admin** | `user.admin === true` | 平台超级管理员 |
+| **冒充会话** | `getImpersonationId(request)` 有值 | Admin 以他人身份操作 |
+| **组织成员** | `OrganizationMember` 记录存在 | 通过 `findProjectBySlug` 验证 |
+| **API 调用方** | API Key / JWT / PAT | 绑定到 RuntimeEnvironment |
+| **非成员** | 无 OrganizationMember 记录 | 被拒之门外 |
+
+### 12.2 各页面/接口的角色可见性矩阵
+
+| 页面/接口 | 平台 Admin | 冒充会话 | 普通组织成员 | API 调用方 | 非成员 |
+|-----------|-----------|----------|-------------|-----------|--------|
+| **首页 Activity 图** | ✅ | ✅ | ✅ | ❌ 无入口 | ❌ |
+| **Run 详情页** | ✅ | ✅ | ✅ | ❌ 无入口 | ❌ |
+| ┣ Debug 开关 | ✅ 可见/可操作 | ✅ 可见/可操作 | ❌ 不可见 | — | — |
+| ┣ Debug 日志内容 | ✅ (开关开时) | ✅ (开关开时) | ❌ 默认不返回 | — | — |
+| ┣ 已删除日志 | ✅ (showDeletedLogs) | ✅ (showDeletedLogs) | ❌ trace=undefined | — | — |
+| ┣ AdminDebugTooltip | ✅ | ✅ | ❌ 不渲染 | — | — |
+| ┗ AdminDebugRun | ✅ | ✅ | ❌ 不渲染 | — | — |
+| **Span 详情页** | ✅ | ✅ | ✅ | ❌ 无入口 | ❌ |
+| **日志页面** | ✅ 直接放行 | ✅ 直接放行 | ⚠️ 需 Feature Flag | ❌ 无入口 | ❌ |
+| **日志下载** | ✅ 含LOG | ✅ 含LOG | ⚠️ 需Flag 且不含LOG | ❌ 无入口 | ❌ |
+| **API events** | — | — | — | ✅ 含全部Kind | ❌ 401 |
+| **API trace** | — | — | — | ✅ 含全部Kind | ❌ 401 |
+| **Impersonation审计** | ✅ (数据库直接查) | — | ❌ | ❌ | ❌ |
+
+### 12.3 `useHasAdminAccess` 客户端判定
+
+**代码**：[useUser.ts L33-L38](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/hooks/useUser.ts#L33-L38)
+
+```typescript
+export function useHasAdminAccess(matches?: UIMatch[]): boolean {
+  const user = useOptionalUser(matches);
+  const isImpersonating = useIsImpersonating(matches);
+  return Boolean(user?.admin) || isImpersonating;
+}
+```
+
+此 hook 控制以下 UI 元素的可见性：
+- **Debug 开关**（[L774](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs.$runParam/route.tsx#L774)）：`isAdmin && <Switch label="Debug">`
+- **AdminDebugTooltip**（[debugTooltip.tsx L18](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/components/admin/debugTooltip.tsx#L18)）：`!hasAdminAccess && !isImpersonating → return null`
+- **AdminDebugRun**（[debugRun.tsx L18](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/components/admin/debugRun.tsx#L18)）：`!hasAdminAccess && !isImpersonating → return null`
+
+### 12.4 RBAC Ability 体系
+
+**Ability 构建**（[ability.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/rbac/src/ability.ts)）：
+
+| Ability 类型 | `can()` | `canSuper()` | 适用场景 |
+|-------------|---------|--------------|----------|
+| `permissiveAbility` | 始终 true | false | 普通认证用户（OSS fallback） |
+| `superAbility` | 始终 true | true | 平台 Admin |
+| `denyAbility` | 始终 false | false | 废弃的 PUBLIC token / 未认证 |
+| `buildJwtAbility(scopes)` | 按 scope 匹配 | false | JWT 限定授权 |
+
+**JWT scope 匹配规则**：
+- `admin` → 全通配（`canSuper` 仍为 false）
+- `read:all` → 读任意资源
+- `read:runs` → 读所有 runs
+- `read:runs:run_abc` → 仅读 `run_abc`
+- `*:all` → 任意操作任意资源
+
+**Dashboard 路由**的 `isAuthorized` 检查（[dashboardBuilder.server.ts L27-L32](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/routeBuilders/dashboardBuilder.server.ts#L27-L32)）：
+
+```typescript
+function isAuthorized(ability: RbacAbility, authorization: AuthorizationOption): boolean {
+  if ("requireSuper" in authorization) {
+    return ability.canSuper(); // 仅 Admin 可通过
+  }
+  return ability.can(authorization.action, authorization.resource);
+}
+```
+
+### 12.5 API 路由的授权检查
+
+API 路由通过 `anyResource()` / `everyResource()` 表达多资源授权语义：
+
+- **`anyResource([...])`**：任一资源通过即授权（如 Run 可通过 friendlyId / task / tag / batch 任一匹配）
+- **`everyResource([...])`**：所有资源都必须通过（如批量操作的每个元素）
+
+**events/trace API 授权声明**：
+
+```typescript
+authorization: {
+  action: "read",
+  resource: (run) => anyResource([
+    { type: "runs", id: run.friendlyId },
+    { type: "tasks", id: run.taskIdentifier },
+    ...run.runTags.map(tag => ({ type: "tags", id: tag })),
+    run.batch ? { type: "batch", id: batch.friendlyId } : undefined,
+  ]),
+}
+```
+
+这意味着 JWT scope 为 `read:runs:run_abc`、`read:tasks:my-task`、`read:tags:my-tag` 或 `read:all` 中的任一个均可通过授权。
+
+---
+
+## 13. 补充代码文件索引
+
+| 文件 | 职责 |
+|------|------|
+| [TaskListPresenter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/TaskListPresenter.server.ts) | 首页 Activity 图 Presenter |
+| [environmentMetricsRepository.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/environmentMetricsRepository.server.ts) | 环境指标 Repository（ClickHouse） |
+| [taskRuns.ts L424-L536](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/clickhouse/src/taskRuns.ts#L424-L536) | ClickHouse Activity/Stats/Duration SQL |
+| [logs/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.logs/route.tsx) | 日志页面路由（含访问开关） |
+| [featureFlags.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/featureFlags.ts) | Feature Flag 定义（含 hasLogsPageAccess） |
+| [useUser.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/hooks/useUser.ts) | useHasAdminAccess 客户端 hook |
+| [debugTooltip.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/components/admin/debugTooltip.tsx) | Admin 调试信息 Tooltip |
+| [debugRun.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/components/admin/debugRun.tsx) | Admin Run 调试按钮 |
+| [apiBuilder.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/routeBuilders/apiBuilder.server.ts) | API 路由构建器（含 anyResource/everyResource） |
+| [ability.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/internal-packages/rbac/src/ability.ts) | RBAC Ability 构建（permissive/super/deny/JWT） |
+| [impersonation.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/impersonation.server.ts) | 冒充会话 ID 管理 |
+| [api.v1.runs.$runId.events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.events.ts) | API 事件列表端点 |
+| [api.v1.runs.$runId.trace.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.trace.ts) | API Trace 详情端点 |
