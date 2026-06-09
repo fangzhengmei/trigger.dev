@@ -535,23 +535,99 @@ Webhook payload 有 v1 和 v2 两个版本：
 | 3 | "Worker 可见性超时与 job 执行时间不匹配：`visibilityTimeoutMs: 60_000` 但 `v3.evaluateErrorAlerts` 的实际执行可能超过 60 秒" | **错误**。`v3.evaluateErrorAlerts` 的 `visibilityTimeoutMs` 实际为 `60_000 * 5 = 300,000`（5分钟），与错误评估的执行时间匹配，不存在不匹配风险。此条已从风险表中移除 | [alertsWorker.server.ts#L65](apps/webapp/app/v3/alertsWorker.server.ts#L65)：`visibilityTimeoutMs: 60_000 * 5` |
 | 4 | "DLQ 消息重新入队后可能遇到已被标记为 SENT 的 alert" | 需要补充说明：由于进入 DLQ 时 ProjectAlert 状态仍为 PENDING（不会被更新为 FAILED），redrive 后 `DeliverAlertService` 检查 `status !== PENDING` 时仍会尝试递送。只有在极端情况下（如同时有另一条 Worker 成功递送了同一 alert），redrive 后才会遇到 SENT 状态而被跳过 | [deliverAlert.server.ts#L149](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L149) |
 
-### 12.2 告警 Webhook（出站） vs 入站 HTTP Endpoint 的风险适用性
+### 12.2 入站路径代码分析与风险适用性
 
-trigger.dev 中"入站 HTTP Endpoint"的路径与告警 Webhook 完全不同。入站路径是：外部系统 → `POST /api/v1/tasks/:taskId/trigger` → `TriggerTaskService` → 创建 TaskRun → run engine 排队执行。以下逐项分析各风险点的适用范围：
+trigger.dev 的入站事件处理涉及三条不同路径，它们与出站告警 Webhook 的架构完全不同。以下逐一进行代码级分析，并修正原矩阵中的错误判断。
 
-| # | 风险点 | 是否适用于告警 Webhook（出站） | 是否适用于入站 HTTP Endpoint | 说明 |
-|---|--------|------|------|------|
-| 1 | 重试次数仅 3 次 | ✅ 适用 | ❌ 不适用 | 入站触发是**同步 HTTP 请求**，外部系统调用 `/api/v1/tasks/:taskId/trigger` 时直接获得 200/4xx/5xx 响应。如果 trigger.dev 返回 5xx，重试策略由**调用方**控制，trigger.dev 本身不负责重试。调用方可以自行实现任意退避策略 |
-| 2 | DLQ 无自动补偿 | ✅ 适用 | ❌ 不适用 | 入站请求不经过 Redis Worker 队列，没有 DLQ 概念。请求失败后由调用方决定是否重试 |
-| 3 | ProjectAlert 状态不更新为 FAILED | ✅ 适用 | ❌ 不适用 | 入站触发没有 `ProjectAlert` 模型。TaskRun 创建后会持久化到 DB，可通过 API 查询状态。如果创建失败（返回 5xx），调用方会收到明确的 HTTP 错误码 |
-| 4 | HTTP 超时仅 5 秒 | ✅ 适用（trigger.dev 作为发送端） | ✅ 适用（但角色相反） | 对于入站路径，超时由 trigger.dev 的 Web 服务器配置控制（如 Remix 的请求处理超时），且触发操作是同步的 DB 写入 + 排队，通常远小于 5 秒。但调用方如果自身有短超时限制，可能在 trigger.dev 处理高峰时遇到超时 |
-| 5 | 所有非 2xx 响应都触发重试 | ✅ 适用 | ❌ 不适用 | 入站路径中不存在"trigger.dev 重试调用方"的场景。调用方收到 4xx 后可自行决定是否重试（通常 4xx 表示参数错误，不应重试） |
-| 6 | EMAIL/SLACK 速率限制静默丢弃 | ✅ 适用 | ❌ 不适用 | 入站触发不受 GCRA 限流器影响。入站路径有自己的 API 速率限制（`apiRateLimit.server.ts`），但限制不通过时会返回 429 状态码而非静默丢弃 |
-| 7 | Webhook secret 存储依赖 ENCRYPTION_KEY | ✅ 适用 | ❌ 不适用 | 入站触发的认证使用 API Key / Personal Access Token，不依赖 `ENCRYPTION_KEY` 加密的 secret |
+#### 12.2.1 路径一：HTTP Endpoint / Source 回调
 
-**核心区别总结**：
+外部系统通过 HTTP POST 将事件推送到 trigger.dev 的回调 URL。API 速率限制白名单中包含两条相关路径（见 [apiRateLimit.server.ts#L49-L73](apps/webapp/app/services/apiRateLimit.server.ts#L49-L73)）：
 
-- **告警 Webhook（出站）**：trigger.dev 是主动方，使用 Redis Worker 异步递送，集成方是被动接收端。丢事件的风险集中在 trigger.dev 的递送策略上（重试次数少、DLQ 无补偿、状态不更新）。
-- **入站 HTTP Endpoint**：外部系统是主动方，发起同步 HTTP 请求。trigger.dev 直接处理并返回结果。丢事件的风险不在 trigger.dev 内部，而在于调用方是否正确处理了非 200 响应（如网络超时、5xx 等）。trigger.dev 对入站请求提供了幂等性支持（`idempotency-key`）和请求级错误码，调用方可以据此实现可靠重试。
+- `/api/v1/http-endpoints/$httpEndpointId/env/$envType/$shortcode` — HTTP Endpoint 回调
+- `/api/v1/sources/http/$id` — HTTP Source 回调
+- `/api/v1/endpoints/$environmentId/$endpointSlug/index/$indexHookIdentifier` — Index Hook 回调
 
-因此，集成方反馈的"丢事件"问题如果发生在**出站告警 Webhook**方向，很可能与上述高风险点 1-3 直接相关；如果发生在**入站触发**方向，则需要排查调用方的重试逻辑和网络层配置。
+这三条路径均被列入 `pathWhiteList`，**完全绕过 API 速率限制**。这意味着外部系统向这些 URL 推送事件时不受 token bucket 限流约束。
+
+> ⚠️ **重要发现**：在当前代码库中，这三个路由对应的 Remix route handler 文件**不存在**。`apiRateLimit.server.ts` 中保留了这些白名单条目，但路由文件已不再存在（可能在 run-engine 重构中被移除或合并）。这意味着当前版本中，这些回调 URL 的入站请求要么由其他机制（如反向代理、云平台专用 handler）处理，要么已经不再使用。
+
+#### 12.2.2 路径二：Task Trigger API
+
+**路由**: `POST /api/v1/tasks/:taskId/trigger`
+**文件**: [api.v1.tasks.$taskId.trigger.ts](apps/webapp/app/routes/api.v1.tasks.$taskId.trigger.ts)
+
+这是集成方主动触发任务执行的主要 API。代码分析如下：
+
+**API 限流**：此路径**不在** `pathWhiteList` 中，受 API 速率限制保护。限流策略为 token bucket，参数由组织的 `apiRateLimiterConfig` 控制（见 [apiRateLimit.server.ts#L27-L45](apps/webapp/app/services/apiRateLimit.server.ts#L27-L45)）。限流不通过时返回 **429 状态码**（非静默丢弃）。
+
+**请求幂等**：支持两层幂等机制：
+
+1. **路由级**（`x-trigger-request-idempotency-key` header）：通过 `handleRequestIdempotency()` 检查 Redis 缓存中是否有相同 key 的已成功请求，有则直接返回缓存结果（见 [requestIdempotency.server.ts#L16-L71](apps/webapp/app/utils/requestIdempotency.server.ts#L16-L71)）
+2. **服务级**（`idempotency-key` header）：通过 `IdempotencyKeyConcern.handleTriggerRequest()` 在 DB 中查找相同 idempotencyKey + taskId + environmentId 的 TaskRun，找到则返回已有 run（见 [idempotencyKeys.server.ts#L20-L79](apps/webapp/app/runEngine/concerns/idempotencyKeys.server.ts#L20-L79)）。幂等 key 有 TTL（默认 30 天），过期后 key 被清除，允许重新触发。如果已有 run 处于失败/过期等终态，key 也会被清除
+
+**任务入队**：`TriggerTaskService.call()` 通过 `RunEngine.trigger()` 创建 TaskRun 记录并写入 run-engine 的 `RunQueue`。入队操作在同一请求中**同步完成**——如果入队成功，API 返回 200 + run ID；如果失败，API 返回 5xx。
+
+**5 秒 fetch 超时**：**不适用**。此路径是入站 HTTP 请求（外部系统 → trigger.dev），不涉及 trigger.dev 向外发起 fetch 调用。请求处理是同步的 DB 写入 + Redis 排队，通常在毫秒级完成。
+
+#### 12.2.3 路径三：TaskRun 的 Run-Engine 队列执行
+
+TaskRun 创建后进入 `RunQueue`（见 [run-queue/index.ts](internal-packages/run-engine/src/run-queue/index.ts)），由 run-engine 的 Worker 异步执行。这是**trigger.dev 内部的异步执行路径**，与告警 Webhook 的 AlertsWorker 架构类似但参数差异很大。
+
+**DLQ 与 redrive**：RunQueue 有自己的 DLQ 机制：
+
+- 当 `nackMessage()` 被调用且 `incrementAttemptCount = true` 时，attempt 递增；如果 `attempt >= maxAttempts`，消息被移入 DLQ（见 [run-queue/index.ts#L922-L927](internal-packages/run-engine/src/run-queue/index.ts#L922-L927)）
+- DLQ 消息可通过 `redriveMessage()` 重新入队（见 [run-queue/index.ts#L463-L466](internal-packages/run-engine/src/run-queue/index.ts#L463-L466)），同样基于 Redis Pub/Sub（`rq:redrive` channel）
+- Redrive 时 attempt 重置为 0（见 [run-queue/index.ts#L1163](internal-packages/run-engine/src/run-queue/index.ts#L1163)），消息重新进入正常队列
+
+**重试配置**：RunQueue 的默认重试配置（见 [run-queue/index.ts#L139-L145](internal-packages/run-engine/src/run-queue/index.ts#L139-L145)）：
+
+| 参数 | 值 | 与 AlertsWorker 对比 |
+|------|----|--------------------|
+| maxAttempts | 12 | AlertsWorker: 3 |
+| factor | 2 | 相同 |
+| minTimeoutInMs | 1,000 | 相同 |
+| maxTimeoutInMs | 3,600,000 (1h) | 相同 |
+| randomize | true | 相同 |
+
+RunQueue 的 `maxAttempts` 可通过 `RunQueueOptions.retryOptions` 覆盖，但默认为 **12 次**，远高于 AlertsWorker 的 3 次。退避时序理论上可达 ~1s → ~2s → ~4s → ~8s → ~16s → ~32s → ... → 上限 1h。
+
+**Engine Rate Limit**：run-engine 的 `/engine/v1/worker-actions/*` 路径在 `engineRateLimiter` 中被**白名单豁免**（见 [engineRateLimit.server.ts#L28](apps/webapp/app/services/engineRateLimit.server.ts#L28)），即 Worker 与 engine 之间的通信不受速率限制。
+
+#### 12.2.4 修正后的风险适用性矩阵
+
+原矩阵将"入站 HTTP Endpoint"视为单一整体，忽略了三条路径的差异和 run-engine 队列执行阶段的存在。以下为修正后的逐项分析：
+
+| # | 风险点 | 告警 Webhook（出站） | HTTP Endpoint / Source 回调 | Task Trigger API | Run-Engine 队列执行 |
+|---|--------|------|------|------|------|
+| 1 | 重试次数仅 3 次 | ✅ 适用 | ❌ 不适用（无 Redis Worker 队列） | ❌ 不适用（同步请求，重试由调用方控制） | ❌ **不适用**（默认 maxAttempts=12，远高于 3） |
+| 2 | DLQ 无自动补偿 | ✅ 适用 | ❌ 不适用 | ❌ 不适用 | ✅ **适用**（RunQueue 同样依赖手动 redrive，无自动扫描） |
+| 3 | ProjectAlert 状态不更新为 FAILED | ✅ 适用 | ❌ 不适用 | ❌ 不适用（TaskRun 持久化到 DB，状态可查询） | ❌ **不适用**（TaskRun 有完整的状态机：QUEUED → EXECUTING → COMPLETED/FAILED 等） |
+| 4 | HTTP 超时仅 5 秒 | ✅ 适用（trigger.dev 作为发送端） | ✅ **适用**（外部系统向 trigger.dev 推送时，若 trigger.dev 处理超时则外部系统会收到错误） | ✅ **适用**（但角色相反：调用方如果自身有短超时，可能在 trigger.dev 处理高峰时超时） | ❌ 不适用（内部队列处理，不涉及 HTTP fetch） |
+| 5 | 所有非 2xx 响应都触发重试 | ✅ 适用 | ❌ 不适用 | ❌ 不适用 | ❌ 不适用 |
+| 6 | 速率限制静默丢弃 | ✅ 适用（EMAIL/SLACK 类型） | ❌ **不适用**（白名单豁免限流） | ❌ 不适用（限流返回 429，非静默丢弃） | ❌ 不适用（Worker 通信被白名单豁免） |
+| 7 | Webhook secret 存储依赖 ENCRYPTION_KEY | ✅ 适用 | ❌ 不适用 | ❌ 不适用（使用 API Key 认证） | ❌ 不适用 |
+
+**修正要点**：
+
+1. **原矩阵第 2 项"DLQ 无自动补偿"**：原判断为入站路径"不适用"，**部分修正**。Task Trigger API 本身确实不涉及 DLQ，但 TaskRun 创建后进入 Run-Engine 队列执行阶段时，RunQueue **同样存在 DLQ 无自动补偿的风险**。如果 run-engine 队列中的消息因执行失败耗尽重试次数进入 DLQ，同样需要手动 redrive，且**没有自动扫描/通知机制**。
+
+2. **原矩阵第 4 项"HTTP 超时仅 5 秒"**：原判断为入站路径"适用但角色相反"，**需补充说明**。对于 HTTP Endpoint / Source 回调路径，外部系统向 trigger.dev 推送事件时，如果 trigger.dev 处理超时，外部系统会收到连接错误，**此时 5 秒超时的风险不在 trigger.dev 侧**，而在于外部系统的推送端是否实现了可靠重试。
+
+3. **原矩阵第 6 项"速率限制静默丢弃"**：对于 HTTP Endpoint / Source 回调路径，这些路径被**白名单豁免**API 限流（见 [apiRateLimit.server.ts#L57-L58](apps/webapp/app/services/apiRateLimit.server.ts#L57-L58)），因此不存在被限流静默丢弃的风险。但这同时意味着这些路径**完全没有速率保护**，如果外部系统发送大量请求，可能对 trigger.dev 造成过载。
+
+#### 12.2.5 核心区别总结
+
+| 维度 | 告警 Webhook（出站） | Task Trigger API（入站） | Run-Engine 队列执行 |
+|------|------|------|------|
+| 通信模式 | trigger.dev → 外部（异步） | 外部 → trigger.dev（同步） | 内部异步队列 |
+| 消息队列 | AlertsWorker (Redis) | 无 | RunQueue (Redis) |
+| 最大重试 | 3 次 | 由调用方决定 | 12 次（默认） |
+| DLQ | 有，无自动补偿 | 无 | 有，无自动补偿 |
+| 丢事件可追溯性 | 差（状态永远 PENDING） | 好（同步返回错误码 + 幂等支持） | 好（TaskRun 状态机完整） |
+| 速率限制 | WEBHOOK 不受限，EMAIL/SLACK 静默丢弃 | 限流返回 429 | Worker 通信被白名单豁免 |
+| 5 秒超时 | ✅ trigger.dev 出站 fetch | 取决于调用方配置 | 不涉及 HTTP |
+
+因此，集成方反馈的"丢事件"问题需要根据方向分别排查：
+- **出站告警 Webhook**：高风险点 1-3（重试仅 3 次、DLQ 无补偿、状态不更新）是直接原因
+- **入站 Task Trigger API**：风险在于调用方是否正确处理了非 200 响应，trigger.dev 提供了幂等性和明确错误码
+- **Run-Engine 队列执行**：虽然重试次数远高于 AlertsWorker（12 vs 3），但 DLQ 同样无自动补偿，极端情况下仍可能丢失
