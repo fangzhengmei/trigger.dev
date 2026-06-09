@@ -482,36 +482,272 @@ API 请求的认证链路（[apiAuth.server.ts](file:///d:/fz/0508-3/solo-dogfee
 
 ---
 
-## 7. 安全风险与建议
+## 7. 安全边界深度分析
 
-### 7.1 当前架构风险点
+### 7.1 Vercel configurationId 进入 Onboarding 的完整流程
+
+Vercel 集成的安装有两种入口，对应不同的 OAuth 回调路径：
+
+**入口 A：Dashboard 发起（有 state）**
+
+用户从 trigger.dev Dashboard 点击"连接 Vercel"，后端已生成 state JWT，Vercel 回调时携带 `state + code`：
+
+```
+Dashboard → vercelInstallUrl(state=JWT) → Vercel 授权
+  → callback 带 state + code + configurationId?
+  → redirect → /vercel/connect（直接创建集成）
+```
+
+**入口 B：Vercel Marketplace 发起（无 state，有 configurationId）**
+
+用户从 Vercel Marketplace 安装，没有 trigger.dev 侧的 state JWT，Vercel 回调时只携带 `code + configurationId`：
+
+```
+Vercel Marketplace → callback 无 state, 有 code + configurationId
+  → redirect → /vercel/onboarding（引导选组织/项目）
+```
+
+[vercel.callback.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.callback.ts#L61-L74) 的路由逻辑：
+
+```typescript
+// 有 state：dashboard 流程，直接跳转 /vercel/connect
+if (state) {
+  const params = new URLSearchParams({ state, code, origin: "dashboard" });
+  if (configurationId) params.set("configurationId", configurationId);
+  return redirect(`/vercel/connect?${params.toString()}`);
+}
+
+// 无 state 但有 configurationId：marketplace 流程，跳转 /vercel/onboarding
+if (configurationId) {
+  const params = new URLSearchParams({ code, configurationId, origin: "marketplace" });
+  return redirect(`/vercel/onboarding?${params.toString()}`);
+}
+```
+
+**Marketplace 流程的 onboarding 步骤**（[vercel.onboarding.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx)）：
+
+1. 用户选择组织 → 选择项目（每步都验证用户是该组织成员）
+2. 选择项目后，后端**生成 state JWT**（[vercel.onboarding.tsx#L249-L258](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx#L249-L258)）：
+
+```typescript
+const stateResult = await generateVercelOAuthState({
+  organizationId: project.organizationId,
+  projectId: project.id,
+  environmentSlug: environment.slug,    // 固定为 "prod"
+  organizationSlug: project.organization.slug,
+  projectSlug: project.slug,
+});
+```
+
+3. 带 `state + code + configurationId + origin=marketplace` 重定向到 `/vercel/connect`
+4. `/vercel/connect` 验证 state JWT 签名、过期、用户权限，然后交换 token 并创建集成
+
+**安全边界**：Marketplace 流程中，`configurationId` 从 Vercel 回调一路传递到 `createOrFindVercelIntegration`，最终存入 `VercelSecret.installationId`。`configurationId` 本身不是 secret（它是 Vercel 侧的集成配置 ID），但它在 onboarding 各步骤间通过隐藏表单字段传递，未做额外校验——攻击者无法篡改 `configurationId` 来指向其他集成配置，因为后续 Vercel API 调用使用的 `code` 是一次性且绑定该 `configurationId` 的。
+
+### 7.2 Slack State 未与 Session 绑定的风险分析
+
+Slack 的 `state` 参数是裸 `organizationId`，**不与 Session 绑定**。这意味着：
+
+**攻击场景：CSRF 式集成安装**
+
+```
+攻击者构造 URL:
+  https://slack.com/oauth/v2/authorize?...&state=VICTIM_ORG_ID
+
+攻击者诱导受害者（VICTIM_ORG 的成员）点击该 URL
+  → 受害者在 Slack 授权
+  → Slack 回调 /integrations/slack/callback?code=xxx&state=VICTIM_ORG_ID
+  → CreateOrgIntegrationService.call(受害者userId, VICTIM_ORG_ID, "slack", code)
+  → 成员校验通过 → 集成创建成功
+```
+
+**此攻击的效果**：攻击者可以让受害者为攻击者选择的 Slack workspace 安装到受害者的组织中。不过：
+
+1. **攻击者无法获取凭据**：凭据存储在 SecretStore 中，攻击者无法读取
+2. **攻击者无法选择安装哪个 Slack workspace**：OAuth 授权页面由 Slack 展示给受害者，受害者看到的是自己有权限的 workspace
+3. **实际威胁有限**：攻击者最多能让受害者组织连接一个"不想要的" Slack workspace，但不会导致凭据泄露
+
+**更严重但无法实现的攻击场景（理论上）**：
+
+如果攻击者能获取一个有效的 Slack `code`（需要 Slack 授权流程中的 client_secret 交换），理论上可以构造：
+
+```
+攻击者自己的 Slack workspace 授权 → 获得 code
+构造回调 URL → /integrations/slack/callback?code=ATTACKER_CODE&state=VICTIM_ORG_ID
+发送给受害者浏览器访问
+```
+
+但此攻击**不可行**，因为 Slack 的 `code` 只能使用一次，且绑定 `redirect_uri`——攻击者无法让受害者的浏览器触发带有正确 `redirect_uri` 的回调。
+
+**对比 Vercel 的安全性**：Vercel 的 state JWT 包含 `projectId`、`organizationSlug` 等信息并用 `ENCRYPTION_KEY` 签名，攻击者无法篡改 state 中的目标组织/项目，也无法伪造有效的 state。
+
+**加固建议**：将 Slack 的 state 也改为 JWT 签名方式，并在 state 中绑定 `userId`（或至少绑定 Session ID），使回调时可以验证 state 的发出者和当前用户一致。
+
+### 7.3 API Key 与 RevokedApiKey 的明文查找机制
+
+[findEnvironmentByApiKey](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/runtimeEnvironment.server.ts#L94-L130) 的认证流程：
+
+```typescript
+// 1. 先在 RuntimeEnvironment 表按明文 apiKey 查找
+let environment = await $replica.runtimeEnvironment.findFirst({
+  where: { apiKey },
+  include,
+});
+
+// 2. 找不到 → 在 RevokedApiKey 表按明文 apiKey 查找（宽限期内仍可用）
+if (!environment) {
+  const revokedApiKey = await $replica.revokedApiKey.findFirst({
+    where: {
+      apiKey,
+      expiresAt: { gt: new Date() },
+    },
+    include: { runtimeEnvironment: { include } },
+  });
+  environment = revokedApiKey?.runtimeEnvironment ?? null;
+}
+```
+
+**确认：API Key 认证完全基于明文查找，无哈希。**
+
+这意味着：
+
+| 方面 | 说明 |
+|------|------|
+| 查找方式 | `WHERE apiKey = 'tr_prod_xxxxx'`，直接明文匹配 |
+| RevokedApiKey | 同样明文存储，额外有 `expiresAt` 过滤（24小时宽限期） |
+| 数据库索引 | `RuntimeEnvironment.apiKey` 有 `@@unique` 约束，`RevokedApiKey.apiKey` 有 `@@index` |
+| 风险 | 数据库泄露 → 所有 API Key 明文暴露，可立即用于 API 认证 |
+
+**与 PAT/OAT 的对比**：
+
+| Token 类型 | 存储方式 | 数据库泄露影响 |
+|-----------|---------|-------------|
+| API Key | 明文 | ⚠️ 可直接使用 |
+| RevokedApiKey | 明文（24h TTL） | ⚠️ 宽限期内可直接使用 |
+| PAT | AES-256-GCM 加密 + SHA-256 哈希 | ✅ 需 ENCRYPTION_KEY 才能解密原始 token |
+| OAT | 仅 SHA-256 哈希 | ✅ 不可逆，无法还原原始 token |
+| OAuth 凭据 | AES-256-GCM 加密 | ✅ 需 ENCRYPTION_KEY 才能解密 |
+
+**RevokedApiKey 的宽限机制**：
+
+当用户重新生成 API Key 时（[api-key.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/api-key.server.ts#L64-L88)）：
+
+1. 旧 apiKey 明文写入 `RevokedApiKey` 表，`expiresAt = now + 24h`
+2. `RuntimeEnvironment.apiKey` 更新为新 key
+3. 旧 key 在 24 小时宽限期内仍可通过 `RevokedApiKey` 表认证成功
+
+**安全边界**：宽限期的设计目的是让正在运行的 worker 在 key 轮换后仍能短暂工作，避免中断。但这意味着数据库泄露后，即使管理员立即轮换了 API Key，旧 key 在 24 小时内仍然有效。
+
+### 7.4 Slack 重装 vs Vercel 按 teamId 更新 Token
+
+两种集成在"重新安装"场景下的行为完全不同：
+
+**Slack：每次都创建新集成记录**
+
+[createOrgIntegration](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L189-L267) 中，Slack 流程**没有"查找已有"逻辑**：
+
+```
+用户点击 reinstall=true
+  → 跳过 "已有集成则重定向" 的检查
+  → 重新走完整 OAuth 流程
+  → createOrgIntegration() → 总是创建新的 OrganizationIntegration
+     → 新的 friendlyId
+     → 新的 SecretReference
+     → 新的 SecretStore 记录
+     → 新的 OrganizationIntegration 行
+```
+
+结果：同一组织可以有**多条** `service: "SLACK"` 的 `OrganizationIntegration` 记录（旧记录的 `deletedAt` 可能为 null 或有值）。代码中查询 Slack 集成使用 `findFirst`，只会返回最新的一条。
+
+**旧凭据未清理**：重装后，旧的 SecretStore 和 SecretReference 记录仍然存在，旧的加密凭据未被删除。
+
+**Vercel：按 teamId 查找并更新**
+
+[createOrFindVercelIntegration](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.connect.tsx#L21-L64) 中，Vercel 流程**先查找已有集成**：
+
+```typescript
+let orgIntegration = await VercelIntegrationRepository.findVercelOrgIntegrationByTeamId(
+  organizationId,
+  tokenResponse.teamId ?? null
+);
+
+if (orgIntegration) {
+  // 已有 → 更新 token
+  await VercelIntegrationRepository.updateVercelOrgIntegrationToken({ ... });
+} else {
+  // 没有 → 创建新集成
+  await VercelIntegrationRepository.createVercelOrgIntegration({ ... });
+}
+```
+
+[findVercelOrgIntegrationByTeamId](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/vercelIntegration.server.ts#L859-L874) 按 `externalOrganizationId = teamId` 查找：
+
+```typescript
+return prisma.organizationIntegration.findFirst({
+  where: {
+    organizationId,
+    service: "VERCEL",
+    externalOrganizationId: teamId,
+    deletedAt: null,
+  },
+});
+```
+
+[updateVercelOrgIntegrationToken](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/vercelIntegration.server.ts#L753-L799) 更新时：
+
+1. 通过现有的 `SecretReference.key` 找到 SecretStore 中的旧凭据
+2. 用新 token **覆盖**旧凭据（`secretStore.setSecret`）
+3. 更新 `integrationData` 中的元数据
+
+**关键区别**：
+
+| 维度 | Slack 重装 | Vercel 重装 |
+|------|-----------|------------|
+| 策略 | 总是创建新记录 | 按 teamId 查找并更新 |
+| 旧凭据 | 保留在 SecretStore 中（孤立） | 被**覆盖**，同一 SecretStore key 被重写 |
+| 旧记录 | 可能存在多条未删除的 SLACK 集成 | 始终保持一条 VERCEL 集成（per teamId） |
+| 幂等性 | ❌ 不幂等 | ✅ 幂等 |
+| 凭据残留 | ⚠️ 有——旧凭据成为孤立数据 | ✅ 无——旧凭据被覆盖 |
+
+**安全边界**：Vercel 的 teamId 匹配更新机制意味着，如果同一个 Vercel team 的 token 被两个不同的 trigger.dev 组织安装，后安装的会**覆盖**先安装的 token（因为 `findVercelOrgIntegrationByTeamId` 只在 `organizationId` 内查找，不会跨组织冲突）。但每个 trigger.dev 组织独立管理自己的集成，所以实际不会发生跨组织覆盖。
+
+---
+
+## 8. 安全风险与建议
+
+### 8.1 当前架构风险点
 
 | 风险 | 严重度 | 说明 |
 |------|-------|------|
 | 全局单一加密密钥 | 中 | 所有租户共享 `ENCRYPTION_KEY`，密钥泄露影响所有凭据。数据库泄露 + 密钥泄露 = 所有凭据明文暴露 |
+| API Key 明文存储且按明文查找 | 中 | RuntimeEnvironment.apiKey 和 RevokedApiKey.apiKey 均为明文，数据库泄露即可直接使用所有 API Key |
 | Slack Token 未实现自动刷新 | 中 | `refreshToken` 已存储但未使用，user token 过期后集成静默失败 |
 | 集成软删除未清理 SecretStore | 中 | `OrganizationIntegration` 软删除后，`SecretStore` 和 `SecretReference` 中的密文仍残留。数据库泄露时这些密文可被解密（若有 ENCRYPTION_KEY） |
+| Slack 重装产生孤立凭据 | 中 | 每次 Slack 重装都创建新记录，旧 SecretStore 凭据未清理，形成不可控的凭据残留 |
 | Slack 撤销不调用第三方 API | 中 | Slack 集成删除后，token 在 Slack 侧仍有效，存在被滥用的窗口期 |
-| Slack state 无签名校验 | 低 | Slack 的 `state` 参数是裸 `organizationId`，依赖后续的成员校验保证安全，不如 Vercel 的 JWT state 安全 |
+| Slack state 无签名校验 | 低 | Slack 的 `state` 参数是裸 `organizationId`，不与 Session 绑定，依赖后续成员校验保证安全。CSRF 式安装攻击理论上可行但实际威胁有限 |
 | OAuth state 验证机制不一致 | 低 | Vercel 使用签名 JWT 验证 state，Slack 依赖 Session + 成员校验，两种模式安全基线不同 |
+| RevokedApiKey 宽限期过长 | 低 | API Key 轮换后旧 key 仍有 24 小时有效期，数据库泄露场景下缩小了轮换的即时防护效果 |
 | OrganizationAccessToken 未加密 | 低 | 仅存哈希，但原始 token 只在创建时返回一次，类似密码存储模式 |
-| API Key 明文存储 | 低 | RuntimeEnvironment.apiKey 在数据库中明文存储，安全边界依赖数据库访问控制 |
 
-### 7.2 金融客户加固建议
+### 8.2 金融客户加固建议
 
 1. **密钥层级化**：为每个 Organization 生成独立的 KEK（Key Encryption Key），用 KEK 加密该组织的凭据。主密钥（ENCRYPTION_KEY）只加密 KEK，实现密钥隔离
 2. **HSM/KMS 集成**：将 `ENCRYPTION_KEY` 托管至 AWS KMS / HashiCorp Vault，实现密钥轮换和审计
-3. **实现 Slack Token 自动刷新**：在 `getAuthenticatedClientForIntegration` 中实现基于 `refreshToken` 的自动刷新逻辑
-4. **集成删除时清理凭据**：在软删除 `OrganizationIntegration` 时，同步删除 `SecretStore` 和 `SecretReference` 中的记录
-5. **Slack 撤销时调用 Slack API**：参考 Vercel 的 `uninstallVercelIntegration` 模式，在删除 Slack 集成时调用 Slack 的 `auth.revoke` API 使 token 失效
-6. **统一 state 验证机制**：将 Slack 的 state 也改为 JWT 签名方式，与 Vercel 对齐
-7. **审计日志**：对凭据的读取、解密操作记录审计日志，包含操作者、时间、目标集成
-8. **传输加密**：确保数据库连接使用 SSL/TLS（PostgreSQL `sslmode=require`）
-9. **密钥轮换**：实现 `ENCRYPTION_KEY` 轮换机制，新数据用新密钥加密，旧数据保留旧密钥版本标记（当前 version 字段已预留此能力）
+3. **API Key 改为哈希存储**：参考 PAT 的 `hashedToken` 模式，将 API Key 改为 SHA-256 哈希存储，仅在创建时返回明文
+4. **缩短 RevokedApiKey 宽限期**：将 24 小时宽限期缩短至 5-10 分钟，或实现优雅滚动轮换（先创建新 key，再废弃旧 key）
+5. **实现 Slack Token 自动刷新**：在 `getAuthenticatedClientForIntegration` 中实现基于 `refreshToken` 的自动刷新逻辑
+6. **集成删除时清理凭据**：在软删除 `OrganizationIntegration` 时，同步删除 `SecretStore` 和 `SecretReference` 中的记录
+7. **Slack 重装时查找并更新**：参考 Vercel 的 `createOrFindVercelIntegration` 模式，按 Slack team_id 查找已有集成并更新 token，而非创建新记录
+8. **Slack 撤销时调用 Slack API**：参考 Vercel 的 `uninstallVercelIntegration` 模式，在删除 Slack 集成时调用 Slack 的 `auth.revoke` API 使 token 失效
+9. **统一 state 验证机制**：将 Slack 的 state 也改为 JWT 签名方式，并在 payload 中绑定 userId，与 Vercel 对齐
+10. **审计日志**：对凭据的读取、解密操作记录审计日志，包含操作者、时间、目标集成
+11. **传输加密**：确保数据库连接使用 SSL/TLS（PostgreSQL `sslmode=require`）
+12. **密钥轮换**：实现 `ENCRYPTION_KEY` 轮换机制，新数据用新密钥加密，旧数据保留旧密钥版本标记（当前 version 字段已预留此能力）
 
 ---
 
-## 8. 代码索引
+## 9. 代码索引
 
 | 组件 | 文件路径 |
 |------|---------|
@@ -531,5 +767,8 @@ API 请求的认证链路（[apiAuth.server.ts](file:///d:/fz/0508-3/solo-dogfee
 | Vercel 连接路由 | [vercel.connect.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.connect.tsx) |
 | Slack 设置/撤销页 | [settings.integrations.slack.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.integrations.slack.tsx) |
 | Vercel 设置/撤销页 | [settings.integrations.vercel.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.integrations.vercel.tsx) |
+| Vercel Onboarding | [vercel.onboarding.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx) |
+| API Key 管理 | [api-key.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/api-key.server.ts) |
+| 环境查找（含 RevokedApiKey） | [runtimeEnvironment.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/runtimeEnvironment.server.ts) |
 | 环境变量定义 | [env.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/env.server.ts) |
 | 数据库 Schema | [schema.prisma](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/internal-packages/database/prisma/schema.prisma) |
