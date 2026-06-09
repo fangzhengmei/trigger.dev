@@ -822,74 +822,115 @@ API 请求
 | **JWT 细粒度** | 不适用 | 支持 `read:runs:run_xxx` 限定单 Run |
 | **跨环境** | 同组织可跨环境切换 | 不可，API Key 绑定单一环境 |
 
-### 11.5 Debug 日志过滤 — PG vs ClickHouse 后端差异（关键修正）
+### 11.5 五大入口的 Debug 日志可见性 — 逐入口实际传参追踪
 
-此前文档错误地声明"API 始终返回全部 Kind"，实际行为因方法和后端而异：
+此前文档将事件仓库方法的默认值与页面实际传参混淆。以下严格按每个入口的实际代码追踪，区分"方法签名默认值"和"调用方实际传入值"。
 
-#### `getRunEvents()`（被 API events 和日志下载调用）
+#### 入口 1：Run 详情页
 
-| 后端 | Debug 过滤机制 | 结果 |
-|------|---------------|------|
-| **PostgreSQL** | `findMany()` 未传 `includeDebugLogs` → 默认 `filterDebug=true` → `WHERE kind != 'LOG'` | ❌ Debug 日志被过滤 |
-| **ClickHouse** | 硬编码 `queryBuilder.where("kind != {kind: String}", { kind: "DEBUG_EVENT" })`（[L2088](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2088)） | ❌ Debug 日志被过滤 |
-
-**结论**：API events 端点在两种后端下都**不返回** debug 日志。
-
-#### `getTraceDetailedSummary()`（被 API trace 和 Run 详情页调用）
-
-| 后端 | Debug 过滤机制 | `includeDebugLogs` 未传时行为 | 结果 |
-|------|---------------|-------------------------------|------|
-| **PostgreSQL** | `findDetailedTraceEvents()` 未传 `includeDebugLogs` → 默认 `filterDebug=true` → `WHERE kind != 'LOG'` | `undefined` 等价 `false` → 过滤 | ❌ Debug 日志被过滤 |
-| **ClickHouse** | `if (options?.includeDebugLogs === false)` 条件判断（[L1863](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1863)） | `undefined !== false` → 不添加过滤条件 | ✅ **Debug 日志被包含** |
-
-**这是一个关键的后端行为不一致**：
-- PG 后端：`includeDebugLogs` 为 `undefined` 时等价 `false` → 过滤 debug
-- CH 后端：`includeDebugLogs` 仅在 `=== false` 时过滤，`undefined` 不触发 → 不过滤
-
-这意味着使用 ClickHouse 后端时，API trace 端点**默认返回 DEBUG_EVENT**，而 PostgreSQL 后端不返回。
-
-#### `getTraceSummary()`（被 Run 详情页 Span 树调用）
-
-| 后端 | `includeDebugLogs` 未传时行为 | 结果 |
-|------|-------------------------------|------|
-| **PostgreSQL** | `undefined` → `filterDebug=true` → `kind != 'LOG'` | ❌ 过滤 |
-| **ClickHouse** | `undefined !== false` → 不过滤（[L1292](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1292)） | ✅ 包含 |
-
-#### Dashboard Run 详情页的 `showDebug` 授权漏洞
-
-**代码**：[runs.$runParam/route.tsx L254](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.runs.$runParam/route.tsx#L254)
-
-```typescript
-const showDebug = url.searchParams.get("showDebug") === "true";
+**调用链**：
+```
+runs.$runParam/route.tsx L254
+  → showDebug = url.searchParams.get("showDebug") === "true"  // 无 Admin 检查
+  → RunPresenter.call({ showDebug })
+    → eventRepository.getTraceSummary(..., { includeDebugLogs: showDebug })  // L151-L158
 ```
 
-`showDebug` 从 URL query parameter 直接读取，**未经任何 Admin 权限检查**即传入 `RunPresenter.call({ showDebug })`。Debug Switch UI 仅在 `isAdmin` 时渲染，但 **任何认证用户都可通过手动添加 `?showDebug=true` 获取 debug 日志**。
+**实际传参**：`includeDebugLogs` = `showDebug` 的值（`true` / `false`），**不是** `undefined`
 
-影响范围：
-- **PG 后端**：`includeDebugLogs=true` → 不过滤 `kind=LOG` → **用户可看到 debug 日志**
-- **CH 后端**：`includeDebugLogs=true` → 不过滤 `DEBUG_EVENT` → **用户可看到 debug 日志**
+| 后端 | 普通用户（showDebug=false） | Admin/URL注入（showDebug=true） |
+|------|---------------------------|-------------------------------|
+| **PG** | `includeDebugLogs=false` → `filterDebug=true` → `kind != 'LOG'` → ❌ 无 Debug | `includeDebugLogs=true` → 不过滤 → ✅ 有 Debug |
+| **CH** | `includeDebugLogs=false` → `=== false` 成立 → `kind != 'DEBUG_EVENT'` → ❌ 无 Debug | `includeDebugLogs=true` → 不过滤 → ✅ 有 Debug |
 
-这是一个**服务端授权缺失**：UI 层的 admin 检查可被绕过。
+**修正**：此前文档称 CH 后端 `getTraceSummary` 在 `includeDebugLogs=undefined` 时默认返回 Debug——这在 **API trace** 场景成立（入口 4），但 **Run 详情页实际传入 `false`**（`showDebug` 默认值为 `"true" === "true"` 即 `false`），因此 CH 后端下 Run 详情页**不返回** Debug 日志（除非 `?showDebug=true`）。
 
-### 11.6 日志下载鉴权（修正版）
+**授权漏洞**：`showDebug` 从 URL 直接读取无 Admin 检查。普通用户加 `?showDebug=true` 即可获取 Debug 日志，两种后端均受影响。
+
+#### 入口 2：Span 详情侧栏
+
+**调用链**：
+```
+resources.orgs....spans.$spanParam/route.tsx L121
+  → SpanPresenter.call({ userId, projectSlug, spanId, runFriendlyId, linkedRunId })
+    → #getSpan() L587-L594
+      → eventRepository.getSpan(..., { includeDebugLogs: true })  // 硬编码 true！
+```
+
+**实际传参**：`includeDebugLogs` = `true`（硬编码），**与角色无关、与 showDebug 无关**
+
+| 后端 | 普通用户 | Admin | 说明 |
+|------|---------|-------|------|
+| **PG** | ✅ 有 Debug | ✅ 有 Debug | `includeDebugLogs=true` → `filterDebug=false` → 不过滤 `kind=LOG` |
+| **CH** | ✅ 有 Debug | ✅ 有 Debug | **`getSpan()` 不使用 `includeDebugLogs` 参数**（见下方分析） |
+
+**ClickHouse `getSpan()` 的 `includeDebugLogs` 参数未被使用**：
+
+CH 的 [getSpan()](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1365-L1403) 方法签名接受 `options?: { includeDebugLogs?: boolean }`，但方法体中**从未检查此参数**——没有 `if (options?.includeDebugLogs === false)` 判断，也没有 `kind != 'DEBUG_EVENT'` 过滤。查询 `spanDetailsQueryBuilder` 返回所有 kind 的记录，不做 Debug 过滤。
+
+这意味着 CH 后端下 `getSpan()` **始终返回所有 kind（含 DEBUG_EVENT）**，与 `includeDebugLogs` 的值无关。
+
+**对比 PG 后端**：PG 的 `getSpan()` 通过 `#getSpanEvent()` → `findMany()` 实际传递 `options`，`includeDebugLogs=true` 时不过滤 `kind=LOG`。
+
+**结论**：两种后端下 Span 详情侧栏**始终包含 Debug 日志**，但原因不同——PG 是参数生效（硬编码 true），CH 是参数根本未被使用。
+
+#### 入口 3：API events（`GET /api/v1/runs/:runId/events`）
+
+**调用链**：
+```
+api.v1.runs.$runId.events.ts L43
+  → eventRepository.getRunEvents(storeTable, envId, traceId, runId, createdAt, completedAt)
+  // 未传 options 参数 — getRunEvents 签名不接受 includeDebugLogs
+```
+
+**实际传参**：`getRunEvents()` 无 `options` 参数——该方法的签名不接受 `includeDebugLogs`
+
+| 后端 | API 调用方 | 说明 |
+|------|-----------|------|
+| **PG** | ❌ 无 Debug | `findMany()` 未传 `options` → 默认 `filterDebug=true` → `kind != 'LOG'` |
+| **CH** | ❌ 无 Debug | 硬编码 `kind != 'DEBUG_EVENT'`（[L2088](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2088)） |
+
+**结论**：两种后端下 API events **均不返回** Debug 日志。
+
+#### 入口 4：API trace（`GET /api/v1/runs/:runId/trace`）
+
+**调用链**：
+```
+api.v1.runs.$runId.trace.ts L48
+  → eventRepository.getTraceDetailedSummary(storeTable, envId, traceId, createdAt, completedAt)
+  // 未传 options 参数 → includeDebugLogs = undefined
+```
+
+**实际传参**：`includeDebugLogs` = `undefined`（未传 `options`）
+
+| 后端 | API 调用方 | 说明 |
+|------|-----------|------|
+| **PG** | ❌ 无 Debug | `undefined` → `findDetailedTraceEvents` 默认 `filterDebug=true` → `kind != 'LOG'` |
+| **CH** | ✅ **有 Debug** | `undefined !== false` → 不添加 `kind != 'DEBUG_EVENT'` 过滤（[L1863](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1863)） |
+
+**这是 PG/CH 行为不一致的关键入口**：API trace 在 CH 后端下**默认返回 DEBUG_EVENT**，PG 不返回。API 调用方无法控制此行为。
+
+#### 入口 5：日志下载（`GET /resources/runs/:runParam/logs/download`）
+
+**调用链**：
+```
+resources.runs.$runParam.logs.download.ts L38
+  → eventRepository.getRunEvents(storeTable, envId, traceId, runId, createdAt, completedAt)
+  // 未传 options 参数 — 同入口 3
+  → 遍历结果:
+    if (!user.admin && event.kind === TaskEventKind.LOG) return; // 应用层过滤
+```
+
+| 后端 | Admin | 普通组织成员 | 说明 |
+|------|-------|-------------|------|
+| **PG** | ❌ 无 Debug（第1层已过滤） | ❌ 无 Debug（第1层已过滤，第2层冗余） | `kind=LOG` 在查询层已不存在 |
+| **CH** | ❌ 无 Debug（第1层已过滤） | ❌ 无 Debug（第1层已过滤，第2层失效） | `kind=UNSPECIFIED` ≠ `TaskEventKind.LOG`，但 DEBUG_EVENT 已在第1层过滤 |
+
+CH 后端第2层过滤失效：`#spanSummaryToRunPreparedEvent()` 硬编码 `kind: "UNSPECIFIED"`（[L2161](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2161)），导致 `event.kind === TaskEventKind.LOG` 永远不匹配。实际无安全影响——第1层已过滤 DEBUG_EVENT。
+
+### 11.6 日志下载鉴权
 
 **代码**：[resources.runs.$runParam.logs.download.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/resources.runs.$runParam.logs.download.ts)
-
-```
-Session 认证（requireUser）
-  → prisma.taskRun.findFirst({
-      where: {
-        friendlyId: runParam,
-        project: { organization: { members: { some: { userId: user.id } } } }
-      }
-    })
-  → eventRepository.getRunEvents() — 两种后端均过滤 Debug
-  → 遍历事件时:
-    if (!user.admin && event.kind === TaskEventKind.LOG) {
-      return; // 非 Admin 跳过 LOG 类型事件
-    }
-  → Gzip 流式输出
-```
 
 #### 日志下载访问权限边界
 
@@ -901,36 +942,9 @@ Session 认证（requireUser）
 | `logsDeletedAt` | ❌ **未检查** | 已删除日志仍可下载 |
 | 环境/项目隔离 | ⚠️ 间接 | 通过 `findFirst` 的组织 JOIN 间接限制 |
 
-**关键边界问题**：
-1. **Feature Flag 绕过**：日志页面要求 `hasLogsPageAccess` Flag，但日志下载资源路由位于 `resources.` 命名空间（非 `_app.` 布局），有独立的认证逻辑，**不检查此 Flag**。知道下载 URL 的用户可绕过日志页面的 Feature Flag 限制。
-2. **已删除日志可下载**：`getRunEvents()` 不检查 `logsDeletedAt`，已删除日志仍可通过下载获取。
-
-#### 日志下载的 Debug 日志双重过滤
-
-| 过滤层 | PG 后端 | CH 后端 |
-|--------|---------|---------|
-| **第 1 层**：`getRunEvents()` 查询 | `WHERE kind != 'LOG'`（已过滤） | `WHERE kind != 'DEBUG_EVENT'`（已过滤） |
-| **第 2 层**：应用层 `event.kind === TaskEventKind.LOG` | 冗余（第 1 层已过滤） | **无效**（CH 返回的 `kind` 为 `"UNSPECIFIED"`） |
-
-**CH 后端的关键发现**：ClickHouse 的 `getRunEvents()` 将 SpanSummary 转为 `RunPreparedEvent` 时，`kind` 硬编码为 `"UNSPECIFIED"`（[L2161](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2161)）：
-
-```typescript
-#spanSummaryToRunPreparedEvent(span: SpanSummary): RunPreparedEvent {
-  return {
-    ...
-    kind: "UNSPECIFIED",  // 硬编码！
-    ...
-  };
-}
-```
-
-这意味着应用层的 `event.kind === TaskEventKind.LOG` 检查在 CH 后端下**永远不匹配**——不是因为它通过了 debug 事件，而是因为 `DEBUG_EVENT` 已在第 1 层被过滤掉了，而所有通过第 1 层的事件都被标为 `UNSPECIFIED`。
-
-**结论**：日志下载在两种后端下都不包含 debug 日志，但原因不同——PG 是双重过滤，CH 是查询层过滤 + 应用层检查失效（但无实际影响，因为查询层已过滤）。
-
 ---
 
-## 12. 不同角色能看到哪些事件或日志 — 完整矩阵（修正版）
+## 12. Debug 日志角色可见性矩阵（核正确版）
 
 ### 12.1 角色定义
 
@@ -938,78 +952,78 @@ Session 认证（requireUser）
 |------|---------|------|
 | **平台 Admin** | `user.admin === true` | 平台超级管理员 |
 | **冒充会话** | `getImpersonationId(request)` 有值 | Admin 以他人身份操作 |
-| **组织成员（有 Flag）** | `OrganizationMember` + `hasLogsPageAccess=true` | 可访问日志页 |
-| **组织成员（无 Flag）** | `OrganizationMember` + `hasLogsPageAccess` 为 false/缺失 | 不可访问日志页 |
+| **普通组织成员** | `OrganizationMember` 记录存在 | 通过 `findProjectBySlug` 验证 |
 | **API 调用方** | API Key / JWT / PAT | 绑定到 RuntimeEnvironment |
-| **非成员** | 无 OrganizationMember 记录 | 被拒之门外 |
 
-### 12.2 矩阵 A：页面访问权限
+### 12.2 矩阵：五入口 × 三角色 × 两后端
+
+#### Run 详情页（getTraceSummary，includeDebugLogs = showDebug）
+
+| 角色 | PG 后端 | CH 后端 | 说明 |
+|------|---------|---------|------|
+| 普通组织成员 | ❌ 无 Debug | ❌ 无 Debug | `showDebug` 默认 `false`，两种后端均过滤 |
+| Admin | ✅ 有 Debug（showDebug=true） | ✅ 有 Debug（showDebug=true） | 通过 Debug Switch 或 URL 参数 |
+| ⚠️ URL 注入 | ✅ 有 Debug | ✅ 有 Debug | **任何用户**加 `?showDebug=true` 即可绕过 UI 限制 |
+
+#### Span 详情侧栏（getSpan，includeDebugLogs = true 硬编码）
+
+| 角色 | PG 后端 | CH 后端 | 说明 |
+|------|---------|---------|------|
+| 普通组织成员 | ✅ **有 Debug** | ✅ **有 Debug** | 硬编码 `includeDebugLogs=true`（PG）/ 参数未使用（CH） |
+| Admin | ✅ 有 Debug | ✅ 有 Debug | 同上 |
+
+**修正**：此前文档未识别出 Span 侧栏对**所有用户**均可见 Debug 日志。
+
+#### API events（getRunEvents，无 includeDebugLogs 参数）
+
+| 角色 | PG 后端 | CH 后端 | 说明 |
+|------|---------|---------|------|
+| API 调用方 | ❌ 无 Debug | ❌ 无 Debug | 两种后端均硬编码过滤 |
+
+#### API trace（getTraceDetailedSummary，includeDebugLogs = undefined）
+
+| 角色 | PG 后端 | CH 后端 | 说明 |
+|------|---------|---------|------|
+| API 调用方 | ❌ 无 Debug | ✅ **有 Debug** | PG 默认过滤，CH 不过滤（`undefined !== false`） |
+
+#### 日志下载（getRunEvents + 应用层 kind 检查）
+
+| 角色 | PG 后端 | CH 后端 | 说明 |
+|------|---------|---------|------|
+| 普通组织成员 | ❌ 无 Debug | ❌ 无 Debug | 查询层已过滤 |
+| Admin | ❌ 无 Debug | ❌ 无 Debug | 查询层已过滤（应用层检查冗余/失效） |
+
+### 12.3 合规审计发现的安全边界问题汇总
+
+| 编号 | 问题 | 严重度 | 影响 |
+|------|------|--------|------|
+| AUD-1 | `showDebug` URL 参数无服务端 Admin 检查 | 高 | 任何认证用户可通过 `?showDebug=true` 获取 debug 日志（PG/CH 均受影响） |
+| AUD-2 | CH `getTraceDetailedSummary` 在 `includeDebugLogs=undefined` 时不过滤 | 高 | API trace 在 CH 后端下默认返回 DEBUG_EVENT |
+| AUD-3 | CH `getSpan()` 忽略 `includeDebugLogs` 参数 | 中 | Span 侧栏对所有用户均返回 Debug 日志，无法按角色控制 |
+| AUD-4 | Span 侧栏硬编码 `includeDebugLogs=true` | 中 | 普通用户在 Span 详情中始终可见 Debug 日志 |
+| AUD-5 | 日志下载路由不检查 `hasLogsPageAccess` Feature Flag | 中 | 无 Flag 用户可通过直接 URL 下载日志 |
+| AUD-6 | 日志下载和 API 不检查 `logsDeletedAt` | 中 | 已删除日志仍可通过下载和 API 获取 |
+| AUD-7 | CH `getRunEvents()` 返回 `kind: "UNSPECIFIED"` 导致应用层 kind 检查失效 | 低 | 当前无实际影响（查询层已过滤），但代码意图与实现不一致 |
+
+### 12.4 页面访问权限矩阵
 
 | 页面 | 平台 Admin | 冒充会话 | 组织成员(有Flag) | 组织成员(无Flag) | 非成员 |
 |------|-----------|----------|-----------------|-----------------|--------|
 | 首页 Activity 图 | ✅ | ✅ | ✅ | ✅ | ❌ 404 |
 | Run 详情页 | ✅ | ✅ | ✅ | ✅ | ❌ 404 |
-| Span 详情页 | ✅ | ✅ | ✅ | ✅ | ❌ 404 |
+| Span 详情侧栏 | ✅ | ✅ | ✅ | ✅ | ❌ 404 |
 | 日志页面 | ✅ 直接放行 | ✅ 直接放行 | ✅ Flag放行 | ❌ 重定向首页 | ❌ 重定向首页 |
-
-### 12.3 矩阵 B：下载资源权限
-
-| 资源 | 平台 Admin | 冒充会话 | 组织成员(有Flag) | 组织成员(无Flag) | 非成员 |
-|------|-----------|----------|-----------------|-----------------|--------|
 | 日志下载 | ✅ | ✅ | ✅ **不检查Flag** | ✅ **不检查Flag** | ❌ 404 |
 
-**边界问题**：日志下载路由不检查 `hasLogsPageAccess` Flag，无 Flag 的组织成员仍可直接通过下载 URL 获取日志。
-
-### 12.4 矩阵 C：API 导出权限
+### 12.5 API 导出权限矩阵
 
 | API 端点 | API Key (PRIVATE) | JWT (限定 scope) | PAT | 无凭据 |
 |----------|-------------------|------------------|-----|--------|
 | `GET /api/v1/runs/:id/events` | ✅ 读该环境 Run | ✅ scope 匹配时 | ✅ | ❌ 401 |
 | `GET /api/v1/runs/:id/trace` | ✅ 读该环境 Run | ✅ scope 匹配时 | ✅ | ❌ 401 |
+| `GET /api/v1/runs/:id/spans/:spanId` | ✅ 读该环境 Run | ✅ scope 匹配时 | ✅ | ❌ 401 |
 
-### 12.5 矩阵 D：Debug 日志可见性 — 按存储后端和调用方法
-
-#### `getRunEvents()`（API events + 日志下载）
-
-| 后端 | 任何角色 | 说明 |
-|------|---------|------|
-| **PostgreSQL** | ❌ 不返回 | `findMany()` 默认 `filterDebug=true` → `kind != 'LOG'` |
-| **ClickHouse** | ❌ 不返回 | 硬编码 `kind != 'DEBUG_EVENT'` |
-
-#### `getTraceDetailedSummary()`（API trace）
-
-| 后端 | `includeDebugLogs` | Admin / `?showDebug=true` | 普通用户 (无 showDebug) |
-|------|-------------------|---------------------------|----------------------|
-| **PostgreSQL** | `undefined` / `false` | ❌ 不返回 | ❌ 不返回 |
-| **PostgreSQL** | `true` | ✅ 返回 | — |
-| **ClickHouse** | `undefined` | ✅ **默认返回** | ✅ **默认返回** |
-| **ClickHouse** | `false` | ❌ 不返回 | ❌ 不返回 |
-| **ClickHouse** | `true` | ✅ 返回 | — |
-
-#### `getSpan()`（Run 详情页 Span 侧栏）
-
-| 后端 | `includeDebugLogs` | 结果 |
-|------|-------------------|------|
-| **PostgreSQL** | `true` | ✅ 返回 Debug 相关 span 详情 |
-| **ClickHouse** | `true` | ✅ 返回 Debug 相关 span 详情 |
-
-Span 详情 Presenter 调用 `getSpan(..., { includeDebugLogs: true })`，不使用 URL 的 `showDebug` 参数，因此这里应与 API trace 分开看。
-
-#### `getTraceSummary()`（Run 详情页 Span 树）
-
-| 后端 | `includeDebugLogs` | Admin (showDebug=true) | 普通用户 (默认) |
-|------|-------------------|------------------------|----------------|
-| **PostgreSQL** | `undefined` / `false` | ❌ 不返回 | ❌ 不返回 |
-| **PostgreSQL** | `true` | ✅ 返回 | — |
-| **ClickHouse** | `undefined` | ✅ **默认返回** | ✅ **默认返回** |
-| **ClickHouse** | `false` | ❌ 不返回 | ❌ 不返回 |
-
-#### 日志下载应用层过滤
-
-| 后端 | Admin | 普通组织成员 | 说明 |
-|------|-------|-------------|------|
-| **PostgreSQL** | 已在第1层过滤，第2层冗余 | 同左 | `kind=LOG` 在第1层已不存在 |
-| **ClickHouse** | 已在第1层过滤，第2层无效 | 同左 | `kind=UNSPECIFIED` ≠ `TaskEventKind.LOG`，但 `DEBUG_EVENT` 在第1层已不存在 |
+**补充发现**：API spans 端点 (`api.v1.runs.$runId.spans.$spanId.ts`) 调用 `getSpan()` 未传 options → `includeDebugLogs=undefined`。PG 后端因 `filterDebug` 默认为 true 而过滤 debug；CH 后端因 `getSpan()` 从未检查 `includeDebugLogs` 而返回全部事件（含 debug）。此端点也存在与 Span 侧栏相同的 CH 后端 debug 泄露问题。
 
 ### 12.6 已删除日志可见性
 
@@ -1092,16 +1106,6 @@ authorization: {
 
 这意味着 JWT scope 为 `read:runs:run_abc`、`read:tasks:my-task`、`read:tags:my-tag` 或 `read:all` 中的任一个均可通过授权。
 
-### 12.10 合规审计发现的安全边界问题汇总
-
-| 编号 | 问题 | 严重度 | 影响 |
-|------|------|--------|------|
-| AUD-1 | `showDebug` URL 参数无服务端 Admin 检查 | 高 | 任何认证用户可通过 `?showDebug=true` 获取 debug 日志 |
-| AUD-2 | CH 后端 `getTraceDetailedSummary` / `getTraceSummary` 的 `includeDebugLogs === false` 判断不一致 | 高 | CH 后端下 API trace 默认返回 DEBUG_EVENT，PG 不返回 |
-| AUD-3 | 日志下载路由不检查 `hasLogsPageAccess` Feature Flag | 中 | 无 Flag 用户可通过直接 URL 下载日志 |
-| AUD-4 | 日志下载和 API 不检查 `logsDeletedAt` | 中 | 已删除日志仍可通过下载和 API 获取 |
-| AUD-5 | CH `getRunEvents()` 返回 `kind: "UNSPECIFIED"` 导致应用层 kind 检查失效 | 低 | 当前无实际影响（第1层已过滤），但代码意图与实现不一致 |
-
 ---
 
 ## 13. 补充代码文件索引
@@ -1121,6 +1125,10 @@ authorization: {
 | [impersonation.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/services/impersonation.server.ts) | 冒充会话 ID 管理 |
 | [api.v1.runs.$runId.events.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.events.ts) | API 事件列表端点 |
 | [api.v1.runs.$runId.trace.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.trace.ts) | API Trace 详情端点 |
+| [api.v1.runs.$runId.spans.$spanId.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/routes/api.v1.runs.$runId.spans.$spanId.ts) | API Span 详情端点 |
+| [SpanPresenter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/SpanPresenter.server.ts) | Span 详情 Presenter（硬编码 includeDebugLogs=true） |
+| [RunPresenter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/presenters/v3/RunPresenter.server.ts) | Run 详情 Presenter（showDebug 参数传递） |
+| [clickhouseEventRepository.server.ts L1365-L1403](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1365-L1403) | CH getSpan 方法（includeDebugLogs 死参数） |
 | [clickhouseEventRepository.server.ts L2088](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2088) | CH getRunEvents 硬编码 DEBUG_EVENT 过滤 |
 | [clickhouseEventRepository.server.ts L2161](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L2161) | CH getRunEvents kind 硬编码 UNSPECIFIED |
 | [clickhouseEventRepository.server.ts L1863](file:///d:/fz/0508-3/solo-dogfeeding/code/193-trigger.dev/apps/webapp/app/v3/eventRepository/clickhouseEventRepository.server.ts#L1863) | CH getTraceDetailedSummary includeDebugLogs === false 检查 |
