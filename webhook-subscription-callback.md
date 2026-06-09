@@ -36,7 +36,7 @@ trigger.dev 的 webhook 通知体系由两条主线组成：
 
 ### 2.1 API 入口
 
-**文件**: [api.v1.projects.$projectRef.alertChannels.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/routes/api.v1.projects.$projectRef.alertChannels.ts#L17-L95)
+**文件**: [api.v1.projects.$projectRef.alertChannels.ts](apps/webapp/app/routes/api.v1.projects.$projectRef.alertChannels.ts#L17-L95)
 
 - **路由**: `POST /api/v1/projects/:projectRef/alertChannels`
 - **认证**: Personal Access Token (`authenticateApiRequestWithPersonalAccessToken`)
@@ -45,7 +45,7 @@ trigger.dev 的 webhook 通知体系由两条主线组成：
 
 ### 2.2 服务层：CreateAlertChannelService
 
-**文件**: [createAlertChannel.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts#L37-L103)
+**文件**: [createAlertChannel.server.ts](apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts#L37-L103)
 
 关键逻辑：
 
@@ -62,11 +62,11 @@ trigger.dev 的 webhook 通知体系由两条主线组成：
    ```
    - 如果集成方未提供 secret，系统自动用 `nanoid()` 生成一个
    - Secret 使用 `ENCRYPTION_KEY` 加密后存储到 DB
-   - **默认版本为 `v2`**（虽然 schema 中 `version` 默认值为 `"v1"`，但 `CreateAlertChannelService` 在创建时硬编码为 `"v2"`）
+   - **channel properties 中的 `version` 字段被硬编码为 `"v2"`**（虽然 `ProjectAlertWebhookProperties` Zod schema 中 `version` 默认值为 `"v1"`，但 `CreateAlertChannelService` 在创建时显式设为 `"v2"`）
 
 ### 2.3 数据模型：ProjectAlertChannel
 
-**文件**: [schema.prisma](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/internal-packages/database/prisma/schema.prisma#L2299-L2331)
+**文件**: [schema.prisma](internal-packages/database/prisma/schema.prisma#L2299-L2331)
 
 ```
 ProjectAlertChannel {
@@ -100,18 +100,18 @@ ProjectAlertChannel {
 
 | 事件类型 | 触发位置 | 入队 Job |
 |----------|----------|----------|
-| Task Run 失败 | [finalizeTaskRun.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/finalizeTaskRun.server.ts#L149) | `v3.performTaskRunAlerts` |
-| Task Run 失败 (runEngine) | [runEngineHandlers.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/runEngineHandlers.server.ts#L83) | `v3.performTaskRunAlerts` |
-| 部署失败 | [failDeployment.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/failDeployment.server.ts#L69) | `v3.performDeploymentAlerts` |
-| 部署超时 | [timeoutDeployment.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/timeoutDeployment.server.ts#L66) | `v3.performDeploymentAlerts` |
-| 部署成功 | [finalizeDeployment.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/finalizeDeployment.server.ts#L148) | `v3.performDeploymentAlerts` |
-| 部署索引失败 | [deploymentIndexFailed.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/deploymentIndexFailed.server.ts#L92) | `v3.performDeploymentAlerts` |
-| 部署成功(Worker V3) | [createDeploymentBackgroundWorkerV3.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts#L212) | `v3.performDeploymentAlerts` |
-| 错误组告警 | [errorAlertEvaluator.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts) | `v3.deliverErrorGroupAlert` |
+| Task Run 失败 | [finalizeTaskRun.server.ts](apps/webapp/app/v3/services/finalizeTaskRun.server.ts#L149) | `v3.performTaskRunAlerts` |
+| Task Run 失败 (runEngine) | [runEngineHandlers.server.ts](apps/webapp/app/v3/runEngineHandlers.server.ts#L83) | `v3.performTaskRunAlerts` |
+| 部署失败 | [failDeployment.server.ts](apps/webapp/app/v3/services/failDeployment.server.ts#L69) | `v3.performDeploymentAlerts` |
+| 部署超时 | [timeoutDeployment.server.ts](apps/webapp/app/v3/services/timeoutDeployment.server.ts#L66) | `v3.performDeploymentAlerts` |
+| 部署成功 | [finalizeDeployment.server.ts](apps/webapp/app/v3/services/finalizeDeployment.server.ts#L148) | `v3.performDeploymentAlerts` |
+| 部署索引失败 | [deploymentIndexFailed.server.ts](apps/webapp/app/v3/services/deploymentIndexFailed.server.ts#L92) | `v3.performDeploymentAlerts` |
+| 部署成功(Worker V3) | [createDeploymentBackgroundWorkerV3.server.ts](apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts#L212) | `v3.performDeploymentAlerts` |
+| 错误组告警 | [errorAlertEvaluator.server.ts](apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts) | `v3.deliverErrorGroupAlert` |
 
 ### 3.2 PerformTaskRunAlertsService
 
-**文件**: [performTaskRunAlerts.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/performTaskRunAlerts.server.ts#L13-L48)
+**文件**: [performTaskRunAlerts.server.ts](apps/webapp/app/v3/services/alerts/performTaskRunAlerts.server.ts#L13-L48)
 
 1. 查找 TaskRun，获取 `projectId` 和 `runtimeEnvironment.type`
 2. 在 DB 中查找匹配的 AlertChannel：`projectId` + `alertTypes has TASK_RUN` + `environmentTypes has <环境类型>` + `enabled = true`
@@ -119,13 +119,13 @@ ProjectAlertChannel {
 
 ### 3.3 PerformDeploymentAlertsService
 
-**文件**: [performDeploymentAlerts.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/performDeploymentAlerts.server.ts#L6-L57)
+**文件**: [performDeploymentAlerts.server.ts](apps/webapp/app/v3/services/alerts/performDeploymentAlerts.server.ts#L6-L57)
 
 逻辑类似，根据部署状态（`DEPLOYED` / 非 `DEPLOYED`）决定 alertType 为 `DEPLOYMENT_SUCCESS` 或 `DEPLOYMENT_FAILURE`。
 
 ### 3.4 错误组告警评估器
 
-**文件**: [errorAlertEvaluator.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts)
+**文件**: [errorAlertEvaluator.server.ts](apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts)
 
 - **周期性自调度**：通过 `selfChain()` 在每次评估结束后将自己重新入队，默认间隔 5 分钟（300,000ms）
 - 查询 ClickHouse 获取活跃错误，分类为 `new_issue` / `regression` / `unignored`
@@ -137,7 +137,7 @@ ProjectAlertChannel {
 
 ### 4.1 AlertsWorker
 
-**文件**: [alertsWorker.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/alertsWorker.server.ts#L13-L141)
+**文件**: [alertsWorker.server.ts](apps/webapp/app/v3/alertsWorker.server.ts#L13-L141)
 
 基于 `@trigger.dev/redis-worker` 的 `RedisWorker`，使用 Redis 作为消息队列。
 
@@ -146,10 +146,10 @@ ProjectAlertChannel {
 | Job | 用途 | visibilityTimeoutMs | retry.maxAttempts |
 |-----|------|---------------------|-------------------|
 | `v3.performTaskRunAlerts` | 查找匹配 channel 并创建告警 | 60,000 (60s) | 3 |
-| `v3.performDeploymentAlerts` | 查找匹配 channel 并创建告警 | 60,000 | 3 |
-| `v3.deliverAlert` | 实际递送告警 | 60,000 | 3 |
+| `v3.performDeploymentAlerts` | 查找匹配 channel 并创建告警 | 60,000 (60s) | 3 |
+| `v3.deliverAlert` | 实际递送告警 | 60,000 (60s) | 3 |
 | `v3.evaluateErrorAlerts` | 错误组评估 | 300,000 (5min) | 3 |
-| `v3.deliverErrorGroupAlert` | 递送错误组告警 | 60,000 | 3 |
+| `v3.deliverErrorGroupAlert` | 递送错误组告警 | 60,000 (60s) | 3 |
 
 **并发配置**（通过环境变量）：
 
@@ -163,7 +163,7 @@ ProjectAlertChannel {
 
 ### 4.2 消息入队与去重
 
-**文件**: [deliverAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1266-L1335)
+**文件**: [deliverAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1266-L1335)
 
 `DeliverAlertService.enqueue()` 使用 `alert:{alertId}` 作为去重 ID 入队，确保同一 alert 不会被重复处理。
 
@@ -174,7 +174,7 @@ ProjectAlertChannel {
 
 ### 4.3 GCRA 速率限制器
 
-**文件**: [GCRARateLimiter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/GCRARateLimiter.server.ts)
+**文件**: [GCRARateLimiter.server.ts](apps/webapp/app/v3/GCRARateLimiter.server.ts)
 
 使用 Generic Cell Rate Algorithm (GCRA) 实现，基于 Redis Lua 脚本原子执行。
 
@@ -185,7 +185,7 @@ ProjectAlertChannel {
 | `ALERT_RATE_LIMITER_EMISSION_INTERVAL` | 2,500ms | 最小请求间隔 |
 | `ALERT_RATE_LIMITER_BURST_TOLERANCE` | 10,000ms | 突发容忍度 |
 
-**重要：速率限制仅对非 WEBHOOK 类型生效**（见 [deliverAlert.server.ts#L1295-L1319](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1295-L1319)）：
+**重要：速率限制仅对非 WEBHOOK 类型生效**（见 [deliverAlert.server.ts#L1295-L1319](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1295-L1319)）：
 
 ```ts
 if (taskRunId && channelType !== "WEBHOOK") {
@@ -204,7 +204,7 @@ if (taskRunId && channelType !== "WEBHOOK") {
 
 ### 5.1 DeliverAlertService
 
-**文件**: [deliverAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L103-L198)
+**文件**: [deliverAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L103-L198)
 
 1. 从 DB 加载 alert 记录，**如果状态不是 `PENDING` 则直接返回**（防止重复递送）
 2. 根据 channel 类型分发：`EMAIL` / `SLACK` / `WEBHOOK`
@@ -213,7 +213,7 @@ if (taskRunId && channelType !== "WEBHOOK") {
 
 ### 5.2 #deliverWebhook() — 核心递送方法
 
-**文件**: [deliverAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L931-L970)
+**文件**: [deliverAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L931-L970)
 
 ```ts
 async #deliverWebhook<T>(payload: T, webhook: ProjectAlertWebhookProperties) {
@@ -260,13 +260,13 @@ async #deliverWebhook<T>(payload: T, webhook: ProjectAlertWebhookProperties) {
 
 ### 5.3 错误组告警递送
 
-**文件**: [deliverErrorGroupAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverErrorGroupAlert.server.ts#L197-L263)
+**文件**: [deliverErrorGroupAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverErrorGroupAlert.server.ts#L197-L263)
 
 递送逻辑与 `#deliverWebhook()` 完全一致：同样的签名算法、同样的超时时间、同样的成功判定标准。
 
 ### 5.4 Webhook Payload 格式
 
-**文件**: [webhooks.ts (core schemas)](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/core/src/v3/schemas/webhooks.ts)
+**文件**: [webhooks.ts (core schemas)](packages/core/src/v3/schemas/webhooks.ts)
 
 使用 Zod discriminated union 定义四种 webhook 类型：
 
@@ -277,7 +277,9 @@ async #deliverWebhook<T>(payload: T, webhook: ProjectAlertWebhookProperties) {
 | `alert.deployment.failed` | 部署失败 | `AlertWebhookDeploymentFailedObject` |
 | `alert.error` | 错误组告警 | `AlertWebhookErrorGroupObject` |
 
-公共字段：`id` (alert ID)、`created` (创建时间)、`webhookVersion` (固定 "v1")
+公共字段：`id` (alert ID)、`created` (创建时间)、`webhookVersion` (硬编码为 `"v1"`)
+
+> **关于 `webhookVersion` 字段**：在 `DeliverAlertService.#sendWebhook()` 构建 v2 格式的 payload 时，`webhookVersion` 字段被硬编码为 `"v1"`（见 [deliverAlert.server.ts#L393](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L393) 和 [#L609](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L609)）。这里的 `webhookVersion` 是 payload 中的协议版本标识，始终为 `"v1"`，与 channel properties 中的 `version` 字段（控制 payload 结构为 v1 还是 v2 格式）是两个不同的概念。
 
 ---
 
@@ -285,7 +287,7 @@ async #deliverWebhook<T>(payload: T, webhook: ProjectAlertWebhookProperties) {
 
 ### 6.1 发送端签名生成
 
-签名流程（见 [#deliverWebhook()](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L931-L970)）：
+签名流程（见 [deliverAlert.server.ts#L931-L970](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L931-L970)）：
 
 1. 将 payload JSON 序列化为字符串
 2. 将 secret 解密
@@ -295,7 +297,7 @@ async #deliverWebhook<T>(payload: T, webhook: ProjectAlertWebhookProperties) {
 
 ### 6.2 接收端验证（SDK）
 
-**文件**: [webhooks.ts (SDK)](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/trigger-sdk/src/v3/webhooks.ts#L58-L109)
+**文件**: [webhooks.ts (SDK)](packages/trigger-sdk/src/v3/webhooks.ts#L58-L109)
 
 集成方可以使用 SDK 提供的 `webhooks.constructEvent()` 验证签名：
 
@@ -330,7 +332,7 @@ const event = await webhooks.constructEvent(request, "webhook_secret");
 
 ### 7.2 Worker 重试机制
 
-**文件**: [worker.ts (redis-worker)](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/worker.ts#L897-L993)
+**文件**: [worker.ts (redis-worker)](packages/redis-worker/src/worker.ts#L897-L993)
 
 当 `processItem` 失败时：
 
@@ -342,10 +344,11 @@ const event = await webhooks.constructEvent(request, "webhook_secret");
 
 ### 7.3 退避算法
 
-**文件**: [retries.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/core/src/v3/utils/retries.ts#L29-L44)
+**文件**: [retries.ts](packages/core/src/v3/utils/retries.ts#L29-L44)
 
 ```ts
 export function calculateNextRetryDelay(options: RetryOptions, attempt: number) {
+  const opts = { ...defaultRetryOptions, ...options };
   if (attempt >= opts.maxAttempts) return;
   const random = randomize ? Math.random() + 1 : 1;
   const timeout = Math.min(maxTimeoutInMs, random * minTimeoutInMs * Math.pow(factor, attempt - 1));
@@ -353,25 +356,38 @@ export function calculateNextRetryDelay(options: RetryOptions, attempt: number) 
 }
 ```
 
-**Alerts Worker 的具体配置**：
+**Alerts Worker 的实际重试配置**：
 
-| 参数 | 值 | 说明 |
-|------|----|------|
-| maxAttempts | 3 | 最多重试 3 次 |
-| factor | 2 (默认) | 指数因子 |
-| minTimeoutInMs | 1,000 (默认) | 最小延迟 1 秒 |
-| maxTimeoutInMs | 60,000 (默认) | 最大延迟 60 秒 |
-| randomize | true (默认) | 随机抖动 |
+Alerts Worker catalog 中每个 job 仅指定了 `retry: { maxAttempts: 3 }`。Worker 的 `processItem` 在计算重试延迟时，将 catalog 的 retry 配置展开覆盖到 Worker 的 `defaultRetrySettings` 上：
+
+```ts
+const retrySettings = {
+  ...defaultRetrySettings,   // Worker 内置默认值
+  ...catalogItem?.retry,     // catalog 覆盖
+};
+```
+
+Worker 的 `defaultRetrySettings` 定义（见 [worker.ts#L97-L105](packages/redis-worker/src/worker.ts#L97-L105)）：
+
+| 参数 | Worker 默认值 | Alerts catalog 覆盖 | 最终生效值 |
+|------|--------------|---------------------|-----------|
+| maxAttempts | 12 | 3 | **3** |
+| factor | 2 | (未覆盖) | **2** |
+| minTimeoutInMs | 1,000 | (未覆盖) | **1,000** |
+| maxTimeoutInMs | 3,600,000 (1h) | (未覆盖) | **3,600,000** |
+| randomize | true | (未覆盖) | **true** |
+
+> **注意**：`maxTimeoutInMs` 的最终生效值是 **3,600,000（1小时）**，来自 Worker 的 `defaultRetrySettings`，而非 `@trigger.dev/core` 中 `defaultRetryOptions` 的 60,000。这是因为 Worker 使用自己的 `defaultRetrySettings` 进行合并，`calculateNextRetryDelay` 内部的 `defaultRetryOptions` 会被 Worker 传入的完整 `retrySettings` 覆盖。
 
 **实际退避时序**（理论值，实际会有 ±随机抖动）：
 
-| Attempt | 延迟 |
-|---------|------|
-| 1 (首次失败) | ~1,000ms × 2^0 = 1s |
-| 2 (第二次失败) | ~1,000ms × 2^1 = 2s |
-| 3 (第三次失败) | → DLQ（不再重试） |
+| Attempt | 延迟计算 | 延迟 |
+|---------|---------|------|
+| 1 (首次失败) | random × 1,000 × 2^0 | ~1-2s |
+| 2 (第二次失败) | random × 1,000 × 2^1 | ~2-4s |
+| 3 (第三次失败) | attempt(3) >= maxAttempts(3) | → DLQ（不再重试） |
 
-> ⚠️ **关键发现**：Alerts Worker 的 retry 配置只有 `maxAttempts: 3`，这意味着加上首次尝试，总共只有 **3 次机会**。如果集成方的 webhook 端点在 3 次（约 3 秒 + 2 秒 + 可见性超时恢复时间）内无法恢复，事件将进入 DLQ 被永久丢弃。
+> ⚠️ **关键发现**：Alerts Worker 的 retry 配置只有 `maxAttempts: 3`，这意味着加上首次尝试，总共只有 **3 次机会**。如果集成方的 webhook 端点在 3 次（约 1s + 2s + 可见性超时恢复时间）内无法恢复，事件将进入 DLQ 被永久丢弃。
 
 ---
 
@@ -379,7 +395,7 @@ export function calculateNextRetryDelay(options: RetryOptions, attempt: number) 
 
 ### 8.1 DLQ 机制
 
-**文件**: [queue.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/queue.ts#L328-L360)
+**文件**: [queue.ts](packages/redis-worker/src/queue.ts#L328-L360)
 
 当重试次数用尽后，消息被移入 Redis 中的 DLQ（Dead Letter Queue）：
 - 存储在 Redis sorted set 中
@@ -388,7 +404,7 @@ export function calculateNextRetryDelay(options: RetryOptions, attempt: number) 
 
 ### 8.2 DLQ Redrive
 
-**文件**: [worker.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/worker.ts#L1126-L1153)
+**文件**: [worker.ts](packages/redis-worker/src/worker.ts#L1126-L1153)
 
 Worker 订阅 Redis Pub/Sub channel `{name}:redrive`，收到消息后调用 `redriveFromDeadLetterQueue(id)` 将消息从 DLQ 移回主队列。
 
@@ -397,16 +413,18 @@ Worker 订阅 Redis Pub/Sub channel `{name}:redrive`，收到消息后调用 `re
 ### 8.3 ProjectAlert 状态流转
 
 ```
-PENDING → SENT     (递送成功)
-PENDING → (无变化)  (递送失败且 SkipRetryError)
-PENDING → (无变化)  (递送失败，Worker 重试)
-         → DLQ     (重试耗尽，消息丢失)
+PENDING → SENT     (递送成功，DeliverAlertService.call() 第 192-197 行更新)
+PENDING → (无变化)  (递送失败且 SkipRetryError，不进入重试)
+PENDING → (无变化)  (递送失败，Worker 重试中)
+PENDING → (无变化)  (重试耗尽，消息进入 DLQ)
 ```
 
-> ⚠️ **关键发现**：当 Worker 重试耗尽进入 DLQ 时，**DB 中 ProjectAlert 的状态仍然是 `PENDING`**，不会更新为 `FAILED`。这导致：
+> ⚠️ **关键发现**：当 Worker 重试耗尽将消息移入 DLQ 时，`DeliverAlertService.call()` 抛出的异常被 Worker 的 `processItem()` 捕获并处理（重入队或移 DLQ），但 **没有任何代码路径将 `ProjectAlert.status` 更新为 `FAILED`**。DB 中的 alert 永远停留在 `PENDING`。这导致：
 > 1. 无法通过 DB 查询知道哪些 alert 递送失败
 > 2. 没有 `FAILED` 状态的告警记录，集成方无法追溯丢失的事件
 > 3. 没有自动补偿机制
+>
+> 此外，如果 DLQ 消息被手动 redrive 回主队列，Worker 会重新执行 `DeliverAlertService.call()`，该方法首先检查 `alert.status !== "PENDING"`（见 [deliverAlert.server.ts#L149](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L149)）。由于状态仍为 `PENDING`，redrive 后仍会尝试递送——这一点是正确的。但如果在 Worker 重试期间 alert 已因某种原因被更新为 `SENT`（极端情况），则 redrive 后会被跳过。
 
 ---
 
@@ -440,7 +458,9 @@ Webhook payload 有 v1 和 v2 两个版本：
 - **v1**：扁平结构，包含基本字段
 - **v2**：嵌套结构，增加 `id`、`created`、`webhookVersion`、`type` 字段，payload 包裹在 `object` 中
 
-在 `CreateAlertChannelService` 中创建时默认为 `"v2"`，但 `ProjectAlertWebhookProperties` schema 中 `version` 默认值为 `"v1"`。在 `DeliverAlertService.#sendWebhook()` 中根据 version 分发不同格式的 payload。
+在 `CreateAlertChannelService` 中创建时 `version` 被硬编码为 `"v2"`，但 `ProjectAlertWebhookProperties` Zod schema 中 `version` 默认值为 `"v1"`。在 `DeliverAlertService.#sendWebhook()` 中根据 version 分发不同格式的 payload。
+
+> **注意**：channel properties 的 `version` 字段（`"v1"` / `"v2"`）控制 payload 结构格式；而 payload 中的 `webhookVersion` 字段始终硬编码为 `"v1"`，表示协议版本。两者含义不同。
 
 ---
 
@@ -450,54 +470,88 @@ Webhook payload 有 v1 和 v2 两个版本：
 
 | # | 风险点 | 代码位置 | 说明 |
 |---|--------|----------|------|
-| 1 | **重试次数仅 3 次** | [alertsWorker.server.ts#L36-L38](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/alertsWorker.server.ts#L36-L38) | Alert 递送 job 最多重试 3 次，退避仅 ~1s+2s。如果集成方短暂不可用（如部署中），极易丢事件 |
-| 2 | **DLQ 无自动补偿** | [worker.ts#L933-L958](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/worker.ts#L933-L958) | 进入 DLQ 的事件需要手动 redrive，无自动扫描/通知机制 |
-| 3 | **ProjectAlert 状态不更新为 FAILED** | [deliverAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts) | 重试耗尽时 DB 中的 alert 永远停留在 PENDING，无法区分"正在重试"和"已丢弃" |
-| 4 | **HTTP 超时仅 5 秒** | [deliverAlert.server.ts#L956](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L956) | `AbortSignal.timeout(5000)` 对慢速集成方不友好 |
+| 1 | **重试次数仅 3 次** | [alertsWorker.server.ts#L36-L38](apps/webapp/app/v3/alertsWorker.server.ts#L36-L38) | Alert 递送 job 最多重试 3 次，退避仅 ~1s+2s。如果集成方短暂不可用（如部署中），极易丢事件 |
+| 2 | **DLQ 无自动补偿** | [worker.ts#L933-L958](packages/redis-worker/src/worker.ts#L933-L958) | 进入 DLQ 的事件需要手动 redrive，无自动扫描/通知机制 |
+| 3 | **ProjectAlert 状态不更新为 FAILED** | [deliverAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts) | 重试耗尽时 DB 中的 alert 永远停留在 PENDING，无法区分"正在重试"和"已丢弃" |
+| 4 | **HTTP 超时仅 5 秒** | [deliverAlert.server.ts#L956](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L956) | `AbortSignal.timeout(5000)` 对慢速集成方不友好 |
 
 ### 🟡 中等风险
 
 | # | 风险点 | 代码位置 | 说明 |
 |---|--------|----------|------|
-| 5 | **所有非 2xx 响应都触发重试** | [deliverAlert.server.ts#L959-L969](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L959-L969) | 4xx 错误（如 URL 不存在、签名验证失败）也会重试，浪费重试次数 |
-| 6 | **EMAIL/SLACK 速率限制静默丢弃** | [deliverAlert.server.ts#L1296-L1309](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1296-L1309) | 被 GCRA 限流的 alert 不创建记录，集成方完全无感知 |
-| 7 | **Worker 可见性超时与 job 执行时间不匹配** | [alertsWorker.server.ts#L34-L35](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/alertsWorker.server.ts#L34-L35) | `visibilityTimeoutMs: 60_000` 但 `v3.evaluateErrorAlerts` 的实际执行可能超过 60 秒 |
+| 5 | **所有非 2xx 响应都触发重试** | [deliverAlert.server.ts#L959-L969](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L959-L969) | 4xx 错误（如 URL 不存在、签名验证失败）也会重试，浪费重试次数 |
+| 6 | **EMAIL/SLACK 速率限制静默丢弃** | [deliverAlert.server.ts#L1296-L1309](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L1296-L1309) | 被 GCRA 限流的 alert 不创建记录，集成方完全无感知 |
 
 ### 🟢 低风险
 
 | # | 风险点 | 代码位置 | 说明 |
 |---|--------|----------|------|
-| 8 | **无事件去重确认** | [deliverAlert.server.ts#L149](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L149) | 依赖 `status !== PENDING` 防重复递送，但 DLQ 消息重新入队后可能遇到已被标记为 SENT 的 alert |
-| 9 | **Webhook secret 存储依赖 ENCRYPTION_KEY** | [createAlertChannel.server.ts#L125](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts#L125) | 如果 ENCRYPTION_KEY 丢失或轮换，已存储的 secret 将无法解密，webhook 递送将失败 |
+| 7 | **Webhook secret 存储依赖 ENCRYPTION_KEY** | [createAlertChannel.server.ts#L125](apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts#L125) | 如果 ENCRYPTION_KEY 丢失或轮换，已存储的 secret 将无法解密，webhook 递送将失败 |
 
 ---
 
 ## 11. 完整代码路径索引
 
 ### 注册路径
-1. `POST /api/v1/projects/:projectRef/alertChannels` → [api.v1.projects.$projectRef.alertChannels.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/routes/api.v1.projects.$projectRef.alertChannels.ts)
-2. → `CreateAlertChannelService.call()` → [createAlertChannel.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts)
+1. `POST /api/v1/projects/:projectRef/alertChannels` → [api.v1.projects.$projectRef.alertChannels.ts](apps/webapp/app/routes/api.v1.projects.$projectRef.alertChannels.ts)
+2. → `CreateAlertChannelService.call()` → [createAlertChannel.server.ts](apps/webapp/app/v3/services/alerts/createAlertChannel.server.ts)
 3. → `encryptSecret()` → DB `ProjectAlertChannel`
 
 ### 事件触发路径
-4. Task Run 完成/失败 → `PerformTaskRunAlertsService.enqueue()` → [performTaskRunAlerts.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/performTaskRunAlerts.server.ts)
-5. 部署事件 → `PerformDeploymentAlertsService.enqueue()` → [performDeploymentAlerts.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/performDeploymentAlerts.server.ts)
-6. 错误组 → `ErrorAlertEvaluator.evaluate()` → [errorAlertEvaluator.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts)
+4. Task Run 完成/失败 → `PerformTaskRunAlertsService.enqueue()` → [performTaskRunAlerts.server.ts](apps/webapp/app/v3/services/alerts/performTaskRunAlerts.server.ts)
+5. 部署事件 → `PerformDeploymentAlertsService.enqueue()` → [performDeploymentAlerts.server.ts](apps/webapp/app/v3/services/alerts/performDeploymentAlerts.server.ts)
+6. 错误组 → `ErrorAlertEvaluator.evaluate()` → [errorAlertEvaluator.server.ts](apps/webapp/app/v3/services/alerts/errorAlertEvaluator.server.ts)
 
 ### 消息排队路径
 7. `DeliverAlertService.createAndSendAlert()` → GCRA 速率检查 → DB `ProjectAlert(PENDING)` → alertsWorker.enqueue()
-8. alertsWorker (Redis RedisWorker) → [alertsWorker.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/alertsWorker.server.ts)
+8. alertsWorker (Redis RedisWorker) → [alertsWorker.server.ts](apps/webapp/app/v3/alertsWorker.server.ts)
 
 ### 递送路径
-9. `DeliverAlertService.call()` → [deliverAlert.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/apps/webapp/app/v3/services/alerts/deliverAlert.server.ts)
+9. `DeliverAlertService.call()` → [deliverAlert.server.ts](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts)
 10. → `#sendWebhook()` → `#deliverWebhook()` → `fetch()` with HMAC signature
 11. → 成功: DB `ProjectAlert(SENT)` | 失败: 抛异常 → Worker 重试
 
 ### 重试与丢弃路径
-12. Worker `processItem()` catch → `calculateNextRetryDelay()` → [retries.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/core/src/v3/utils/retries.ts)
-13. 重试: 重新入队 `queue.enqueue({ availableAt: retryDate })` → [worker.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/worker.ts)
-14. 耗尽: `queue.moveToDeadLetterQueue()` → DLQ → [queue.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/redis-worker/src/queue.ts)
+12. Worker `processItem()` catch → `calculateNextRetryDelay()` → [retries.ts](packages/core/src/v3/utils/retries.ts)
+13. 重试: 重新入队 `queue.enqueue({ availableAt: retryDate })` → [worker.ts](packages/redis-worker/src/worker.ts)
+14. 耗尽: `queue.moveToDeadLetterQueue()` → DLQ → [queue.ts](packages/redis-worker/src/queue.ts)
 
 ### 签名验证路径（接收端 SDK）
-15. `webhooks.constructEvent()` → [webhooks.ts (SDK)](file:///d:/fz/0508-3/solo-dogfeeding/code/191-trigger.dev/packages/trigger-sdk/src/v3/webhooks.ts)
+15. `webhooks.constructEvent()` → [webhooks.ts (SDK)](packages/trigger-sdk/src/v3/webhooks.ts)
 16. → `verifySignature()` → timing-safe 比较 → `Webhook.parse()` (Zod 校验)
+
+---
+
+## 12. 事实校验修订
+
+### 12.1 原文描述修正
+
+以下是对初版文档中与代码不符之处的逐项修正：
+
+| # | 原文描述 | 修正 | 代码依据 |
+|---|---------|------|---------|
+| 1 | "公共字段：`webhookVersion` (固定 'v1')" | 表述不够准确，容易误解。`webhookVersion` 是 payload 中的**协议版本标识**，硬编码为 `"v1"`；channel properties 的 `version` 字段控制 payload 结构（v1 扁平 vs v2 嵌套），两者是不同概念 | [deliverAlert.server.ts#L393](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L393)：v2 格式 payload 中 `webhookVersion: "v1"` |
+| 2 | "maxTimeoutInMs: 60,000 (默认)" | **错误**。Alerts Worker 的 `retry` 配置仅指定了 `maxAttempts: 3`，`maxTimeoutInMs` 来自 Worker 的 `defaultRetrySettings`（3,600,000 = 1小时），而非 `@trigger.dev/core` 的 `defaultRetryOptions`（60,000） | [worker.ts#L97-L105](packages/redis-worker/src/worker.ts#L97-L105)：`defaultRetrySettings = { maxTimeoutInMs: 3_600_000 }`；[worker.ts#L927-L930](packages/redis-worker/src/worker.ts#L927-L930)：`...defaultRetrySettings, ...catalogItem?.retry` |
+| 3 | "Worker 可见性超时与 job 执行时间不匹配：`visibilityTimeoutMs: 60_000` 但 `v3.evaluateErrorAlerts` 的实际执行可能超过 60 秒" | **错误**。`v3.evaluateErrorAlerts` 的 `visibilityTimeoutMs` 实际为 `60_000 * 5 = 300,000`（5分钟），与错误评估的执行时间匹配，不存在不匹配风险。此条已从风险表中移除 | [alertsWorker.server.ts#L65](apps/webapp/app/v3/alertsWorker.server.ts#L65)：`visibilityTimeoutMs: 60_000 * 5` |
+| 4 | "DLQ 消息重新入队后可能遇到已被标记为 SENT 的 alert" | 需要补充说明：由于进入 DLQ 时 ProjectAlert 状态仍为 PENDING（不会被更新为 FAILED），redrive 后 `DeliverAlertService` 检查 `status !== PENDING` 时仍会尝试递送。只有在极端情况下（如同时有另一条 Worker 成功递送了同一 alert），redrive 后才会遇到 SENT 状态而被跳过 | [deliverAlert.server.ts#L149](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L149) |
+
+### 12.2 告警 Webhook（出站） vs 入站 HTTP Endpoint 的风险适用性
+
+trigger.dev 中"入站 HTTP Endpoint"的路径与告警 Webhook 完全不同。入站路径是：外部系统 → `POST /api/v1/tasks/:taskId/trigger` → `TriggerTaskService` → 创建 TaskRun → run engine 排队执行。以下逐项分析各风险点的适用范围：
+
+| # | 风险点 | 是否适用于告警 Webhook（出站） | 是否适用于入站 HTTP Endpoint | 说明 |
+|---|--------|------|------|------|
+| 1 | 重试次数仅 3 次 | ✅ 适用 | ❌ 不适用 | 入站触发是**同步 HTTP 请求**，外部系统调用 `/api/v1/tasks/:taskId/trigger` 时直接获得 200/4xx/5xx 响应。如果 trigger.dev 返回 5xx，重试策略由**调用方**控制，trigger.dev 本身不负责重试。调用方可以自行实现任意退避策略 |
+| 2 | DLQ 无自动补偿 | ✅ 适用 | ❌ 不适用 | 入站请求不经过 Redis Worker 队列，没有 DLQ 概念。请求失败后由调用方决定是否重试 |
+| 3 | ProjectAlert 状态不更新为 FAILED | ✅ 适用 | ❌ 不适用 | 入站触发没有 `ProjectAlert` 模型。TaskRun 创建后会持久化到 DB，可通过 API 查询状态。如果创建失败（返回 5xx），调用方会收到明确的 HTTP 错误码 |
+| 4 | HTTP 超时仅 5 秒 | ✅ 适用（trigger.dev 作为发送端） | ✅ 适用（但角色相反） | 对于入站路径，超时由 trigger.dev 的 Web 服务器配置控制（如 Remix 的请求处理超时），且触发操作是同步的 DB 写入 + 排队，通常远小于 5 秒。但调用方如果自身有短超时限制，可能在 trigger.dev 处理高峰时遇到超时 |
+| 5 | 所有非 2xx 响应都触发重试 | ✅ 适用 | ❌ 不适用 | 入站路径中不存在"trigger.dev 重试调用方"的场景。调用方收到 4xx 后可自行决定是否重试（通常 4xx 表示参数错误，不应重试） |
+| 6 | EMAIL/SLACK 速率限制静默丢弃 | ✅ 适用 | ❌ 不适用 | 入站触发不受 GCRA 限流器影响。入站路径有自己的 API 速率限制（`apiRateLimit.server.ts`），但限制不通过时会返回 429 状态码而非静默丢弃 |
+| 7 | Webhook secret 存储依赖 ENCRYPTION_KEY | ✅ 适用 | ❌ 不适用 | 入站触发的认证使用 API Key / Personal Access Token，不依赖 `ENCRYPTION_KEY` 加密的 secret |
+
+**核心区别总结**：
+
+- **告警 Webhook（出站）**：trigger.dev 是主动方，使用 Redis Worker 异步递送，集成方是被动接收端。丢事件的风险集中在 trigger.dev 的递送策略上（重试次数少、DLQ 无补偿、状态不更新）。
+- **入站 HTTP Endpoint**：外部系统是主动方，发起同步 HTTP 请求。trigger.dev 直接处理并返回结果。丢事件的风险不在 trigger.dev 内部，而在于调用方是否正确处理了非 200 响应（如网络超时、5xx 等）。trigger.dev 对入站请求提供了幂等性支持（`idempotency-key`）和请求级错误码，调用方可以据此实现可靠重试。
+
+因此，集成方反馈的"丢事件"问题如果发生在**出站告警 Webhook**方向，很可能与上述高风险点 1-3 直接相关；如果发生在**入站触发**方向，则需要排查调用方的重试逻辑和网络层配置。
