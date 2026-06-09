@@ -94,10 +94,10 @@ const workspaceDir = await findWorkspaceDir(cwd);
 ```ts
 async function autoDetectDirs(workingDir: string): Promise<string[]> {
   // 递归扫描 workingDir 下所有子目录
-  // 跳过: node_modules, .git, dist, out, build, 隐藏目录 (L263)
-  // 跳过: 以 app/api/trigger 结尾的路径（Next.js API route）(L269)
-  // 匹配: 名为 "trigger" 的目录 (L273)
-  // 递归进入所有其他目录继续查找 (L277)
+  // 跳过: node_modules, .git, dist, out, build, 隐藏目录 (packages/cli-v3/src/config.ts:263)
+  // 跳过: 以 app/api/trigger 结尾的路径（Next.js API route）(packages/cli-v3/src/config.ts:269)
+  // 匹配: 名为 "trigger" 的目录 (packages/cli-v3/src/config.ts:273)
+  // 递归进入所有其他目录继续查找 (packages/cli-v3/src/config.ts:277)
 }
 ```
 
@@ -153,10 +153,10 @@ const apiUrl = env.TRIGGER_API_URL ?? opts.defaultApiUrl ?? CLOUD_API_URL;
 **第三优先级：交互式登录**
 
 `packages/cli-v3/src/commands/login.ts:273-313`：
-1. 调用 API 生成授权码（L276）
-2. 打开浏览器让用户授权（L288）
-3. 轮询 API 等待令牌（最多 60 秒，1 秒间隔，L295-302）
-4. 将令牌写入本地配置文件（L307-313）
+1. 调用 API 生成授权码（`packages/cli-v3/src/commands/login.ts:276`）
+2. 打开浏览器让用户授权（`packages/cli-v3/src/commands/login.ts:288`）
+3. 轮询 API 等待令牌（最多 60 秒，1 秒间隔，`packages/cli-v3/src/commands/login.ts:295-302`）
+4. 将令牌写入本地配置文件（`packages/cli-v3/src/commands/login.ts:307-313`）
 
 ### 3.2 CI 环境的特殊行为
 
@@ -200,16 +200,16 @@ defu() 合并优先级（后者覆盖前者）：
 `packages/cli-v3/src/utilities/localEnvVars.ts:4-15` 合并顺序：
 ```ts
 {
-  ...sanitizeEnvVars(processEnv),          // ① 系统环境变量 (L8)
-  ...sanitizeEnvVars(additionalVariables), // ② 额外变量（如有）(L13)
-  ...sanitizeEnvVars(dotEnvVars),          // ③ .env 文件变量（后加载覆盖前者）(L14)
+  ...sanitizeEnvVars(processEnv),          // ① 系统环境变量 (packages/cli-v3/src/utilities/localEnvVars.ts:8)
+  ...sanitizeEnvVars(additionalVariables), // ② 额外变量（如有）(packages/cli-v3/src/utilities/localEnvVars.ts:13)
+  ...sanitizeEnvVars(dotEnvVars),          // ③ .env 文件变量（后加载覆盖前者）(packages/cli-v3/src/utilities/localEnvVars.ts:14)
 }
 ```
 
 `packages/cli-v3/src/utilities/dotEnv.ts:13-37` 的 `resolveDotEnvVars()` 加载：
-- `.env`、`.env.development`、`.env.local`、`.env.development.local`、`dev.vars`（L5-11）
+- `.env`、`.env.development`、`.env.local`、`.env.development.local`、`dev.vars`（`packages/cli-v3/src/utilities/dotEnv.ts:5-11`）
 - 或 `--env-file` 指定的路径
-- **显式删除** `TRIGGER_API_URL`、`TRIGGER_SECRET_KEY`、`OTEL_EXPORTER_OTLP_ENDPOINT`（L28-30）（这些应该来自 worker，不应从本地 .env 泄露）
+- **显式删除** `TRIGGER_API_URL`、`TRIGGER_SECRET_KEY`、`OTEL_EXPORTER_OTLP_ENDPOINT`（`packages/cli-v3/src/utilities/dotEnv.ts:28-30`）（这些应该来自 worker，不应从本地 .env 泄露）
 
 **第二层：构建时的服务端环境变量**（用于代码打包时的 inline 替换）
 
@@ -226,7 +226,7 @@ const serverEnvVars = await projectClient.client.getEnvironmentVariables(resolve
 
 ```ts
 env: z.enum(["prod", "staging", "preview", "production"]),
-// production 会被强制转换为 prod (L290-291)
+// production 会被强制转换为 prod (packages/cli-v3/src/commands/deploy.ts:290-291)
 ```
 
 - `prod` / `production` → 生产环境
@@ -237,7 +237,7 @@ env: z.enum(["prod", "staging", "preview", "production"]),
 
 `packages/cli-v3/src/commands/deploy.ts:351-358` 调用 `getProjectClient()`，该函数在 `packages/cli-v3/src/utilities/session.ts:84-118` 中：
 - 用个人令牌创建 API 客户端，调用 `getProjectEnv()` 获取项目环境的 API Key
-- 用该 API Key 创建新的客户端实例（L111），后续操作使用这个环境级客户端
+- 用该 API Key 创建新的客户端实例（`packages/cli-v3/src/utilities/session.ts:111`），后续操作使用这个环境级客户端
 
 ---
 
@@ -252,11 +252,11 @@ trigger.dev 的「增量 / 全量」概念体现在三个层面：内容哈希�
 ```ts
 const hasher = createHash("md5");
 for (const outputFile of result.outputFiles) {
-  hasher.update(outputFile.hash);   // 累加每个输出文件的 esbuild 内部哈希 (L248)
-  outputHashes[outputFile.path] = outputFile.hash;  // L250
+  hasher.update(outputFile.hash);   // 累加每个输出文件的 esbuild 内部哈希 (packages/cli-v3/src/build/bundle.ts:248)
+  outputHashes[outputFile.path] = outputFile.hash;  // packages/cli-v3/src/build/bundle.ts:250
 }
 // ...
-contentHash: hasher.digest("hex"),  // L323 最终 MD5 摘要
+contentHash: hasher.digest("hex"),  // packages/cli-v3/src/build/bundle.ts:323 最终 MD5 摘要
 ```
 
 **contentHash 是所有 esbuild 输出文件哈希的聚合**。任何一个源文件变动都会改变 contentHash。
@@ -268,7 +268,7 @@ contentHash: hasher.digest("hex"),  // L323 最终 MD5 摘要
 ```ts
 return {
   contentHash: payload.contentHash,  // 写入 WorkerDeployment 记录
-  // ... 其他字段 (L238-259)
+  // ... 其他字段 (apps/webapp/app/v3/services/initializeDeployment.server.ts:238-259)
 };
 ```
 
@@ -297,10 +297,10 @@ useRegistryCache: z.boolean().default(false),  // --use-registry-cache 启用远
 `apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:46-99` 处理并发部署的版本冲突：
 
 ```
-1. 查询当前环境最新部署的 version (L59-63)
-2. 调用 calculateNextBuildVersion(latest?.version) 计算下一个版本号 (L65)
-3. 尝试写入数据库（version + environmentId 联合唯一约束）(L70-71)
-4. 如果唯一约束冲突（并发竞争），加随机 jitter 后重试，最多 5 次 (L73-91)
+1. 查询当前环境最新部署的 version (apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:59-63)
+2. 调用 calculateNextBuildVersion(latest?.version) 计算下一个版本号 (apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:65)
+3. 尝试写入数据库（version + environmentId 联合唯一约束）(apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:70-71)
+4. 如果唯一约束冲突（并发竞争），加随机 jitter 后重试，最多 5 次 (apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:73-91)
 ```
 
 版本号格式类似 `20250208.1`（日期.序号）。
@@ -338,52 +338,52 @@ const skipServerSideRegistryPush = options.localBuild;
 ### 阶段 1：项目发现
 
 ```
-deploy [path]                                                         # deploy.ts:102
-  → projectPath = resolve(cwd, dir)                                   # deploy.ts:266
-  → loadConfig({ cwd: projectPath, ... })                             # deploy.ts:300-304
-     → c12.loadConfig({ name: "trigger", cwd })                       # config.ts:40-45
+deploy [path]                                                         # packages/cli-v3/src/commands/deploy.ts:102
+  → projectPath = resolve(cwd, dir)                                   # packages/cli-v3/src/commands/deploy.ts:266
+  → loadConfig({ cwd: projectPath, ... })                             # packages/cli-v3/src/commands/deploy.ts:300-304
+     → c12.loadConfig({ name: "trigger", cwd })                       # packages/cli-v3/src/config.ts:40-45
         → 搜索 trigger.config.ts 等
-     → resolveConfig()                                                # config.ts:149-232
-        → workingDir = dirname(configFile) / dirname(packageJson) / cwd  # config.ts:160-164
-        → workspaceDir = findWorkspaceDir(cwd)                        # config.ts:158
-        → dirs = config.dirs ?? autoDetectDirs(workingDir)            # config.ts:186
-        → project = defu(overrides, config, defaults).project         # config.ts:196-224
+     → resolveConfig()                                                # packages/cli-v3/src/config.ts:149-232
+        → workingDir = dirname(configFile) / dirname(packageJson) / cwd  # packages/cli-v3/src/config.ts:160-164
+        → workspaceDir = findWorkspaceDir(cwd)                        # packages/cli-v3/src/config.ts:158
+        → dirs = config.dirs ?? autoDetectDirs(workingDir)            # packages/cli-v3/src/config.ts:186
+        → project = defu(overrides, config, defaults).project         # packages/cli-v3/src/config.ts:196-224
 ```
 
 ### 阶段 2：用户认证
 
 ```
-login({ embedded: true, ... })                                        # deploy.ts:270-275
-  → TRIGGER_ACCESS_TOKEN 存在？                                        # login.ts:120
-    → validateAccessToken() 验证前缀                                    # accessTokens.ts:12-23
-    → whoAmI() 验证令牌有效性                                           # login.ts:138
-    → apiUrl = TRIGGER_API_URL ?? defaultApiUrl ?? CLOUD_API_URL       # login.ts:135
-  → 本地 profile 有 token？                                            # login.ts:158-160
-    → whoAmI() 验证存储令牌                                            # login.ts:161
-  → CI 环境？                                                          # login.ts:251
-    → 报错，要求设置 TRIGGER_ACCESS_TOKEN                               # login.ts:260-266
-  → 交互式环境？                                                       # login.ts:273
-    → 浏览器 OAuth 登录 + 轮询                                         # login.ts:276-302
+login({ embedded: true, ... })                                        # packages/cli-v3/src/commands/deploy.ts:270-275
+  → TRIGGER_ACCESS_TOKEN 存在？                                        # packages/cli-v3/src/commands/login.ts:120
+    → validateAccessToken() 验证前缀                                    # packages/cli-v3/src/utilities/accessTokens.ts:12-23
+    → whoAmI() 验证令牌有效性                                           # packages/cli-v3/src/commands/login.ts:138
+    → apiUrl = TRIGGER_API_URL ?? defaultApiUrl ?? CLOUD_API_URL       # packages/cli-v3/src/commands/login.ts:135
+  → 本地 profile 有 token？                                            # packages/cli-v3/src/commands/login.ts:158-160
+    → whoAmI() 验证存储令牌                                            # packages/cli-v3/src/commands/login.ts:161
+  → CI 环境？                                                          # packages/cli-v3/src/commands/login.ts:251
+    → 报错，要求设置 TRIGGER_ACCESS_TOKEN                               # packages/cli-v3/src/commands/login.ts:260-266
+  → 交互式环境？                                                       # packages/cli-v3/src/commands/login.ts:273
+    → 浏览器 OAuth 登录 + 轮询                                         # packages/cli-v3/src/commands/login.ts:276-302
 ```
 
 ### 阶段 3：任务收集 + 代码打包
 
 ```
-buildWorker({ target: "deploy", ... })                                # buildWorker.ts:44
-  → createEntryPointManager(dirs, config, "deploy", false)            # buildWorker.ts:74 (间接)
-     → glob(dirs 下的 *.{ts,tsx,mts,cts,js,jsx,mjs,cjs})             # entryPoints.ts:63-67
-     → 添加 managedEntryPoints（runController, indexController 等）    # entryPoints.ts:84
-     → 添加 config.configFile                                         # entryPoints.ts:75
-  → bundleWorker({ entryPoints, ... })                                # buildWorker.ts:79-89
-     → esbuild.build() → 所有输出文件的 MD5 聚合 → contentHash         # bundle.ts:244-323
-  → createBuildManifestFromBundle()                                   # buildWorker.ts:93-101
+buildWorker({ target: "deploy", ... })                                # packages/cli-v3/src/build/buildWorker.ts:44
+  → createEntryPointManager(dirs, config, "deploy", false)            # packages/cli-v3/src/build/buildWorker.ts:74 (间接)
+     → glob(dirs 下的 *.{ts,tsx,mts,cts,js,jsx,mjs,cjs})             # packages/cli-v3/src/build/entryPoints.ts:63-67
+     → 添加 managedEntryPoints（runController, indexController 等）    # packages/cli-v3/src/build/entryPoints.ts:84
+     → 添加 config.configFile                                         # packages/cli-v3/src/build/entryPoints.ts:75
+  → bundleWorker({ entryPoints, ... })                                # packages/cli-v3/src/build/buildWorker.ts:79-89
+     → esbuild.build() → 所有输出文件的 MD5 聚合 → contentHash         # packages/cli-v3/src/build/bundle.ts:244-323
+  → createBuildManifestFromBundle()                                   # packages/cli-v3/src/build/buildWorker.ts:93-101
      → 提取任务文件列表、入口点、外部依赖、sync 配置
-  → bundleSkills() (如果存在 AI skill 定义)                            # buildWorker.ts:111-122
-  → notifyExtensionOnBuildComplete() (build extensions 钩子)           # buildWorker.ts:128
-  → writeDeployFiles()                                                # buildWorker.ts:135-141
-     → package.json（仅含外部依赖）                                     # buildWorker.ts:222-237
-     → build.json（BuildManifest）                                     # buildWorker.ts:239
-     → Containerfile（Dockerfile）                                     # buildWorker.ts:240
+  → bundleSkills() (如果存在 AI skill 定义)                            # packages/cli-v3/src/build/buildWorker.ts:111-122
+  → notifyExtensionOnBuildComplete() (build extensions 钩子)           # packages/cli-v3/src/build/buildWorker.ts:128
+  → writeDeployFiles()                                                # packages/cli-v3/src/build/buildWorker.ts:135-141
+     → package.json（仅含外部依赖）                                     # packages/cli-v3/src/build/buildWorker.ts:222-237
+     → build.json（BuildManifest）                                     # packages/cli-v3/src/build/buildWorker.ts:239
+     → Containerfile（Dockerfile）                                     # packages/cli-v3/src/build/buildWorker.ts:240
 ```
 
 ### 阶段 4：部署初始化 + 镜像构建
@@ -391,15 +391,15 @@ buildWorker({ target: "deploy", ... })                                # buildWor
 **标准路径（非 Native Build）：**
 
 ```
-initializeOrAttachDeployment()                                        # deploy.ts:422-435
-  → TRIGGER_EXISTING_DEPLOYMENT_ID 存在？                              # deploy.ts:903
-    → attach 到已有部署                                                # deploy.ts:911
-  → 否则 → apiClient.initializeDeployment({ contentHash, ... })       # deploy.ts:941-943
-           → POST /api/v1/deployments                                  # apiClient.ts:414
-           → 服务端创建新 WorkerDeployment 记录                         # initializeDeployment.server.ts:196-261
+initializeOrAttachDeployment()                                        # packages/cli-v3/src/commands/deploy.ts:422-435
+  → TRIGGER_EXISTING_DEPLOYMENT_ID 存在？                              # packages/cli-v3/src/commands/deploy.ts:903
+    → attach 到已有部署                                                # packages/cli-v3/src/commands/deploy.ts:911
+  → 否则 → apiClient.initializeDeployment({ contentHash, ... })       # packages/cli-v3/src/commands/deploy.ts:941-943
+           → POST /api/v1/deployments                                  # packages/cli-v3/src/apiClient.ts:414
+           → 服务端创建新 WorkerDeployment 记录                         # apps/webapp/app/v3/services/initializeDeployment.server.ts:196-261
            → 返回 deployment.id, version, imageTag, externalBuildData
 
-buildImage()                                                          # deploy.ts:530
+buildImage()                                                          # packages/cli-v3/src/commands/deploy.ts:530
   → isLocalBuild ? localBuildImage() : remoteBuildImage()
   → localBuildImage(): 调用 docker buildx build
   → remoteBuildImage(): 调用 Depot 远程构建
@@ -408,22 +408,22 @@ buildImage()                                                          # deploy.t
 **Native Build Server 路径：**
 
 ```
-handleNativeBuildServerDeploy()                                       # deploy.ts:986
-  → createContextArchive(workspaceDir, archivePath)                   # deploy.ts:1009
-     → 过滤: .git, node_modules, dist, .env, .trigger, ...           # archiveContext.ts:5-49
-     → 合并 .gitignore 规则                                           # archiveContext.ts:96-101
-  → apiClient.createArtifact()                                        # deploy.ts:1015
+handleNativeBuildServerDeploy()                                       # packages/cli-v3/src/commands/deploy.ts:986
+  → createContextArchive(workspaceDir, archivePath)                   # packages/cli-v3/src/commands/deploy.ts:1009
+     → 过滤: .git, node_modules, dist, .env, .trigger, ...           # packages/cli-v3/src/deploy/archiveContext.ts:5-49
+     → 合并 .gitignore 规则                                           # packages/cli-v3/src/deploy/archiveContext.ts:96-101
+  → apiClient.createArtifact()                                        # packages/cli-v3/src/commands/deploy.ts:1015
      → 获取 S3 预签名上传 URL
-  → POST 上传 tar.gz                                                  # deploy.ts:1050-1054
-  → apiClient.initializeDeployment({                                  # deploy.ts:1081-1092
+  → POST 上传 tar.gz                                                  # packages/cli-v3/src/commands/deploy.ts:1050-1054
+  → apiClient.initializeDeployment({                                  # packages/cli-v3/src/commands/deploy.ts:1081-1092
       contentHash: "-",                               // 占位，服务端计算
       isNativeBuild: true,
       artifactKey,
-      configFilePath,                                 // 配置文件在 workspace 中的相对路径 # deploy.ts:1076-1079
+      configFilePath,                                 // 配置文件在 workspace 中的相对路径 # packages/cli-v3/src/commands/deploy.ts:1076-1079
       skipPromotion,
     })
-  → 服务端入队构建任务                                                 # initializeDeployment.server.ts:274-306
-  → 返回 S2 event stream 用于实时日志                                 # initializeDeployment.server.ts:144-152
+  → 服务端入队构建任务                                                 # apps/webapp/app/v3/services/initializeDeployment.server.ts:274-306
+  → 返回 S2 event stream 用于实时日志                                 # apps/webapp/app/v3/services/initializeDeployment.server.ts:144-152
 ```
 
 ### 阶段 5：环境变量同步
@@ -433,8 +433,8 @@ handleNativeBuildServerDeploy()                                       # deploy.t
 ```ts
 if (hasVarsToSync) {
   syncEnvVarsWithServer(client, projectRef, env, childVars, parentVars);
-  // 仅当 BuildManifest.deploy.sync 存在时触发 (L456-459)
-  // preview 分支额外同步 parentEnv（从父环境继承变量）(L459)
+  // 仅当 BuildManifest.deploy.sync 存在时触发 (packages/cli-v3/src/commands/deploy.ts:456-459)
+  // preview 分支额外同步 parentEnv（从父环境继承变量）(packages/cli-v3/src/commands/deploy.ts:459)
 }
 ```
 
@@ -444,9 +444,9 @@ if (hasVarsToSync) {
 
 ```
 apiClient.finalizeDeployment(deploymentId, {
-  imageDigest,                          // 镜像摘要 (L670)
-  skipPromotion,                        // --skip-promotion 跳过晋升 (L671)
-  skipPushToRegistry,                   // 本地构建跳过推送 (L672)
+  imageDigest,                          // 镜像摘要 (packages/cli-v3/src/commands/deploy.ts:670)
+  skipPromotion,                        // --skip-promotion 跳过晋升 (packages/cli-v3/src/commands/deploy.ts:671)
+  skipPushToRegistry,                   // 本地构建跳过推送 (packages/cli-v3/src/commands/deploy.ts:672)
 })
   → 服务端验证镜像、创建 Worker 记录
   → 若非 skipPromotion → 自动晋升为当前部署
@@ -503,10 +503,10 @@ npx trigger.dev@latest promote <version>
 
 | 错误信息 | 原因 | 源码位置 | 解决 |
 |----------|------|----------|------|
-| `You must login first` | 无 TRIGGER_ACCESS_TOKEN 且本地无 profile | `commands/login.ts:283-285` | CI 中设置 TRIGGER_ACCESS_TOKEN |
-| `not a Personal Access Token` | TRIGGER_ACCESS_TOKEN 格式错误 | `utilities/accessTokens.ts:15-23` | 确保以 `tr_pat_` 开头 |
-| `Project not found` | projectRef 与 profile 指向不同实例 | `utilities/session.ts:98-101` | 检查 `--profile` 和 `--api-url` |
-| `Failed to connect to ...` | API URL 不可达 | `commands/deploy.ts:279-281` | 检查 `TRIGGER_API_URL` 或 `--api-url` |
+| `You must login first` | 无 TRIGGER_ACCESS_TOKEN 且本地无 profile | `packages/cli-v3/src/commands/login.ts:283-285` | CI 中设置 TRIGGER_ACCESS_TOKEN |
+| `not a Personal Access Token` | TRIGGER_ACCESS_TOKEN 格式错误 | `packages/cli-v3/src/utilities/accessTokens.ts:15-23` | 确保以 `tr_pat_` 开头 |
+| `Project not found` | projectRef 与 profile 指向不同实例 | `packages/cli-v3/src/utilities/session.ts:98-101` | 检查 `--profile` 和 `--api-url` |
+| `Failed to connect to ...` | API URL 不可达 | `packages/cli-v3/src/commands/deploy.ts:279-281` | 检查 `TRIGGER_API_URL` 或 `--api-url` |
 
 ---
 
