@@ -1,171 +1,308 @@
 # Trigger.dev 用量计量与套餐配额告警机制
 
-本文档基于代码分析，深入梳理 trigger.dev 在配额接近上限时的提示机制，重点校准 Billing Alerts 对免费用户和付费用户的邮件告警差异，重新划定 FreePlanUsage、UpgradePrompt、NotificationPanel、Billing Alerts 四大提示通道在产品内提示和邮件提醒功能上的职责边界。
+本文档基于代码分析，深入梳理 Billing Alerts 100% 阈值的精确判断逻辑，包括 CheckboxWithLabel 的 checked 状态管理、readOnly 阻止切换但不强制选中的实现细节、alerts.alertLevels 默认值来源，以及"100% 不可取消"与"是否一定收到 100% 邮件"之间的关联；同时重新整理免费用户与付费用户的邮件提醒时间线。
 
 ---
 
-## 一、FreePlanUsage 组件：侧边栏配额进度条
+## 一、CheckboxWithLabel 的 checked 状态管理
 
-### 1.1 组件代码
+### 1.1 组件核心逻辑
 
-代码位置：[FreePlanUsage](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx)
+代码位置：[CheckboxWithLabel](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L68-L177)
 
 ```ts
-export function FreePlanUsage({ to, percentage }: { to: string; percentage: number }) {
-  const cappedPercentage = Math.min(percentage, 1);
-  const widthProgress = useMotionValue(cappedPercentage * 100);
-  const color = useTransform(
-    widthProgress,
-    [0, 74, 75, 95, 100],
-    ["#22C55E", "#22C55E", "#F59E0B", "#F43F5E", "#F43F5E"]
-  );
+export const CheckboxWithLabel = React.forwardRef<HTMLInputElement, CheckboxProps>(
+  ({ defaultChecked, disabled, ...props }, ref) => {
+    const [isChecked, setIsChecked] = useState<boolean>(defaultChecked ?? false);
+    const [isDisabled, setIsDisabled] = useState<boolean>(disabled ?? false);
 
-  const hasHitLimit = cappedPercentage >= 1;
-  // ...
+    useEffect(() => {
+      setIsChecked(defaultChecked ?? false);
+    }, [defaultChecked]);
+
+    return (
+      <div
+        onClick={(e) => {
+          if (isDisabled || props.readOnly === true) return false;
+          setIsChecked((c) => !c);
+        }}
+      >
+        <input
+          type="checkbox"
+          value={value}
+          checked={isChecked}
+          onChange={(e) => {
+            if (isDisabled || props.readOnly === true) return false;
+            setIsChecked(!isChecked);
+          }}
+        />
+      </div>
+    );
+  }
+);
+```
+
+### 1.2 状态初始化链
+
+```
+defaultChecked prop
+       │
+       ▼
+useState(defaultChecked ?? false)   → isChecked 初始值
+       │
+       ▼
+<input checked={isChecked} />       → 表单提交时根据 checked 决定是否提交 value
+```
+
+关键点：
+- `isChecked` **完全由 `defaultChecked` 初始值决定**
+- 后续状态变化仅通过 `setIsChecked` 触发
+- `useEffect(() => setIsChecked(defaultChecked ?? false), [defaultChecked])` 会在 `defaultChecked` 变化时同步，但 billing-alerts 页面中 `defaultChecked` 不会变化（loader 数据在页面生命周期内固定）
+
+### 1.3 readOnly 的精确行为
+
+```ts
+// onClick 阻止切换
+onClick={(e) => {
+  if (isDisabled || props.readOnly === true) return false;  // 直接返回，不调用 setIsChecked
+  setIsChecked((c) => !c);
+}}
+
+// onChange 阻止切换
+onChange={(e) => {
+  if (isDisabled || props.readOnly === true) return false;  // 直接返回，不调用 setIsChecked
+  setIsChecked(!isChecked);
+}}
+```
+
+**`readOnly` 的行为：阻止从当前状态切换到任何其他状态。**
+
+| 当前 isChecked | readOnly | 点击结果 | 含义 |
+|---------------|----------|---------|------|
+| `true`        | `true`   | 仍为 `true` | 不可取消 ✓ |
+| `false`       | `true`   | 仍为 `false` | **不可选中** ✗ |
+| `true`        | `false`  | 变为 `false` | 可取消 |
+| `false`       | `false`  | 变为 `true`  | 可选中 |
+
+**这是理解 100% 阈值的关键：`readOnly` 并不强制选中，而是冻结当前状态。**
+
+### 1.4 readOnly 的视觉表现
+
+```ts
+// 容器样式
+cn(
+  props.readOnly || disabled ? "cursor-default" : "cursor-pointer",
+  isChecked && isCheckedClassName,
+  (isDisabled || props.readOnly) && isDisabledClassName  // "opacity-70"
+)
+
+// input 样式
+"read-only:border-charcoal-650 read-only:!bg-charcoal-700"
+```
+
+- `readOnly` 时：鼠标变为 default（非 pointer），透明度降低到 70%，checkbox 背景变为 charcoal-700
+- 如果 `isChecked === true`：仍有 `checked:!bg-indigo-500`（紫色填充）
+- 如果 `isChecked === false`：仅有灰色边框和灰色背景
+
+---
+
+## 二、Billing Alerts 100% 阈值的精确判断逻辑
+
+### 2.1 标准阈值复选框渲染
+
+代码位置：[billing-alerts/route.tsx#L256-L275](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L256-L275)
+
+```tsx
+{checkboxLevels.map((level) => (
+  <CheckboxWithLabel
+    name={alertLevels.name}
+    id={`level_${level}`}
+    key={level}
+    value={level.toString()}
+    variant="simple/small"
+    label={
+      <span>
+        {level * 100}%
+        <span className="text-text-dimmed">
+          ({formatCurrency(Number(dollarAmount) * level, false)})
+        </span>
+      </span>
+    }
+    defaultChecked={alerts.alertLevels.includes(level)}
+    className="pr-0"
+    readOnly={level === 1.0}
+  />
+))}
+```
+
+### 2.2 defaultChecked 的来源追踪
+
+```
+Billing API 返回
+      │
+      ▼
+loader: const [error, alerts] = await tryCatch(getBillingAlerts(organization.id))
+      │
+      ▼
+alerts = { amount: 美分, emails: [...], alertLevels: [...] }
+      │
+      ▼
+return typedjson({ alerts: { ...alerts, amount: alerts.amount / 100 } })
+      │
+      ▼
+组件: const { alerts } = useTypedLoaderData<typeof loader>()
+      │
+      ▼
+defaultChecked={alerts.alertLevels.includes(level)}
+```
+
+**`defaultChecked` 的值完全取决于 Platform Billing API 返回的 `alertLevels` 数组。**
+
+### 2.3 alertLevels 默认值的来源
+
+代码位置：[getBillingAlerts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L600-L610)
+
+```ts
+export async function getBillingAlerts(organizationId: string) {
+  if (!client) return undefined;
+  const result = await client.getBillingAlerts(organizationId);
+  if (!result.success) {
+    recordPlatformFailure("getBillingAlert", "no_success");
+    throw new Error("Error getting billing alert");
+  }
+  return result;
 }
 ```
 
-### 1.2 三段颜色阈值
+- `getBillingAlerts` 直接调用 `@trigger.dev/platform`（v1.0.27）的 `BillingClient.getBillingAlerts()`
+- `@trigger.dev/platform` 是外部 npm 包，不在本 monorepo 中
+- **Webapp 代码无法控制 `alertLevels` 的默认值**
+- `alertLevels` 的默认值由 Platform Billing API 在创建组织时初始化
 
-| 使用率范围        | 进度条颜色  | Tailwind 近似色  | 含义         |
-|------------------|------------|-----------------|-------------|
-| 0% – 74%         | `#22C55E`  | green-500       | 正常（绿色） |
-| 75% – 94%        | `#F59E0B`  | amber-500       | 警告（琥珀色）|
-| 95% – 100%+      | `#F43F5E`  | rose-500        | 危险（红色） |
+### 2.4 100% 阈值的两种场景
 
-- 75% 是所有组件中**最早的视觉预警点**
-- 100% 时容器边框额外变为 `border-error/40`（半透明红色边框）
-- 进度条宽度上限 `Math.min(percentage, 1)`，始终不超过 100%
+根据 CheckboxWithLabel 的 readOnly 行为，100% 复选框有两种可能状态：
 
-### 1.3 SideMenu 渲染条件
+#### 场景 A：Billing API 返回 `alertLevels` 包含 `1.0`
 
-代码位置：[SideMenu.tsx#L745-L752](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L745-L752)
-
-```tsx
-{isFreeUser && (
-  <CollapsibleHeight isCollapsed={isCollapsed}>
-    <FreePlanUsage
-      to={v3BillingPath(organization)}
-      percentage={currentPlan.v3Usage.usagePercentage}
-    />
-  </CollapsibleHeight>
-)}
+```
+alerts.alertLevels.includes(1.0) === true
+  → defaultChecked={true}
+  → isChecked 初始化为 true
+  → readOnly={true} 锁定状态
+  → 用户无法取消 100% 复选框
+  → 表单提交时 value="1.0" 被包含在 alertLevels 中
+  → ✅ 用户一定会收到 100% 邮件
 ```
 
-- **仅免费用户**（`isPaying === false`）显示
-- 侧边栏折叠时完全隐藏，无 mini 图标替代
-- `percentage` 来自 org route loader，仅在页面导航时刷新（不自动轮询）
+#### 场景 B：Billing API 返回 `alertLevels` 不包含 `1.0`
 
----
-
-## 二、Billing Alerts：邮件告警的完整校准
-
-### 2.1 页面入口与前置条件
-
-代码位置：[billing-alerts/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx) / [OrganizationSettingsSideMenu](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/OrganizationSettingsSideMenu.tsx#L107-L114)
-
-Billing Alerts 入口位于 **Organization Settings** 侧边菜单（非项目级 SideMenu），所有 Cloud 环境的用户都能看到该入口：
-
-```tsx
-// OrganizationSettingsSideMenu 中
-{isManagedCloud && (
-  <SideMenuItem
-    name="Billing alerts"
-    icon={BellAlertIcon}
-    to={v3BillingAlertsPath(organization)}
-  />
-)}
+```
+alerts.alertLevels.includes(1.0) === false
+  → defaultChecked={false}
+  → isChecked 初始化为 false
+  → readOnly={true} 锁定状态
+  → 用户无法勾选 100% 复选框
+  → 表单提交时 value="1.0" 不被包含在 alertLevels 中
+  → ❌ 用户不会收到 100% 邮件
+  → ❌ 用户无法通过 UI 启用 100% 邮件
 ```
 
-前置条件：
-- `isManagedCloud === true`（仅 Trigger.dev Cloud 环境）
-- 自托管环境自动重定向到组织首页，无法访问
+**场景 B 会导致一个严重问题：readOnly 阻止了用户选中 100% 复选框，使得"100% 不可取消"变成了"100% 不可启用"。**
 
-### 2.2 isFree 分支：amount 字段的差异化渲染
+### 2.5 设计意图与代码实现的差距
 
-代码位置：[billing-alerts/route.tsx#L194-L251](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L194-L251)
+| 设计意图                      | 代码实现                              | 差距 |
+|------------------------------|--------------------------------------|------|
+| 用户始终收到 100% 邮件通知     | `readOnly` 冻结当前状态，不强制选中     | 如果 API 默认不含 1.0，readOnly 会阻止启用 |
+| 100% 阈值不可关闭             | 100% 复选框不可切换（选中或未选中都锁定）| "不可关闭"≠"始终开启" |
+| 确保最低限度的告警覆盖         | 依赖 Billing API 默认包含 1.0          | 无客户端校验强制 1.0 在 alertLevels 中 |
+
+**要实现"用户一定收到 100% 邮件"，需要同时满足两个条件：**
+1. Billing API 在创建组织时默认将 `1.0` 加入 `alertLevels`
+2. Webapp 端的 `readOnly` 防止用户取消
+
+两个条件缺一不可。当前代码只实现了条件 2，条件 1 由外部服务保证，Webapp 无法验证。
+
+### 2.6 服务端校验是否强制 1.0？
+
+代码位置：[billing-alerts/route.tsx#L101-L104](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L101-L104)
 
 ```ts
-const isFree = !plan?.v3Subscription?.isPaying;
+alertLevels: z.preprocess((i) => {
+  if (typeof i === "string") return [i];
+  return i;
+}, z.coerce.number().array().nonempty("At least one alert level is required")),
 ```
 
-**免费用户的 Amount 渲染**：
+- 校验仅要求 `alertLevels` 是非空数组
+- **没有校验 `1.0` 是否在数组中**
+- 如果用户提交 `alertLevels: [0.75]`（不含 1.0），服务端校验会通过
+- 而由于 readOnly 冻结了 100% 复选框为未选中状态，这确实可能发生
 
-```tsx
-{isFree ? (
-  <>
-    <Paragraph variant="small" className="text-text-dimmed">
-      ${dollarAmount}
-    </Paragraph>
-    <input type="hidden" name={amount.name} value={dollarAmount} />
-  </>
-) : (
-  <Input
-    {...conform.input(amount, { type: "number" })}
-    value={dollarAmount}
-    onChange={(e) => { /* 可编辑 */ }}
-    readOnly={isFree}
-  />
-)}
-```
-
-| 维度           | 免费用户                                     | 付费用户                         |
-|---------------|---------------------------------------------|---------------------------------|
-| 渲染方式       | `<Paragraph>` 只读文本 + hidden input         | `<Input>` 可编辑数字输入框        |
-| Amount 来源   | Platform Billing API 返回值（美分→美元 `/100`）| 同左，但用户可修改                 |
-| Amount 含义   | 固定为免费套餐的 `includedUsage` 金额           | 用户自定义的预算金额               |
-| 能否编辑       | ❌ 不可编辑（显示为灰色文字）                   | ✅ 可编辑（`step={0.01}`）       |
-| hidden input   | 有（确保表单提交时携带值）                      | 无（使用正常 input）              |
-
-**关键理解**：免费用户的 Amount 是 Platform Billing API 根据免费套餐的 `includedUsage` 自动设置的，用户无法修改。这意味着免费用户的告警基准金额就是套餐包含额度本身，告警阈值都是相对于这个固定值计算的。
-
-### 2.3 标准告警阈值（checkboxLevels）
-
-代码位置：[billing-alerts/route.tsx#L185](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L185)
-
-```ts
-const checkboxLevels = [0.75, 0.9, 1.0, 2.0, 5.0];
-```
-
-| 阈值   | 金额（免费用户 $5 included 为例） | 含义                   | 默认行为                        |
-|--------|----------------------------------|------------------------|--------------------------------|
-| 75%    | $3.75                            | 接近预算                | `defaultChecked={alerts.alertLevels.includes(level)}` |
-| 90%    | $4.50                            | 即将超预算              | 同上                           |
-| 100%   | $5.00                            | 预算耗尽                | `readOnly={level === 1.0}` — **不可取消** |
-| 200%   | $10.00                           | 超出预算 2 倍           | 同上                           |
-| 500%   | $25.00                           | 超出预算 5 倍           | 同上                           |
-
-**100% 阈值不可取消的逻辑**：
+### 2.7 表单提交时 alertLevels 的组装机制
 
 ```tsx
 <CheckboxWithLabel
-  name={alertLevels.name}
-  value={level.toString()}
-  defaultChecked={alerts.alertLevels.includes(level)}
-  readOnly={level === 1.0}
+  name={alertLevels.name}   // 所有标准阈值复选框共享同一个 name
+  value={level.toString()}  // 每个复选框的 value 是阈值数字字符串
 />
 ```
 
-- `readOnly={level === 1.0}` 使 100% 复选框变灰，用户无法取消勾选
-- 这确保**所有用户（包括免费和付费）至少在用量达到预算 100% 时都会收到邮件**
-- 如果这是首次访问（`alerts.alertLevels` 为空），100% 复选框默认不勾选，但 `readOnly` 使其无法取消
+HTML 表单提交规则：
+- 同名复选框中，只有 `checked` 的复选框的 `value` 会被提交
+- `isChecked` 状态决定是否提交
+- 未选中的复选框不会提交任何值
 
-### 2.4 尖峰告警阈值（spikeAlertLevels）
+所以 `alertLevels` 数组的值 = 所有 `isChecked === true` 的复选框的 `value` 组合。
 
-代码位置：[billing-alerts/route.tsx#L187](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L187)
+---
 
-```ts
-const spikeAlertLevels = [10.0, 20.0, 50.0, 100.0];
+## 三、"100% 不可取消"与"是否一定收到 100% 邮件"的关系
+
+### 3.1 核心结论
+
+**"100% 不可取消"≠"一定收到 100% 邮件"。**
+
+`readOnly` 的语义是"冻结当前状态"，不是"强制选中"。能否收到 100% 邮件取决于：
+
+```
+能否收到 100% 邮件
+  = 1.0 是否在提交的 alertLevels 数组中
+  = 100% 复选框是否 isChecked
+  = alerts.alertLevels.includes(1.0)  （初始值）
+  = Billing API 返回的 alertLevels 是否包含 1.0
 ```
 
-| 阈值     | 金额（免费用户 $5 included 为例） | 含义           |
-|----------|----------------------------------|---------------|
-| 10x      | $50.00                           | 异常飙升        |
-| 20x      | $100.00                          | 严重异常        |
-| 50x      | $250.00                          | 极端异常        |
-| 100x     | $500.00                          | 灾难性异常      |
+### 3.2 三层保障分析
 
-**尖峰告警的默认选中逻辑**：
+| 保障层           | 实现方式                          | 是否保证 100% 邮件 | 备注                          |
+|-----------------|-----------------------------------|-------------------|------------------------------|
+| Webapp 前端      | `readOnly={level === 1.0}`        | ❌ 不保证          | 仅冻结，不强制选中             |
+| Webapp 服务端    | `z.coerce.number().array().nonempty()` | ❌ 不保证     | 不校验 1.0 是否在数组中       |
+| Billing API 后端 | 默认 alertLevels 包含 1.0          | ✅ 保证（如果确实如此）| 外部服务，代码不可见           |
+
+### 3.3 可能的风险场景
+
+```
+1. 组织创建时 Billing API 初始化 alertLevels = [1.0]
+   → 用户首次打开 Billing Alerts 页面 → 100% 已选中且不可取消 ✅
+   → 用户提交表单 → alertLevels 包含 1.0 ✅
+   → 100% 邮件一定会发送 ✅
+
+2. Billing API 初始化 alertLevels = []
+   → 用户首次打开页面 → 100% 未选中且不可选中 ❌
+   → 用户提交表单 → alertLevels 不含 1.0 ❌
+   → 100% 邮件不会发送 ❌
+
+3. 之前的提交将 1.0 移除了（通过其他手段，如 API 直接调用）
+   → 下次打开页面 → 100% 未选中且不可选中 ❌
+   → readOnly 阻止恢复 ❌
+```
+
+### 3.4 尖峰告警的默认选中逻辑对比
+
+代码位置：[billing-alerts/route.tsx#L303-L306](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L303-L306)
 
 ```tsx
 defaultChecked={
@@ -174,337 +311,218 @@ defaultChecked={
 }
 ```
 
-解读：
-- 如果当前 `alertLevels` 已包含该阈值 → 保持勾选
-- **如果 `alertLevels` 中不包含任何尖峰阈值 → 默认全部勾选**
+尖峰告警有**回退默认值**：如果 `alertLevels` 中不包含任何尖峰阈值，则默认全部勾选。这是一种容错设计，确保即使用户从未配置过尖峰告警，也会默认启用。
 
-这意味着：
-- 首次访问的用户（没有配置过告警）：**所有尖峰告警默认勾选**
-- 已手动取消某些尖峰告警的用户：仅保留之前勾选的
-- 尖峰告警没有 `readOnly`，用户可以自由取消任何阈值
-
-### 2.5 邮箱输入的表单行为
-
-代码位置：[billing-alerts/route.tsx#L313-L332](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L313-L332)
-
-```ts
-const schema = z.object({
-  emails: z.preprocess((i) => {
-    if (typeof i === "string") return [i];
-    if (Array.isArray(i)) {
-      const emails = i.filter((v) => typeof v === "string" && v !== "");
-      if (emails.length === 0) return [""];
-      return emails;
-    }
-    return [""];
-  }, z.string().email().array().nonempty("At least one email is required")),
-  // ...
-});
-```
-
-表单行为：
-- 至少需要一个有效邮箱
-- 当所有已有邮箱输入框都填满时，自动追加新的空输入框
-- `defaultValue: { emails: [""] }` 初始只有一个空输入框
-- 提交时 `amount` 乘以 100 转为美分（`submission.value.amount * 100`）
-
-### 2.6 免费用户 vs 付费用户的邮件告警完整对比
-
-| 维度                 | 免费用户                                         | 付费用户                              |
-|---------------------|-------------------------------------------------|--------------------------------------|
-| Amount              | 只读（`<Paragraph>`），值由 Billing API 设置        | 可编辑（`<Input>`），用户自定义预算     |
-| Amount 含义         | 套餐的 includedUsage 金额                          | 用户设定的月度预算                     |
-| 标准阈值            | 75%/90%/100%/200%/500%                            | 同左                                  |
-| 100% 阈值           | `readOnly` 不可取消                                | `readOnly` 不可取消                    |
-| 尖峰阈值            | 10x/20x/50x/100x                                  | 同左                                  |
-| 尖峰默认勾选        | 无已有配置时全部勾选                                | 同左                                  |
-| 邮箱配置            | 可编辑                                            | 可编辑                                |
-| 是否能收到邮件       | ✅ 是（配置邮箱后）                                  | ✅ 是                                  |
-| 邮件中的金额        | 基于 includedUsage 计算                             | 基于用户设置的 amount 计算              |
-
-**关键校准**：**免费用户和付费用户都可以接收 Billing Alerts 邮件。** 之前文档中将 Billing Alerts 归类为"仅付费用户"是不准确的。两者的差异仅在 Amount 是否可编辑，告警机制本身对两种用户都可用。
-
-### 2.7 免费用户的 Amount 值从何而来
-
-代码位置：[billing-alerts/route.tsx#L76-L81](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L76-L81)
-
-```ts
-return typedjson({
-  alerts: {
-    ...alerts,
-    amount: alerts.amount / 100,  // 美分 → 美元
-  },
-});
-```
-
-- `alerts` 来自 `getBillingAlerts(organization.id)` → Platform Billing API
-- Platform Billing API 为免费用户自动设置 `amount = includedUsage`（以美分为单位）
-- 页面将美分转为美元显示
-- 免费用户看到的就是套餐包含额度的等值金额（如 Free 套餐 $5 → 显示 $5.00）
+**但标准阈值（包括 100%）没有这种回退逻辑。** `defaultChecked={alerts.alertLevels.includes(level)}` 完全依赖 API 返回值，没有"如果从未配置则默认启用"的逻辑。
 
 ---
 
-## 三、UpgradePrompt：超限后的强制提醒
+## 四、免费用户与付费用户的邮件提醒时间线（修正版）
 
-代码位置：[UpgradePrompt](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UpgradePrompt.tsx)
+### 4.1 关键前提：Billing Alerts 需要主动配置邮箱
 
-### 3.1 触发条件
+Billing Alerts 页面初始状态：
+- `emails` 默认为 `[""]`（一个空字符串输入框）
+- 表单校验要求至少一个有效邮箱
+- **用户必须手动输入邮箱地址并点击 Update 才能启用邮件告警**
 
-代码位置：[org route.tsx#L115-L120](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120)
+这意味着：**如果用户从未访问 Billing Alerts 页面并配置邮箱，即使 1.0 在 alertLevels 中，也不会收到任何邮件。** 邮件发送需要同时满足两个条件：
+1. `alertLevels` 包含对应阈值
+2. `emails` 中有有效的邮箱地址
 
-```ts
-hasExceededFreeTier = usage.cents > plan.v3Subscription.plan.limits.includedUsage;
-```
-
-- **仅免费用户**，且 `usage.cents > includedUsage` 时触发
-- 付费用户永远不会看到此横幅
-- 替换 NavBar 下方的 EnvironmentBanner
-
-### 3.2 与 Billing Alerts 100% 阈值的关系
-
-Billing Alerts 的 100% 阈值判定条件是 `usage ≥ amount`。对于免费用户，`amount = includedUsage`，因此：
-- Billing Alerts 100% 邮件 ≈ `usage.cents ≥ includedUsage`
-- UpgradePrompt 出现 ≈ `usage.cents > includedUsage`
-
-两者几乎同时触发，但：
-- Billing Alerts 100% 是邮件通知（异步，用户可能在邮箱中看到）
-- UpgradePrompt 是 Dashboard 横幅（同步，用户在产品内看到）
-- 由于缓存差异，实际触发时间可能有数分钟偏差
-
----
-
-## 四、NotificationPanel：产品内通知卡片
-
-代码位置：[NotificationPanel](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/NotificationPanel.tsx) / [platformNotifications.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platformNotifications.server.ts)
-
-### 4.1 定位与能力
-
-- 位于 SideMenu 底部区域（FreePlanUsage 上方）
-- 60 秒轮询，展示来自 `PlatformNotification` 数据库表的卡片
-- 支持类型：`card`、`info`、`warn`、`error`、`success`、`changelog`
-- 支持 scope：`GLOBAL`、`ORGANIZATION`、`PROJECT`、`USER`
-
-### 4.2 配额通知现状
-
-**当前代码中不存在自动创建配额相关 PlatformNotification 的逻辑。** 所有通知必须通过 admin 端点手动创建。
-
-这意味着 NotificationPanel 的 `warn`/`error` 类型虽然**技术上可以展示配额告警**，但目前没有被用于此目的。它是一个**可扩展但未启用**的通知通道。
-
----
-
-## 五、四大提示通道的职责边界
-
-### 5.1 职责矩阵（校准版）
-
-| 通道                | 通道类型   | 目标用户    | 展示位置            | 触发时机         | 提醒方式          | 阈值体系               | 可配置性        |
-|--------------------|-----------|------------|--------------------|-----------------|------------------|-----------------------|----------------|
-| **FreePlanUsage**  | 产品内提示 | 仅免费用户  | 项目 SideMenu 底部  | 始终可见         | 进度条颜色变化     | 75% 绿→琥珀, 95%→红   | 不可配置        |
-| **UpgradePrompt**  | 产品内提示 | 仅免费用户  | 全局 NavBar 下方    | usage > included | 红色横幅+阻断文案  | 100%（无中间阈值）     | 不可配置        |
-| **Billing Alerts** | 邮件提醒   | **所有用户**| 组织设置页配置      | 阈值触发          | 邮件通知          | 75/90/100/200/500% + 尖峰 | 邮箱+阈值可配置 |
-| **NotificationPanel**| 产品内提示| 所有用户   | 项目 SideMenu 底部  | 管理员手动创建    | 通知卡片          | 无内置配额逻辑         | 仅管理员可配置  |
-
-### 5.2 各通道的提示内容对比
-
-| 通道                | 75% 时提示                   | 100% 时提示                          | 超限后提示                |
-|--------------------|-----------------------------|--------------------------------------|-------------------------|
-| **FreePlanUsage**  | 进度条变琥珀色（无文字）       | 进度条变红+边框变红（无文字）           | 同 100%（进度条不超 100%）|
-| **UpgradePrompt**  | 不显示                       | 不显示                                | 红色横幅+明确阻断文案      |
-| **Billing Alerts** | 邮件："compute spend crossed 75%" | 邮件："compute spend crossed 100%"  | 邮件（200%/500%/尖峰）    |
-| **NotificationPanel**| 无                          | 无                                   | 无（除非管理员手动创建）   |
-
-### 5.3 免费用户完整体验时间线（校准版）
+### 4.2 免费用户完整时间线
 
 ```
-用量 0%─────75%─────95%─────100%──────────→
+用量 0%─────75%─────90%─────95%─────100%──────────→
 
-       │       │       │        │
-       ▼       ▼       ▼        ▼
-    FreePlan  FreePlan  FreePlan   UpgradePrompt
-    绿色      琥珀色    红色       红色横幅
-    (侧边栏)  (侧边栏)  (侧边栏)  (全局 NavBar)
-                       +红色边框
-                       
-    ◄── 邮件 (如配置了 Billing Alerts) ──►
-    Billing   Billing   Billing    Billing
-    Alert 75% Alert 90% Alert 100% Alert 200%...
-    (邮箱)    (邮箱)    (邮箱)     (邮箱)
-    
-                                    │
-                                    ▼
-                                 API 阻断
-                                 OutOfEntitlementError
-                                 (仅非 DEV 环境)
+产品内提示：
+       │       │       │       │        │
+       ▼       ▼       ▼       ▼        ▼
+    FreePlan  FreePlan  FreePlan  FreePlan  UpgradePrompt
+    绿色      琥珀色    琥珀色     红色      红色横幅
+    (侧边栏)  (侧边栏)  (侧边栏)  (侧边栏)  (全局 NavBar)
+                                         +红色边框
+
+邮件提醒（前提：已配置邮箱 + alertLevels 包含对应阈值）：
+       │               │       │        │
+       ▼               ▼       ▼        ▼
+    Billing          Billing  Billing  Billing
+    Alert 75%        Alert    Alert    Alert 200%...
+    (邮箱)           90%      100%     (邮箱)
+                     (邮箱)   (邮箱)
+                     
+                                         │
+                                         ▼
+                                      API 阻断
+                                      OutOfEntitlementError
+                                      (仅非 DEV 环境)
+
+注意：
+- FreePlanUsage 75% 变琥珀色是产品内最早的提示（无需配置）
+- Billing Alert 75% 邮件需要提前配置邮箱
+- 如果未配置邮箱：唯一的产品内提示是 FreePlanUsage 颜色变化 + UpgradePrompt（超 100% 后）
 ```
 
-### 5.4 付费用户完整体验时间线（校准版）
+### 4.3 付费用户完整时间线
 
 ```
 用量 0%─────75%─────90%─────100%──────────→
 
+产品内提示：
+       │                       │       │
+       │                       ▼       │
+       │                    Limits    │
+       │                    90%橙     │
+       │                  (需主动查看) │
+
+邮件提醒（前提：已配置邮箱 + alertLevels 包含对应阈值）：
        │               │       │        │
        ▼               ▼       ▼        ▼
-    Billing          Limits   Billing  Billing
-    Alert 75%        90%橙    Alert    Alert 200%
-    (邮箱)          (需主动    100%     (邮箱)
-                     查看)    (邮箱)
+    Billing          Billing  Billing  Billing
+    Alert 75%        Alert    Alert    Alert 200%...
+    (邮箱)           90%      100%     (邮箱)
+                     (邮箱)   (邮箱)
 
-    注意：付费用户
-    ✗ 没有 FreePlanUsage
-    ✗ 没有 UpgradePrompt
-    ✓ 有 Billing Alerts（与免费用户相同的配置界面）
-    ✓ 有 Usage 页面（需主动查看）
-    ✓ 有 Limits 页面（需主动查看）
+付费用户注意：
+  ✗ 没有 FreePlanUsage（侧边栏无进度条）
+  ✗ 没有 UpgradePrompt（无超限横幅）
+  ✓ 有 Billing Alerts（需配置邮箱）
+  ✓ 有 Usage 页面（需主动查看，UsageBar 仅绿色深浅变化）
+  ✓ 有 Limits 页面（需主动查看，90%/100% 数字变色）
+  ✓ 付费用户超限时 API 不阻断（canExceed 机制）
 ```
 
-### 5.5 职责边界总结
+### 4.4 免费用户 vs 付费用户的核心差异
+
+| 维度                  | 免费用户                                   | 付费用户                                |
+|----------------------|-------------------------------------------|----------------------------------------|
+| 产品内持续提示         | FreePlanUsage 进度条（75%/95% 颜色变化）    | ❌ 无                                   |
+| 产品内超限提示         | UpgradePrompt 红色横幅                      | ❌ 无                                   |
+| 邮件提醒              | Billing Alerts（需配置邮箱）                 | Billing Alerts（需配置邮箱）             |
+| 被动查看页面          | Usage / Limits                              | Usage / Limits                          |
+| API 超限行为          | OutOfEntitlementError 阻断                   | canExceed=true 时不阻断，超出部分按量计费  |
+| 首个产品内预警时机     | 75%（FreePlanUsage 变琥珀色）                | ❌ 无自动预警                            |
+| 首个邮件预警时机      | 75%（如已配置 Billing Alerts）                | 75%（如已配置 Billing Alerts）            |
+
+### 4.5 付费用户缺少持续提示的问题
+
+付费用户在产品内**没有任何持续可见的用量提示**：
+- 没有 FreePlanUsage 进度条
+- 没有 UpgradePrompt 横幅
+- UsageBar 仅在 Usage 页面可见，且只有绿色深浅变化
+- Limits 页面需要主动导航
+- 唯一的自动提醒是 Billing Alerts 邮件（需配置邮箱）
+
+如果付费用户**没有配置 Billing Alerts 邮箱**，则：
+- 75% 时：**无任何提示**
+- 90% 时：**无任何提示**（除非主动查看 Limits 页面）
+- 100% 时：**无任何提示**
+- 仅当主动查看 Usage 或 Limits 页面才能发现用量状态
+
+---
+
+## 五、FreePlanUsage、UpgradePrompt、NotificationPanel、Billing Alerts 的职责边界
+
+### 5.1 职责矩阵
+
+| 通道                | 通道类型   | 目标用户    | 展示位置             | 触发时机         | 提醒方式          | 阈值体系                | 需要配置 | 产品内可见 |
+|--------------------|-----------|------------|---------------------|-----------------|------------------|------------------------|---------|-----------|
+| **FreePlanUsage**  | 产品内提示 | 仅免费用户  | 项目 SideMenu 底部   | 始终可见         | 进度条颜色变化     | 75% 绿→琥珀, 95%→红    | 否      | 是（展开时）|
+| **UpgradePrompt**  | 产品内提示 | 仅免费用户  | 全局 NavBar 下方     | usage > included | 红色横幅+阻断文案  | 100%（无中间阈值）      | 否      | 是         |
+| **Billing Alerts** | 邮件提醒   | 所有用户    | 组织设置页配置       | 阈值触发          | 邮件通知          | 75/90/100/200/500%+尖峰 | **是**  | 否（仅邮件）|
+| **NotificationPanel**| 产品内提示| 所有用户    | 项目 SideMenu 底部   | 管理员手动创建    | 通知卡片          | 无内置配额逻辑          | 管理员  | 是         |
+
+### 5.2 提示与邮件的功能边界
+
+```
+┌───────────────────────────────────────────────────────────────┐
+│                    产品内提示（Dashboard 内）                    │
+│                                                               │
+│  ┌─────────────────┐    ┌─────────────────┐                  │
+│  │ FreePlanUsage   │    │ UpgradePrompt   │                  │
+│  │ 被动·持续·视觉   │    │ 被动·超限·强制   │                  │
+│  │ 仅免费用户       │    │ 仅免费用户       │                  │
+│  │ 不需配置         │    │ 不需配置         │                  │
+│  └─────────────────┘    └─────────────────┘                  │
+│           │                       │                          │
+│           │  75%/95% 颜色          │ 100%+ 红色横幅            │
+│           ▼                       ▼                          │
+│  [预警] 进度条变色，无文字    [告知] 已被阻断，需升级           │
+│                                                               │
+│  ┌─────────────────┐    ┌─────────────────┐                  │
+│  │ NotificationPanel│    │ Limits/Usage 页 │                  │
+│  │ 可扩展·未启用    │    │ 被动·按需·详细   │                  │
+│  │ 所有用户         │    │ 所有用户         │                  │
+│  │ 管理员手动创建    │    │ 需主动导航       │                  │
+│  └─────────────────┘    └─────────────────┘                  │
+└───────────────────────────────────────────────────────────────┘
+
+┌───────────────────────────────────────────────────────────────┐
+│                    邮件提醒（Dashboard 外）                      │
+│                                                               │
+│  ┌─────────────────────────────────────────────────┐         │
+│  │ Billing Alerts                                   │         │
+│  │ 主动推送·可配置·异步                               │         │
+│  │ 所有用户                                          │         │
+│  │ 需要用户配置邮箱 + 阈值                            │         │
+│  │ 唯一脱离 Dashboard 的提醒通道                      │         │
+│  └─────────────────────────────────────────────────┘         │
+└───────────────────────────────────────────────────────────────┘
+```
+
+### 5.3 职责边界总结
 
 **FreePlanUsage**：产品内·被动·持续的用量感知
-- 职责：让免费用户在正常使用过程中**随时感知**用量进度
-- 局限：仅颜色变化无文字，折叠时不可见，不自动刷新
+- 职责：让免费用户在正常使用过程中随时感知用量进度
+- 覆盖：仅免费用户，仅产品内，仅侧边栏展开时
+- 局限：仅颜色变化无文字，折叠时不可见，不自动刷新，不发送邮件
 
 **UpgradePrompt**：产品内·被动·强制的阻断告知
-- 职责：在免费用户**已被阻断后**告知原因和解决方案
-- 局限：仅超 100% 后出现，没有预警功能
+- 职责：在免费用户已被阻断后告知原因和解决方案
+- 覆盖：仅免费用户，仅超 100% 后，全局可见
+- 局限：无预警功能，不发送邮件，仅免费用户
 
 **Billing Alerts**：邮件·主动·可配置的阈值推送
-- 职责：在用户**不看 Dashboard** 时也能通过邮件获知用量状态
-- 覆盖：**免费用户和付费用户均可使用**
-- 局限：需要用户主动配置邮箱，邮件可能被忽略
+- 职责：在用户不看 Dashboard 时通过邮件获知用量状态
+- 覆盖：**所有用户**，不依赖 Dashboard 在线
+- 局限：**需要用户主动配置邮箱**，未配置则不会收到任何邮件
+- 关键风险：100% 邮件是否必收取决于 Billing API 默认 alertLevels 是否包含 1.0
 
 **NotificationPanel**：产品内·被动·可扩展的通知卡片
-- 职责：展示管理员创建的**产品内通知**（含配额告警的扩展点）
+- 职责：展示管理员创建的产品内通知
+- 覆盖：所有用户，SideMenu 内
 - 现状：**未用于配额告警**，仅用于产品公告等
 
 ---
 
-## 六、Billing Alerts 的数据流与缓存
-
-### 6.1 完整数据流
-
-```
-┌──────────────────────────┐
-│ Billing Alerts 配置页面    │
-│ (setBillingAlert)         │
-│   amount × 100 → 美分     │
-│   emails[]               │
-│   alertLevels[]          │
-└────────────┬─────────────┘
-             │ POST
-             ▼
-┌──────────────────────────┐
-│ Platform Billing API     │
-│ .updateBillingAlerts()   │
-│   存储: amount, emails,  │
-│         alertLevels      │
-│   后台监控: usage 对比    │
-│   各 alertLevel × amount │
-│   达到阈值 → 发送邮件     │
-└──────────────────────────┘
-
-读取:
-┌──────────────────────────┐
-│ loader → getBillingAlerts│
-│   → client.getBillingAlerts()
-│   → 返回 { amount(美分), emails[], alertLevels[] }
-│   → 页面 amount / 100 → 美元显示
-└──────────────────────────┘
-```
-
-### 6.2 Billing Alerts 不走 platformCache
-
-与 `usage`、`limits`、`entitlement` 不同，`getBillingAlerts` 和 `setBillingAlert` **直接调用 BillingClient**，不经过 `platformCache` 的 SWR 缓存：
-
-```ts
-export async function getBillingAlerts(organizationId: string) {
-  if (!client) return undefined;
-  const result = await client.getBillingAlerts(organizationId);
-  // 直接返回，无缓存
-}
-```
-
-这意味着：
-- 配置页面每次加载都直接查询 Billing API
-- 修改后立即生效（无缓存延迟）
-- 但邮件告警的触发判定在 Billing API 后台进行，与 Webapp 无关
-
-### 6.3 邮件告警与 Dashboard 提示的独立运行
-
-```
-邮件告警路径（Billing API 后台）:
-  Usage 上报 → Billing API 聚合 → 对比 alertLevel × amount → 发邮件
-  (无 Webapp 缓存延迟，Billing API 内部实时判定)
-
-Dashboard 提示路径（Webapp）:
-  org loader → getCachedUsage (5min/10min) → FreePlanUsage / UpgradePrompt
-  (有缓存延迟，见下文)
-```
-
-**邮件告警可能比 Dashboard 提示更早到达用户。** 这是一个合理的设计：邮件通道不受 Webapp 缓存 TTL 限制，Billing API 可以在自己的后台逻辑中实时判定阈值。
-
----
-
-## 七、缓存窗口导致的提示与阻断不同步问题
-
-### 7.1 缓存 TTL 对比
-
-| 缓存项       | Fresh TTL | Stale TTL | 消费者                                  |
-|-------------|-----------|-----------|----------------------------------------|
-| `usage`     | 5 min     | 10 min    | org loader → FreePlanUsage / UpgradePrompt / UsageBar |
-| `limits`    | 5 min     | 10 min    | getCurrentPlan → org loader              |
-| `entitlement`| 1 min    | 2 min     | triggerTask / batchTrigger               |
-| Billing Alerts| 无缓存   | —         | 直接查询 Billing API                     |
-
-### 7.2 两条独立路径导致的不同步
-
-```
-路径 A: Dashboard 提示
-  getCachedUsage → platformCache.usage (5min fresh / 10min stale)
-  → usagePercentage → FreePlanUsage 颜色
-  → hasExceededFreeTier → UpgradePrompt 显示
-
-路径 B: API 阻断
-  getEntitlement → platformCache.entitlement (1min fresh / 2min stale)
-  → hasAccess === false → OutOfEntitlementError
-```
-
-**典型不同步场景**：entitlement 缓存（1-2 min）比 usage 缓存（5-10 min）更快反映超限状态。API 可能在 T+2 min 开始阻断，但 Dashboard 到 T+10 min 才显示超限。用户在 T+2~T+10 之间看到 Dashboard 正常但 API 报错。
-
-加上 org loader 的 `shouldRevalidate` 仅在路径变化时触发，实际延迟可能更长。
-
-### 7.3 邮件告警不受缓存影响
-
-Billing Alerts 的阈值判定在 Platform Billing API 后台进行，不经过 Webapp 的 `platformCache`。这意味着：
-- **邮件告警的到达时间与 Dashboard 提示和 API 阻断均独立**
-- 邮件可能在 Dashboard 还没变红时就到达（Billing API 实时判定 vs Webapp 缓存延迟）
-- 邮件也可能在 API 已阻断后才到达（邮件发送队列延迟）
-
----
-
-## 八、关键代码索引
+## 六、关键代码索引
 
 | 功能                        | 文件                                                                                                              |
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------|
-| FreePlanUsage 组件          | [FreePlanUsage.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx) |
-| FreePlanUsage 颜色阈值      | [useTransform L10-L14](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx#L10-L14) |
-| SideMenu 渲染 FreePlanUsage | [SideMenu.tsx#L745-L752](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L745-L752) |
-| isFreeUser 判定             | [SideMenu.tsx#L180](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L180) |
-| Billing Alerts 页面         | [billing-alerts/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx) |
-| isFree 判定（Billing Alerts）| [billing-alerts/route.tsx#L194](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L194) |
-| Amount 只读渲染             | [billing-alerts/route.tsx#L222-L251](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L222-L251) |
+| CheckboxWithLabel 组件      | [Checkbox.tsx#L68-L177](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L68-L177) |
+| isChecked 初始化             | [Checkbox.tsx#L87](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L87) |
+| readOnly 阻止 onClick       | [Checkbox.tsx#L123](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L123) |
+| readOnly 阻止 onChange      | [Checkbox.tsx#L135](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L135) |
+| readOnly 视觉样式            | [Checkbox.tsx#L115-L118](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/Checkbox.tsx#L115-L118) |
+| 100% readOnly 设置           | [billing-alerts/route.tsx#L273](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L273) |
+| 100% defaultChecked 来源    | [billing-alerts/route.tsx#L271](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L271) |
+| alertLevels schema 校验     | [billing-alerts/route.tsx#L101-L104](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L101-L104) |
+| 尖峰告警默认选中逻辑         | [billing-alerts/route.tsx#L303-L306](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L303-L306) |
 | 标准阈值定义                | [billing-alerts/route.tsx#L185](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L185) |
 | 尖峰阈值定义                | [billing-alerts/route.tsx#L187](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L187) |
-| 100% readOnly               | [billing-alerts/route.tsx#L273](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L273) |
-| 尖峰默认勾选逻辑            | [billing-alerts/route.tsx#L303-L306](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L303-L306) |
-| 邮箱验证 schema            | [billing-alerts/route.tsx#L88-L100](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L88-L100) |
-| Amount 美分→美元            | [billing-alerts/route.tsx#L79](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L79) |
-| Amount 美元→美分（提交）    | [billing-alerts/route.tsx#L134](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L134) |
 | getBillingAlerts            | [platform.v3.server.ts#L600-L610](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L600-L610) |
 | setBillingAlert             | [platform.v3.server.ts#L612-L623](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L612-L623) |
-| OrganizationSettings 侧边栏 | [OrganizationSettingsSideMenu.tsx#L107-L114](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/OrganizationSettingsSideMenu.tsx#L107-L114) |
+| loader 中 alerts 数据处理   | [billing-alerts/route.tsx#L76-L81](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L76-L81) |
+| isFree 判定                 | [billing-alerts/route.tsx#L194](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L194) |
+| Amount 只读渲染             | [billing-alerts/route.tsx#L222-L251](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L222-L251) |
+| 邮箱校验 schema            | [billing-alerts/route.tsx#L88-L100](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L88-L100) |
+| 表单提交 amount × 100       | [billing-alerts/route.tsx#L134](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L134) |
+| FreePlanUsage 组件          | [FreePlanUsage.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx) |
+| SideMenu 渲染 FreePlanUsage | [SideMenu.tsx#L745-L752](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L745-L752) |
 | UpgradePrompt 横幅          | [UpgradePrompt.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UpgradePrompt.tsx) |
 | hasExceededFreeTier 计算    | [org route.tsx#L115-L120](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120) |
 | NotificationPanel           | [NotificationPanel.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/NotificationPanel.tsx) |
-| 通知查询逻辑                | [platformNotifications.server.ts#L139-L205](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platformNotifications.server.ts#L139-L205) |
-| 缓存 TTL 配置               | [platform.v3.server.ts#L91-L107](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L91-L107) |
-| Entitlement 阻断            | [triggerTaskV1.server.ts#L115-L120](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/triggerTaskV1.server.ts#L115-L120) |
-| Billing 页面（套餐展示）     | [billing/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing/route.tsx) |
+| NotificationPanel 通知查询  | [platformNotifications.server.ts#L139-L205](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platformNotifications.server.ts#L139-L205) |
+| UsageBar 组件               | [UsageBar.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx) |
+| Limits 页面颜色函数         | [limits/route.tsx#L809-L826](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L809-L826) |
+| OrganizationSettings 侧边栏 | [OrganizationSettingsSideMenu.tsx#L107-L114](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/OrganizationSettingsSideMenu.tsx#L107-L114) |
