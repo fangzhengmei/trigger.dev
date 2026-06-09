@@ -6,16 +6,44 @@
 
 ## 一、总体部署流水线概览
 
-CLI `deploy` 命令主入口 `packages/cli-v3/src/commands/deploy.ts:256` 的 `_deployCommand()`。整个流水线分为六大阶段：
+CLI `deploy` 命令主入口 `packages/cli-v3/src/commands/deploy.ts:256` 的 `_deployCommand()`。整个流水线在认证后于 `packages/cli-v3/src/commands/deploy.ts:364` 分叉为两条路径：
 
 ```
-┌─────────────┐   ┌──────────────┐   ┌──────────────┐   ┌────────────┐   ┌────────────┐   ┌──────────────┐
-│ 1. 项目发现  │──▶│ 2. 用户认证   │──▶│ 3. 任务收集   │──▶│ 4. 打包构建 │──▶│ 5. 推送镜像 │──▶│ 6. 上线终结  │
-│ (loadConfig) │   │ (login)      │   │ (buildWorker)│   │ (buildImage)│   │ (finalize) │   │ (promotion)  │
-└─────────────┘   └──────────────┘   └──────────────┘   └────────────┘   └────────────┘   └──────────────┘
+                     ┌─────────────┐   ┌──────────────┐
+                     │ 1. 项目发现  │──▶│ 2. 用户认证   │
+                     │ (loadConfig) │   │ (login)      │
+                     └──────┬──────┘   └──────┬───────┘
+                            │                 │
+                            ▼                 ▼
+              ┌─────────────────────────────────────────────┐
+              │        getProjectClient() (packages/cli-v3/src/commands/deploy.ts:351-358)        │
+              └─────────────────┬───────────────────────────┘
+                                │
+                    nativeBuildServer?
+                     ╱              ╲
+                   Yes               No
+                   ╱                  ╲
+    ┌──────────────────────┐   ┌──────────────────────┐
+    │ Native Build Server  │   │ 3. 本地打包           │
+    │ 归档+上传 workspace  │   │ (buildWorker)         │
+    │ contentHash: "-"     │   │ contentHash: 真实 MD5 │
+    └──────────┬───────────┘   └──────────┬───────────┘
+               │                          │
+               ▼                          ▼
+    ┌──────────────────────┐   ┌──────────────────────┐
+    │ initializeDeployment │   │ 4. 镜像构建           │
+    │ (服务端构建+推送)     │   │ (buildImage)          │
+    │ progress 更新 Hash   │   │ Docker / Depot        │
+    └──────────┬───────────┘   └──────────┬───────────┘
+               │                          │
+               ▼                          ▼
+    ┌──────────────────────┐   ┌──────────────────────┐
+    │ 5. finalize + 晋升   │◀──│ 5. 环境变量同步       │
+    │ (promotion)          │   │ 6. finalize + 晋升    │
+    └──────────────────────┘   └──────────────────────┘
 ```
 
-此外还有一条 **Native Build Server** 分支（`--native-build-server` / `--detach`），在第 3 步后直接将 workspace 归档上传，由服务端完成构建和镜像制作，CLI 仅等待结果流。两条分支的对比见后文。
+详细分叉点分析见第四章，contentHash 三层语义见第五章。
 
 ---
 
@@ -241,11 +269,65 @@ env: z.enum(["prod", "staging", "preview", "production"]),
 
 ---
 
-## 四、增量与全量发布的差异
+## 四、Native Build Server 与普通部署的分叉点
 
-trigger.dev 的「增量 / 全量」概念体现在三个层面：内容哈希（contentHash）、镜像构建缓存、以及 Native Build vs 本地构建。
+### 4.1 分叉位置：`options.nativeBuildServer` 判断
 
-### 4.1 contentHash：构建产物的指纹
+两条路径在 `packages/cli-v3/src/commands/deploy.ts:364-374` 处分叉：
+
+```ts
+if (options.nativeBuildServer) {
+  await handleNativeBuildServerDeploy({ ... });
+  return;  // 提前退出，不再执行后续本地构建流程
+}
+// ↓ 以下代码仅在普通路径执行
+const serverEnvVars = await projectClient.client.getEnvironmentVariables(resolvedConfig.project);
+// ...
+const [error, buildManifest] = await tryCatch(buildWorker({ ... }));
+// ...
+const deployment = await initializeOrAttachDeployment(projectClient.client, {
+  contentHash: buildManifest.contentHash,
+  // ...
+  isNativeBuild: false,
+}, envVars.TRIGGER_EXISTING_DEPLOYMENT_ID);
+```
+
+**关键区别**：
+- 普通路径：先 `buildWorker()` 在本地打包，得到真实 `contentHash`，再 `initializeDeployment()` 创建部署记录
+- Native 路径：先 `initializeDeployment(contentHash: "-")` 创建部署记录（占位值），归档上传整个 workspace，由服务端完成打包和构建
+
+两条路径的公共前置步骤是项目发现、认证、`getProjectClient()`（`packages/cli-v3/src/commands/deploy.ts:351-358`），之后立即分叉。
+
+### 4.2 两条路径的执行序列对比
+
+```
+普通路径                                           Native Build Server 路径
+──────────                                         ──────────────────────
+getProjectClient()                                 getProjectClient()
+  ↓                                                  ↓
+serverEnvVars = getEnvironmentVariables()           (跳过——服务端构建时获取)
+  ↓                                                  ↓
+buildWorker()  ← 本地 esbuild 打包                   createContextArchive()  ← 归档整个 workspace
+  ↓ contentHash = 真实 MD5                            ↓
+  ↓                                                  createArtifact() + 上传 tar.gz
+  ↓                                                  ↓
+initializeDeployment(contentHash: 真实值)            initializeDeployment(contentHash: "-")
+  isNativeBuild: false                               isNativeBuild: true
+  ↓                                                  artifactKey: S3 key
+buildImage()  ← 本地 Docker / Depot 构建              configFilePath: 相对路径
+  ↓                                                  ↓
+syncEnvVarsWithServer()  (可选)                      (服务端构建时处理)
+  ↓                                                  ↓
+finalizeDeployment()                                 finalizeDeployment()
+  ↓                                                  ↓
+完成                                                完成（或 --detach 提前返回）
+```
+
+---
+
+## 五、contentHash 的语义：占位值、真实值与元数据
+
+### 5.1 contentHash 的计算：仅存在于本地打包路径
 
 `packages/cli-v3/src/build/bundle.ts:244-323` 的哈希计算逻辑：
 
@@ -259,27 +341,98 @@ for (const outputFile of result.outputFiles) {
 contentHash: hasher.digest("hex"),  // packages/cli-v3/src/build/bundle.ts:323 最终 MD5 摘要
 ```
 
-**contentHash 是所有 esbuild 输出文件哈希的聚合**。任何一个源文件变动都会改变 contentHash。
+**contentHash 是所有 esbuild 输出文件哈希的 MD5 聚合**。任何一个源文件变动都会改变 contentHash。这个值仅在本地打包路径中计算——Native Build Server 路径中 CLI 不执行 esbuild，因此无法计算。
 
-### 4.2 服务端如何使用 contentHash
+### 5.2 contentHash 在三个层面的不同角色
 
-`apps/webapp/app/v3/services/initializeDeployment.server.ts:244` 将 contentHash 存入数据库：
+contentHash 在系统中以三种身份出现，它们的语义和生命周期各不相同：
+
+**① 部署记录占位值（WorkerDeployment.contentHash）**
+
+- 普通路径：`initializeDeployment()` 时传入真实 MD5 值（`packages/cli-v3/src/commands/deploy.ts:425`），服务端写入 `WorkerDeployment` 记录（`apps/webapp/app/v3/services/initializeDeployment.server.ts:244`）
+- Native 路径：`initializeDeployment()` 时传入 `"-"` 占位（`packages/cli-v3/src/commands/deploy.ts:1082`），服务端同样写入 `WorkerDeployment` 记录，但此时 `contentHash` 字段为无意义值
+
+Native 路径的占位值通过 **progressDeployment** API 更新为真实值。构建服务器在完成 esbuild 打包后，调用 `POST /api/v1/deployments/:id/progress`（`apps/webapp/app/routes/api.v1.deployments.$deploymentId.progress.ts:47-51`），传入 `contentHash` 和 `runtime`：
 
 ```ts
-return {
-  contentHash: payload.contentHash,  // 写入 WorkerDeployment 记录
-  // ... 其他字段 (apps/webapp/app/v3/services/initializeDeployment.server.ts:238-259)
-};
+// apps/webapp/app/routes/api.v1.deployments.$deploymentId.progress.ts:47-51
+deploymentService.progressDeployment(authenticatedEnv, deploymentId, {
+  contentHash: body.data.contentHash,
+  git: body.data.gitMeta,
+  runtime: body.data.runtime,
+  buildServerMetadata: body.data.buildServerMetadata,
+});
 ```
 
-**当前服务端不做基于 contentHash 的增量部署判定**——每次 `initializeDeployment` 都会创建一条全新的 `WorkerDeployment` 记录，递增版本号。contentHash 的用途主要是：
-1. 记录部署内容指纹，供 Dashboard 展示和排查
-2. 在 dev 模式下做增量检测（`packages/cli-v3/src/dev/devSupervisor.ts:310-311`：如果 `contentHash` 未变则跳过重建）
-3. 传递到运行时环境变量 `TRIGGER_CONTENT_HASH`，供 worker 运行时使用
+`progressDeployment()` 仅在 `PENDING` 或 `INSTALLING` 状态时可调用（`apps/webapp/app/v3/services/deployment.server.ts:60`），将占位值 `"-"` 更新为真实哈希。
 
-### 4.3 镜像构建缓存：Docker 层缓存
+**② Worker 元数据真实值（BackgroundWorker.contentHash）**
 
-虽然每次部署都是新建记录，但 Docker 镜像构建可以利用缓存：
+部署终结时，`finalizeDeployment()` 要求 `WorkerDeployment` 上已关联一个 `BackgroundWorker`（`apps/webapp/app/v3/services/finalizeDeployment.server.ts:41-52`）。BackgroundWorker 的 `contentHash` 来自构建产物元数据，而非部署记录：
+
+- V4 路径：`apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts:83`
+  ```ts
+  contentHash: body.metadata.contentHash,  // 来自 CLI 或构建服务器传入的 metadata
+  ```
+- V3 路径（已废弃）：`apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts:70`
+
+**BackgroundWorker.contentHash 是实际运行时的指纹**。它用于判断两个 worker 是否代码相同——在 `apps/webapp/app/v3/services/createBackgroundWorker.server.ts:107` 中，如果最新 worker 的 contentHash 与新部署相同，则直接复用现有 worker 而不创建新的：
+
+```ts
+// apps/webapp/app/v3/services/createBackgroundWorker.server.ts:107-109
+if (latestBackgroundWorker?.contentHash === body.metadata.contentHash) {
+  return latestBackgroundWorker;  // 代码未变，复用已有 worker
+}
+```
+
+**③ Docker 构建参数（TRIGGER_CONTENT_HASH）**
+
+contentHash 还作为 Docker build-arg 传入镜像构建，最终成为容器内的环境变量：
+
+- 本地构建：`packages/cli-v3/src/deploy/buildImage.ts:229`
+  ```ts
+  "--build-arg", `TRIGGER_CONTENT_HASH=${options.contentHash}`,
+  ```
+- 远程 Depot 构建：`packages/cli-v3/src/deploy/buildImage.ts:580`
+  ```ts
+  "--build-arg", `TRIGGER_CONTENT_HASH=${options.contentHash}`,
+  ```
+
+**这意味着 contentHash 被烧录进了 Docker 镜像**，worker 运行时可通过 `process.env.TRIGGER_CONTENT_HASH` 读取自己的内容指纹。
+
+### 5.3 contentHash 三层值的关系总结
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     WorkerDeployment 记录                        │
+│  contentHash: 普通路径=真实MD5 / Native路径=初始"-",后由progress更新 │
+│  用途: Dashboard 展示、版本记录                                    │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ finalize 时要求已关联
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     BackgroundWorker 记录                        │
+│  contentHash: 始终为真实值 (来自 metadata)                        │
+│  用途: worker 去重判断 (同 contentHash 复用已有 worker)             │
+└──────────────────────────┬──────────────────────────────────────┘
+                           │ 镜像内可读取
+                           ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                     Docker 镜像 (运行时)                         │
+│  TRIGGER_CONTENT_HASH: 作为 build-arg 烧录                       │
+│  用途: worker 进程可读自己的指纹                                    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+**注意**：WorkerDeployment.contentHash 和 BackgroundWorker.contentHash 可能不同步——Native 路径中，如果 `progressDeployment` 因故障未执行，部署记录的 contentHash 可能停留在 `"-"`，但 BackgroundWorker 的 contentHash 始终是真实值。
+
+---
+
+## 六、Docker 缓存与增量构建
+
+### 6.1 Docker 层缓存
+
+虽然每次部署都创建新记录，Docker 镜像构建可以利用缓存：
 
 ```ts
 // packages/cli-v3/src/commands/deploy.ts:74
@@ -292,7 +445,23 @@ useRegistryCache: z.boolean().default(false),  // --use-registry-cache 启用远
 - `--no-cache`：强制所有层重新构建（全量构建）
 - `--use-registry-cache`：将 Docker 缓存推送到远端 registry，跨 CI 运行复用
 
-### 4.4 版本号分配：乐观并发 + 重试
+### 6.2 contentHash 与 Docker 缓存的关系
+
+contentHash 和 Docker 缓存是**两个独立的优化维度**：
+
+- contentHash 是**源码级指纹**，反映 esbuild 产物的内容是否变化
+- Docker 缓存是**镜像层级复用**，反映 Dockerfile 指令对应层是否可复用
+
+它们的交互方式：
+
+1. contentHash 变化 → 新部署记录 → 新镜像构建 → Docker 可能复用未改变的层
+2. contentHash 不变 → dev 模式下跳过重建（`packages/cli-v3/src/dev/devSupervisor.ts:310-311`），生产部署仍会创建新记录
+3. `--no-cache` 跳过 Docker 层缓存 → 即使 contentHash 未变也全量构建
+4. contentHash 作为 `TRIGGER_CONTENT_HASH` build-arg → **如果 contentHash 变化，对应 Docker 层必然失效**（因为 ARG 值变了）
+
+这意味着 contentHash 实际上充当了 Docker 缓存的一个「失效信号」：代码改动 → contentHash 改变 → `TRIGGER_CONTENT_HASH` build-arg 改变 → 至少一层缓存失效。
+
+### 6.3 版本号分配：乐观并发 + 重试
 
 `apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts:46-99` 处理并发部署的版本冲突：
 
@@ -305,7 +474,7 @@ useRegistryCache: z.boolean().default(false),  // --use-registry-cache 启用远
 
 版本号格式类似 `20250208.1`（日期.序号）。
 
-### 4.5 两种构建路径的对比
+### 6.4 两种构建路径的对比
 
 | 维度 | 本地构建（默认路径） | Native Build Server（`--native-build-server`） |
 |------|---------------------|-----------------------------------------------|
@@ -317,7 +486,7 @@ useRegistryCache: z.boolean().default(false),  // --use-registry-cache 启用远
 | 环境变量同步 | buildManifest.deploy.sync | 服务端处理 |
 | 交互模式 | 等待构建+部署完成 | 可 `--detach` 立即返回 |
 
-### 4.6 本地构建 vs 自托管构建
+### 6.5 本地构建 vs 自托管构建
 
 `packages/cli-v3/src/commands/deploy.ts:440-442`：
 
@@ -333,7 +502,7 @@ const skipServerSideRegistryPush = options.localBuild;
 
 ---
 
-## 五、完整部署流程追踪
+## 七、完整部署流程追踪
 
 ### 阶段 1：项目发现
 
@@ -457,9 +626,9 @@ apiClient.finalizeDeployment(deploymentId, {
 
 ---
 
-## 六、CI 自动化部署的实践要点
+## 八、CI 自动化部署的实践要点
 
-### 6.1 必要的环境变量
+### 8.1 必要的环境变量
 
 ```yaml
 env:
@@ -468,7 +637,7 @@ env:
   # TRIGGER_PROJECT_REF: proj_xxxx     # 覆盖配置文件中的 project（可选）
 ```
 
-### 6.2 推荐的 CLI 命令
+### 8.2 推荐的 CLI 命令
 
 ```bash
 # 基础部署（生产环境）
@@ -489,7 +658,7 @@ npx trigger.dev@latest deploy . --env prod --skip-promotion
 npx trigger.dev@latest promote <version>
 ```
 
-### 6.3 项目根的确定逻辑（CI 注意事项）
+### 8.3 项目根的确定逻辑（CI 注意事项）
 
 | 场景 | 命令 | projectPath | workingDir |
 |------|------|-------------|------------|
@@ -499,7 +668,7 @@ npx trigger.dev@latest promote <version>
 
 **CI 中务必确保工作目录与 `trigger.config.ts` 的位置关系正确。**
 
-### 6.4 凭据错误的常见排查
+### 8.4 凭据错误的常见排查
 
 | 错误信息 | 原因 | 源码位置 | 解决 |
 |----------|------|----------|------|
@@ -510,7 +679,7 @@ npx trigger.dev@latest promote <version>
 
 ---
 
-## 七、关键源码索引
+## 九、关键源码索引
 
 | 关注点 | 仓库相对路径 |
 |--------|-------------|
@@ -533,6 +702,13 @@ npx trigger.dev@latest promote <version>
 | 常量定义 (CLOUD_API_URL, CONFIG_FILES) | `packages/cli-v3/src/consts.ts` |
 | 服务端部署初始化 | `apps/webapp/app/v3/services/initializeDeployment.server.ts` |
 | 版本号分配 + 并发重试 | `apps/webapp/app/v3/services/initializeDeployment/createDeploymentWithNextVersion.server.ts` |
-| 部署 API 路由 | `apps/webapp/app/routes/api.v1.deployments.ts` |
+| 部署初始化 API 路由 | `apps/webapp/app/routes/api.v1.deployments.ts` |
+| 部署 progress API（Native 构建更新 contentHash） | `apps/webapp/app/routes/api.v1.deployments.$deploymentId.progress.ts` |
+| 部署 progress 服务端逻辑 | `apps/webapp/app/v3/services/deployment.server.ts` |
+| 部署终结服务 | `apps/webapp/app/v3/services/finalizeDeployment.server.ts` |
+| 部署终结 V2（含镜像推送） | `apps/webapp/app/v3/services/finalizeDeploymentV2.server.ts` |
+| BackgroundWorker 创建 V4 | `apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts` |
+| BackgroundWorker 创建 V3（已废弃） | `apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts` |
+| Worker 去重与资源创建 | `apps/webapp/app/v3/services/createBackgroundWorker.server.ts` |
 | 部署 API schema | `packages/core/src/v3/schemas/api.ts` |
 | Dev 模式增量检测 | `packages/cli-v3/src/dev/devSupervisor.ts` |
