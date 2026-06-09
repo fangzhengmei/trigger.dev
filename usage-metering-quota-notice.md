@@ -1,530 +1,494 @@
 # Trigger.dev 用量计量与套餐配额告警机制
 
-本文档基于代码分析，深入梳理 trigger.dev 在配额接近上限时的提示机制，包括 Limits 页面颜色和文案变化、Rate limit 剩余 token 的视觉显示、UsageBar 与 Billing Alerts 各自承担的提醒功能，以及这些提示与权益阻断之间的顺序关系。
+本文档基于代码分析，深入梳理 trigger.dev 在配额接近上限时的提示机制，重点剖析免费用户侧边栏 FreePlanUsage 组件、SideMenu 渲染条件、75%/95%/100% 颜色阈值表现、各提示组件的职责边界，以及缓存窗口导致的提示与阻断不同步问题。
 
 ---
 
-## 一、Limits 页面：配额达到 90%/100% 时的颜色与文案变化
+## 一、FreePlanUsage 组件：侧边栏配额进度条
 
-### 1.1 核心颜色函数 `getUsageColorClass`
+### 1.1 组件代码
 
-代码位置：[getUsageColorClass](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L809-L826)
+代码位置：[FreePlanUsage](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx)
 
 ```ts
-function getUsageColorClass(
-  percentage: number | null,
-  mode: "usage" | "remaining" = "usage"
-): string {
-  if (percentage === null) return "text-text-dimmed";
+export function FreePlanUsage({ to, percentage }: { to: string; percentage: number }) {
+  const cappedPercentage = Math.min(percentage, 1);
+  const widthProgress = useMotionValue(cappedPercentage * 100);
+  const color = useTransform(
+    widthProgress,
+    [0, 74, 75, 95, 100],
+    ["#22C55E", "#22C55E", "#F59E0B", "#F43F5E", "#F43F5E"]
+  );
 
-  if (mode === "remaining") {
-    // For remaining tokens: 0 = bad (red), <=10% = warning (orange)
-    if (percentage <= 0) return "text-error";
-    if (percentage <= 0.1) return "text-warning";
-    return "text-text-bright";
-  } else {
-    // For usage: 100% = bad (red), >=90% = warning (orange)
-    if (percentage >= 1) return "text-error";
-    if (percentage >= 0.9) return "text-warning";
-    return "text-text-bright";
-  }
+  const hasHitLimit = cappedPercentage >= 1;
+
+  return (
+    <div className={cn(
+      "rounded border border-charcoal-700 bg-charcoal-750 p-2.5",
+      hasHitLimit && "border-error/40"
+    )}>
+      <div className="flex items-center justify-between gap-2">
+        <div className="flex items-center gap-1">
+          <ArrowUpCircleIcon className="h-5 w-5 text-text-dimmed" />
+          <span className="text-2sm text-text-bright">Free Plan</span>
+        </div>
+        <Link to={to} className="text-2sm text-text-link focus-custom">
+          Upgrade
+        </Link>
+      </div>
+      <div className="relative mt-3 h-1 rounded-full bg-background-dimmed">
+        <motion.div
+          initial={{ width: 0 }}
+          animate={{ width: cappedPercentage * 100 + "%" }}
+          style={{ backgroundColor: color }}
+          transition={{ duration: 1, type: "spring" }}
+          className="absolute left-0 top-0 h-full rounded-full"
+        />
+      </div>
+    </div>
+  );
 }
 ```
 
-该函数接收两个参数：
-- `percentage`：0-1 范围的使用百分比
-- `mode`：`"usage"` 表示使用量（越高越差），`"remaining"` 表示剩余量（越低越差）
+### 1.2 三段颜色阈值
 
-### 1.2 Quota 行的颜色逻辑
-
-代码位置：[QuotaRow](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L554-L684)
-
-Quota 行计算 percentage 并在"Current"列应用颜色：
+使用 Framer Motion 的 `useTransform` 实现连续颜色插值：
 
 ```ts
-const percentage =
-  !hideCurrentUsage && quota.limit && quota.limit > 0
-    ? quota.currentUsage / quota.limit
-    : null;
-
-// 在 TableCell 上应用颜色
-<TableCell
-  alignment="right"
-  className={cn(
-    "tabular-nums",
-    hideCurrentUsage ? "text-text-dimmed" : getUsageColorClass(percentage, "usage")
-  )}
->
+const color = useTransform(
+  widthProgress,         // 输入：0-100 的进度值
+  [0, 74, 75, 95, 100], // 输入断点
+  ["#22C55E", "#22C55E", "#F59E0B", "#F43F5E", "#F43F5E"]  // 输出颜色
+);
 ```
 
-**颜色变化规则（Quota Usage 模式）：**
+| 使用率范围        | 进度条颜色              | Tailwind 近似色  | 含义         |
+|------------------|------------------------|-----------------|-------------|
+| 0% – 74%         | `#22C55E`              | green-500       | 正常（绿色） |
+| 75% – 94%        | `#F59E0B`              | amber-500       | 警告（琥珀色）|
+| 95% – 100%+      | `#F43F5E`              | rose-500        | 危险（红色） |
 
-| 使用率范围        | CSS 类名           | 视觉效果  | 含义         |
-|------------------|--------------------|-----------|-------------|
-| < 90%            | `text-text-bright` | 亮白色    | 正常         |
-| 90% – 99.99%     | `text-warning`     | 橙色/警告色 | 接近上限警告 |
-| ≥ 100%           | `text-error`       | 红色/错误色 | 已达/超限    |
-| 无 limit 或隐藏   | `text-text-dimmed` | 灰色      | 不适用       |
+颜色变化特点：
+- **75% 是从绿到琥珀的转折点**，是所有组件中最早的视觉预警
+- **95% 是从琥珀到红的转折点**，比 Limits 页面的 90% 更晚
+- 75%-95% 之间颜色平滑过渡（`useTransform` 线性插值）
+- 0%-74% 始终绿色，75% 瞬间跳变到琥珀色
 
-**关键发现：Limits 页面仅在 Current 列的数字文字上变色，没有进度条、背景色或其他更醒目的视觉提示。** 没有 75% 的提前预警色，只有 90% 和 100% 两个阈值。
-
-### 1.3 不显示当前用量的 Quota
-
-以下类型的 Quota 隐藏了当前用量，不适用颜色变化：
-
-| Quota 名称              | 原因                                     |
-|------------------------|------------------------------------------|
-| Log retention          | 时长型指标，非计数                         |
-| Query period           | 时长型指标，非计数                         |
-| Charts per dashboard   | 每个 dashboard 不同，无法展示单一数值        |
-| Max queued runs        | 实时队列大小，在 Limits 页面隐藏             |
-
-### 1.4 Quota 超限时的文案和交互
-
-各功能页面（非 Limits 页面）在用户尝试创建超限资源时弹出对话框：
-
-**Schedules 页面**：[schedules/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.schedules/route.tsx#L192-L194)
-
-```
-DialogHeader: "You've exceeded your limit"
-DialogDescription: "You've used {used}/{limit} of your schedules."
-DialogFooter: [Upgrade] 按钮
-```
-
-**Branches 页面**：[branches/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.branches/route.tsx#L240-L246)
+### 1.3 超限时的额外视觉效果
 
 ```ts
-const requiresUpgrade =
-  plan?.v3Subscription?.plan &&
-  limits.used >= plan.v3Subscription.plan.limits.branches.number &&
-  !plan.v3Subscription.plan.limits.branches.canExceed;
-
-const atBranchLimit = limits.used >= limits.limit;
-```
-
-- `requiresUpgrade`（canExceed=false 且已达限额）→ 显示红色错误文案：
-  ```
-  "You've used all {limit} of your branches. Archive one or upgrade your plan to enable more."
-  ```
-- `atBranchLimit`（已达限额但 canExceed=true）→ 显示红色标题 + 普通用量文案：
-  ```
-  Header: "You've used {used}/{limit} of your branches" (text-error)
-  ```
-
-Branches 页面还有**环形进度图**，颜色为：
-- 正常：`stroke-success`（绿色）
-- 达到限额：`stroke-error`（红色）
-
----
-
-## 二、Rate Limit 剩余 Token 低于 10% 的显示方式
-
-### 2.1 Rate Limit 行的 Token 展示
-
-代码位置：[RateLimitRow](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L344-L415)
-
-```ts
-const maxTokens = info.config.type === "tokenBucket"
-  ? info.config.maxTokens
-  : info.config.tokens;
-
-const percentage =
-  info.currentTokens !== null && maxTokens > 0
-    ? info.currentTokens / maxTokens
-    : null;
-```
-
-展示结构：
-```
-┌──────────────────────────────────────┐
-│  {AnimatedNumber}  ← 当前剩余 token（带颜色）  │
-│  of {maxTokens}    ← 灰色小字               │
-└──────────────────────────────────────┘
-```
-
-颜色使用 `getUsageColorClass(percentage, "remaining")` 模式：
-
-| 剩余 Token 百分比   | CSS 类名           | 视觉效果  | 含义           |
-|--------------------|--------------------|-----------|---------------|
-| > 10%              | `text-text-bright` | 亮白色    | 正常           |
-| 1% – 10%           | `text-warning`     | 橙色/警告色 | 即将耗尽警告   |
-| 0%                 | `text-error`       | 红色/错误色 | 已耗尽         |
-| 无法获取            | `text-text-dimmed` | 灰色 "–"  | 不可用         |
-
-### 2.2 Token 数值使用动画显示
-
-代码位置：[AnimatedNumber](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L382)
-
-```tsx
-<AnimatedNumber value={info.currentTokens} />
-```
-
-使用 `AnimatedNumber` 组件，当 Token 数值变化时有动画过渡效果，让用户直观感知到 Token 正在消耗。
-
-### 2.3 Limits 页面自动刷新
-
-代码位置：[loader](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L97-L112)
-
-```ts
-const autoReloadPollIntervalMs = 5000;
-useAutoRevalidate({ interval: data.autoReloadPollIntervalMs, onFocus: true });
-```
-
-- 每 **5 秒**自动重新请求 loader 数据
-- 窗口获得焦点时也会刷新
-- 确保 Rate Limit Token 余量近乎实时更新
-
-### 2.4 Token 查询机制
-
-代码位置：[getRateLimitRemainingTokens](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/presenters/v3/LimitsPresenter.server.ts#L458-L491)
-
-```ts
-const ratelimit = new Ratelimit({
-  redis: rateLimitRedisClient,
-  limiter,
-  ephemeralCache: new Map(),
-  analytics: false,
-  prefix: `ratelimit:${keyPrefix}`,
-});
-const remaining = await ratelimit.getRemaining(hashedKey);
-```
-
-- 使用与 Rate Limit 中间件**相同的 Redis 实例和配置**查询剩余 Token
-- API Key 经过 SHA-256 哈希后查询（与中间件一致）
-- Batch Rate Limit 使用 environmentId 直接查询（不哈希）
-- 查询失败返回 `null`，页面显示 "–"
-
----
-
-## 三、UsageBar 承担的提醒功能
-
-### 3.1 组件职责
-
-代码位置：[UsageBar](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx)
-
-UsageBar 是一个**金额维度的进度可视化组件**，用于 Usage 页面，展示当月 compute 花费相对于套餐限额的进度。
-
-### 3.2 三层可视化结构
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ ████████████████████████████████████░░░░░░░░░░░░░░░░░░░░░░░░░  │
-│ ↑ Used (current)      ↑ Included usage / Tier limit            │
-│     green-600/700         green-900/50                          │
-│                          ↑ Billing limit (optional)             │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-| 层级                    | CSS 类                          | 颜色           | 含义                          |
-|------------------------|---------------------------------|---------------|-------------------------------|
-| Used                   | `bg-green-600` / `bg-green-700` | 亮绿/深绿      | 当前已花费金额                 |
-| Included usage / Tier limit | `bg-green-900/50`          | 半透明深绿     | 套餐包含的免费额度              |
-| Billing limit          | （无特定颜色类）                  | 透明/默认      | 用户自定义的账单上限            |
-| Capped usage           | `bg-green-600`                  | 亮绿           | 用量在限额内的部分              |
-
-### 3.3 超限时的颜色变化
-
-```ts
+const hasHitLimit = cappedPercentage >= 1;
+// 容器边框变为错误色
 className={cn(
-  "absolute h-3 rounded-l-sm",
-  tierLimit && current > tierLimit ? "bg-green-700" : "bg-green-600"
+  "rounded border border-charcoal-700 bg-charcoal-750 p-2.5",
+  hasHitLimit && "border-error/40"
 )}
 ```
 
-- **未超限**（`current <= tierLimit`）：`bg-green-600`（标准绿）
-- **已超限**（`current > tierLimit`）：`bg-green-700`（深绿，视觉更暗）
+- **使用率 ≥ 100%**：容器边框变为 `border-error/40`（半透明红色边框）
+- 进度条宽度上限 `cappedPercentage = Math.min(percentage, 1)`，始终不会超过 100%
 
-**关键发现：UsageBar 超限时仅从标准绿变为深绿，没有红色或橙色警告色。** 颜色变化非常微妙，不够醒目。
+### 1.4 组件 UI 结构
 
-### 3.4 Legend 标签文案
-
-| 标签                | 条件                   | 含义                 |
-|--------------------|-----------------------|----------------------|
-| "Used:"            | 始终显示               | 当前花费金额          |
-| "Included usage:"  | `isPaying === true`   | 付费用户的套餐包含额度 |
-| "Tier limit:"      | `isPaying === false`  | 免费用户的额度上限    |
-| "Billing limit:"   | `billingLimit` 已设置  | 自定义账单上限        |
-
-### 3.5 标签位置自适应
-
-代码位置：[Legend](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx#L107-L137)
-
-```ts
-const flipLegendPositionValue = 80;
-const flipLegendPosition = percentage > flipLegendPositionValue ? true : false;
+```
+┌─────────────────────────────────────┐
+│  ↑ Free Plan               Upgrade │  ← 头部：图标+文字+升级链接
+│  ═════════════════════════════      │  ← 进度条：颜色随阈值变化
+└─────────────────────────────────────┘
+         ↑ 边框变红 (percentage ≥ 100%)
 ```
 
-当进度条超过 80% 时，标签自动翻转到左侧显示，避免溢出右侧边界。
-
-### 3.6 UsageBar 的局限性
-
-| 局限点                     | 说明                                                 |
-|---------------------------|------------------------------------------------------|
-| 无阈值预警色               | 没有 90%/100% 的橙/红色过渡                           |
-| 超限仅变色差               | green-600 → green-700 差异极小                        |
-| 无文案提示                 | 不显示 "approaching limit" 或 "exceeded" 等文字       |
-| 无百分比值                 | 不直接显示使用百分比                                  |
-| 进度条按最大值 1.1 倍缩放  | 即使 100% 也不会充满进度条，可能让用户误以为还有余量    |
+- "Free Plan" 文字始终显示，不随用量变化
+- "Upgrade" 链接始终可见，指向 billing 页面
+- 进度条高 1px（`h-1`），非常纤细
+- 使用 spring 动画过渡，持续 1 秒
 
 ---
 
-## 四、Billing Alerts 承担的提醒功能
+## 二、SideMenu 渲染 FreePlanUsage 的条件
 
-### 4.1 定位与职责
+### 2.1 渲染位置
 
-代码位置：[billing-alerts/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx)
+代码位置：[SideMenu](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L736-L753)
 
-Billing Alerts 是**唯一的主动推送提醒机制**（邮件），与 UsageBar 的被动可视化形成互补。
-
-### 4.2 标准告警阈值
-
-```ts
-const checkboxLevels = [0.75, 0.9, 1.0, 2.0, 5.0];
+```tsx
+<motion.div layout className={cn(
+  "flex flex-col gap-1 border-t border-grid-bright p-1",
+  isCollapsed && "items-center"
+)}>
+  <HelpAndAI isCollapsed={isCollapsed} ... />
+  {isFreeUser && (
+    <CollapsibleHeight isCollapsed={isCollapsed}>
+      <FreePlanUsage
+        to={v3BillingPath(organization)}
+        percentage={currentPlan.v3Usage.usagePercentage}
+      />
+    </CollapsibleHeight>
+  )}
+</motion.div>
 ```
 
-| 阈值   | 含义                    | 场景                           |
-|--------|------------------------|-------------------------------|
-| 75%    | 接近预算                | 早期预警，有时间调整            |
-| 90%    | 即将超预算              | 紧急预警                       |
-| 100%   | 达到预算                | 预算耗尽                       |
-| 200%   | 超出预算 2 倍           | 超额使用                       |
-| 500%   | 超出预算 5 倍           | 严重超额                       |
+FreePlanUsage 位于 SideMenu 的**最底部区域**（`grid-rows-[2.5rem_1fr_auto]` 中的 `auto` 行），在以下组件下方：
+1. IncidentStatusPanel（事故状态面板）
+2. V3DeprecationPanel（V3 弃用警告）
+3. NotificationPanel（平台通知卡片）
+4. HelpAndAI（帮助与 AI 助手）
 
-**100% 阈值不可取消**（`readOnly={level === 1.0}`），确保用户至少在预算耗尽时收到通知。
-
-### 4.3 尖峰告警阈值
+### 2.2 渲染条件
 
 ```ts
-const spikeAlertLevels = [10.0, 20.0, 50.0, 100.0];
+const isFreeUser = currentPlan?.v3Subscription?.isPaying === false;
 ```
 
-| 阈值     | 含义               | 场景                              |
-|----------|-------------------|-----------------------------------|
-| 10x      | 预算的 10 倍       | 异常飙升（bug 导致 runaway task）  |
-| 20x      | 预算的 20 倍       | 严重异常                          |
-| 50x      | 预算的 50 倍       | 极端异常                          |
-| 100x     | 预算的 100 倍      | 灾难性异常                        |
+| 条件                              | 是否渲染 FreePlanUsage |
+|----------------------------------|----------------------|
+| 免费用户 (`isPaying === false`)   | ✅ 显示               |
+| 付费用户 (`isPaying === true`)    | ❌ 不显示             |
+| 无计划信息 (`currentPlan` 为空)    | ❌ 不显示             |
+| 自托管环境（`client` 为 undefined）| ❌ 不显示（currentPlan 为空）|
 
-默认勾选逻辑：
+### 2.3 侧边栏折叠时的行为
+
+```tsx
+<CollapsibleHeight isCollapsed={isCollapsed}>
+  <FreePlanUsage ... />
+</CollapsibleHeight>
+```
+
+- 侧边栏折叠时，`CollapsibleHeight` 通过 CSS Grid `grid-rows-[0fr]` + `opacity-0` 将 FreePlanUsage 完全隐藏
+- **折叠状态下没有替代的 mini 图标**，用户完全看不到配额信息
+- 展开时通过 `grid-rows-[1fr]` + `opacity-100` 显示，带 200ms 动画
+
+### 2.4 percentage 数据来源
+
+代码位置：[org route.tsx loader](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120)
+
 ```ts
-defaultChecked={
-  alerts.alertLevels.includes(level) ||
-  !spikeAlertLevels.some((l) => alerts.alertLevels.includes(l))
+let hasExceededFreeTier = false;
+let usagePercentage = 0;
+if (plan?.v3Subscription && !plan.v3Subscription.isPaying && plan.v3Subscription.plan && usage) {
+  hasExceededFreeTier = usage.cents > plan.v3Subscription.plan.limits.includedUsage;
+  usagePercentage = usage.cents / plan.v3Subscription.plan.limits.includedUsage;
 }
+
+return typedjson({
+  currentPlan: { ...plan, v3Usage: { ...usage, hasExceededFreeTier, usagePercentage } },
+});
 ```
-如果用户之前没有配置过任何尖峰告警，则默认全部勾选。
 
-### 4.4 配置参数
+- `usagePercentage = usage.cents / includedUsage`（0 到 1+ 的浮点数）
+- 此值通过 `useCurrentPlan()` hook 在整个应用共享
+- 数据来自组织级 loader，**仅在页面导航时重新加载**（见下文 shouldRevalidate 分析）
 
-| 参数       | 类型           | 说明                                    |
-|-----------|---------------|-----------------------------------------|
-| amount    | number ($USD)  | 基准预算金额，存储时 × 100 转为美分       |
-| emails    | string[]       | 接收告警邮件的地址列表，至少一个          |
-| alertLevels | number[]     | 已启用的阈值列表                         |
+### 2.5 shouldRevalidate：何时刷新 usagePercentage
 
-### 4.5 免费用户的限制
+代码位置：[org route.tsx shouldRevalidate](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L33-L59)
 
 ```ts
-const isFree = !plan?.v3Subscription?.isPaying;
-// 免费用户: amount 显示为只读文本，不可编辑
-// 付费用户: amount 可编辑输入框
+export const shouldRevalidate: ShouldRevalidateFunction = (params) => {
+  // 仅在以下条件重新加载：
+  // 1. 组织 slug 变化
+  // 2. 项目 slug 变化
+  // 3. 环境 slug 变化
+  // 4. 环境 pause/resume 表单提交
+  // 5. URL 路径名变化（不含 search params）
+  return params.currentUrl.pathname !== params.nextUrl.pathname;
+};
 ```
 
-### 4.6 告警的触发机制
-
-Billing Alerts 的阈值判定和邮件发送由 **Platform Billing API** 在后台完成：
-
-```
-用量上报 → Platform Billing API 聚合 → 对比 alert.amount × alertLevels
-    → 达到阈值 → 发送邮件通知到配置的 emails
-```
-
-webapp 本身**不参与阈值判定和邮件发送**，仅负责配置的 CRUD。
+**关键发现：`usagePercentage` 不会自动定时刷新。** 它只在用户切换页面时重新加载。这与 Limits 页面的 5 秒自动轮询形成对比。
 
 ---
 
-## 五、提示与权益阻断之间的顺序关系
+## 三、五大提示组件的职责对比
 
-### 5.1 完整的"预警 → 阻断"时序
+### 3.1 职责矩阵
+
+| 组件              | 目标用户   | 显示位置          | 触发方式   | 何时可见               | 提醒类型   | 颜色阈值            |
+|------------------|-----------|-------------------|-----------|----------------------|-----------|-------------------|
+| **FreePlanUsage**| 免费用户   | SideMenu 底部      | 始终可见   | 侧边栏展开时始终显示    | 被动+持续  | 75% 绿→琥珀, 95%→红 |
+| **UsageBar**     | 所有用户   | Usage 页面         | 用户导航到  | 用户主动查看 Usage 页   | 被动+按需  | 仅绿色深浅变化       |
+| **Limits 页面**  | 所有用户   | Limits 页面表格    | 用户导航到  | 用户主动查看 Limits 页  | 被动+按需  | 90% 橙, 100% 红     |
+| **UpgradePrompt**| 免费用户   | 全局 NavBar 下方    | 超限时     | 超 100% 后所有页面     | 被动+强制  | 红色横幅            |
+| **Billing Alerts**| 付费用户  | 邮件               | 阈值触发   | 邮件客户端             | 主动推送   | 75%/90%/100%/...   |
+
+### 3.2 各组件的具体职责
+
+#### FreePlanUsage：持续可见的"仪表盘"
+
+- **唯一始终可见的配额进度指示器**（只要侧边栏展开）
+- 告诉用户：你用的是 Free Plan，用量到多少了
+- 提供 Upgrade 快捷链接
+- 不提供具体数字，只有进度条颜色
+- **不提供 75%/95% 的文字提示**，仅通过颜色暗示
+
+#### UsageBar：金额维度的详细可视化
+
+- 展示美元金额（Used / Included usage / Billing limit）
+- 按月选择器查看历史
+- 配合按任务分组的费用明细表和日趋势图
+- 超限时颜色从 `bg-green-600` 变为 `bg-green-700`（几乎看不出）
+- **职责：让用户理解钱花在哪里**
+
+#### Limits 页面：结构化限额清单
+
+- 按行展示每个 Quota 的 Limit / Current / Source / Upgrade
+- Rate Limit 实时 Token 余量（5 秒刷新）
+- Quota 达 90% 时 Current 数字变橙，达 100% 变红
+- **职责：让用户了解所有限制的精确数值**
+
+#### UpgradePrompt：超限后的强制提醒
+
+- 仅当 `hasExceededFreeTier === true` 时出现
+- 替换 NavBar 下的 EnvironmentBanner
+- 红色背景 + 错误图标 + 明确阻断文案
+- **职责：告知用户已被阻断，引导升级**
+
+#### Billing Alerts：脱离 Dashboard 的主动推送
+
+- 唯一不依赖用户主动查看的提醒
+- 通过邮件通知，阈值可配置
+- 100% 阈值不可取消
+- 含尖峰告警（10x/20x/50x/100x）
+- **职责：在用户不看 Dashboard 时也能知道接近上限**
+
+### 3.3 关键差异：FreePlanUsage vs UpgradePrompt
+
+| 维度         | FreePlanUsage                         | UpgradePrompt                         |
+|-------------|---------------------------------------|---------------------------------------|
+| 出现时机     | 始终可见（只要免费+侧边栏展开）         | 仅超 100% 后                           |
+| 显示位置     | SideMenu 底部                          | NavBar 下方（所有页面）                 |
+| 视觉强度     | 小卡片+纤细进度条                       | 全宽红色横幅+错误图标                   |
+| 文案内容     | "Free Plan" + "Upgrade" 链接           | 明确的阻断说明+下月重置日期             |
+| 目标用户     | 免费用户                               | 免费用户                               |
+| 折叠时       | 完全隐藏                               | 不受侧边栏折叠影响                     |
+| 百分比显示   | 有颜色进度条（75%/95% 阈值）            | 无进度条                              |
+
+**FreePlanUsage 是预警，UpgradePrompt 是告知阻断后果。** 两者之间存在"提示→阻断"的空档期：FreePlanUsage 在 75% 时变琥珀色但无文字，用户可能不理解含义；等到 UpgradePrompt 出现时已经超限被阻断了。
+
+---
+
+## 四、缓存窗口导致的提示与阻断不同步问题
+
+### 4.1 两条独立的数据路径
 
 ```
-┌─────────────────────────────────────────────────────────────────────┐
-│ 阶段 1: 被动可视化提示（Dashboard 内，用户需主动查看）               │
-│                                                                     │
-│  ┌──────────────┐   ┌──────────────┐   ┌──────────────────────┐   │
-│  │ UsageBar     │   │ Limits 页面  │   │ Branches/Schedules   │   │
-│  │ (Usage 页)   │   │ Quota 数字   │   │ 环形进度图+红色文案   │   │
-│  │ green 变化    │   │ 颜色变化      │   │ stroke-error         │   │
-│  └──────────────┘   └──────────────┘   └──────────────────────┘   │
-│       ↓ 75%            ↓ 90%              ↓ 100%                   │
-│   仅视觉提示          仅数字变色          弹窗+Upgrade按钮          │
-└─────────────────────────────────────────────────────────────────────┘
-         │
-         │ 用量继续增长
-         ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 阶段 2: 主动推送提醒（用户无需主动查看）                              │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────┐      │
-│  │ Billing Alerts (邮件)                                    │      │
-│  │ 75% → 90% → 100% → 200% → 500% → 10x → 20x → ...      │      │
-│  │ 到达阈值自动发送邮件到配置的邮箱                           │      │
-│  └──────────────────────────────────────────────────────────┘      │
-└─────────────────────────────────────────────────────────────────────┘
-         │
-         │ 用量继续增长（超免费额度）
-         ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 阶段 3: 全局顶部横幅提示（所有页面可见）                              │
-│                                                                     │
-│  ┌──────────────────────────────────────────────────────────┐      │
-│  │ UpgradePrompt (NavBar 内嵌)                              │      │
-│  │ 红色背景 + ExclamationCircleIcon + 错误色文字             │      │
-│  │ "You have exceeded the monthly $X free credits.          │      │
-│  │  Existing runs will be queued and new runs won't be      │      │
-│  │  created until {next month}, or you upgrade."            │      │
-│  │ + [Upgrade] 按钮                                         │      │
-│  └──────────────────────────────────────────────────────────┘      │
-│  触发条件: hasExceededFreeTier === true (仅免费用户)                 │
-│  显示位置: 替换 NavBar 下方的 EnvironmentBanner                     │
-└─────────────────────────────────────────────────────────────────────┘
-         │
-         │ 忽略横幅，继续尝试触发任务
-         ▼
-┌─────────────────────────────────────────────────────────────────────┐
-│ 阶段 4: API 层面权益阻断（硬阻断）                                    │
-│                                                                     │
-│  触发任务时的检查顺序：                                               │
-│  1. Entitlement 检查 → hasAccess === false → OutOfEntitlementError  │
-│     "You can't trigger a task because you have run out of credits." │
-│  2. Queue Size 守卫 → 超限 → ServiceValidationError                │
-│     "Cannot trigger ... queue size limit has been reached"          │
-│  3. Rate Limit → Token 耗尽 → HTTP 429 Too Many Requests           │
-└─────────────────────────────────────────────────────────────────────┘
+路径 A: Dashboard 提示（FreePlanUsage / UpgradePrompt / UsageBar / Limits）
+┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+│ org route.tsx     │     │ platformCache     │     │ Platform Billing  │
+│ loader            │────→│ .usage            │────→│ API               │
+│                   │     │ fresh: 5min       │     │ client.usage()    │
+│ usagePercentage   │     │ stale: 10min      │     │                   │
+│ hasExceededFreeTier│    │                   │     │                   │
+└───────────────────┘     └───────────────────┘     └───────────────────┘
+
+路径 B: API 阻断（Entitlement 检查）
+┌───────────────────┐     ┌───────────────────┐     ┌───────────────────┐
+│ triggerTask       │     │ platformCache     │     │ Platform Billing  │
+│ V1.server.ts      │────→│ .entitlement      │────→│ API               │
+│                   │     │ fresh: 1min       │     │ client.getEntit.. │
+│ getEntitlement()  │     │ stale: 2min       │     │                   │
+│ → OutOfEntitle..  │     │                   │     │                   │
+└───────────────────┘     └───────────────────┘     └───────────────────┘
 ```
 
-### 5.2 UpgradePrompt 的触发逻辑
+### 4.2 缓存 TTL 对比
 
-代码位置：[UpgradePrompt](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UpgradePrompt.tsx#L11-L47)
+| 缓存项       | Fresh TTL | Stale TTL | 用途                          | 消费者              |
+|-------------|-----------|-----------|------------------------------|--------------------|
+| `usage`     | 5 min     | 10 min    | 用量数据（cents）              | org loader → FreePlanUsage / UpgradePrompt / UsageBar |
+| `limits`    | 5 min     | 10 min    | 套餐限额（includedUsage 等）    | getCurrentPlan → org loader |
+| `entitlement`| 1 min    | 2 min     | 访问权限（hasAccess）           | triggerTask / batchTrigger |
+
+### 4.3 不同步场景分析
+
+#### 场景 1：Dashboard 显示正常但 API 已阻断
+
+```
+时间线：
+T+0    用户用量到达 includedUsage 的 100%
+T+0    Platform Billing API 更新 hasAccess = false
+T+0~1  entitlement 缓存仍在 fresh 期（1 min），API 查询返回旧值 hasAccess = true
+T+1~2  entitlement 缓存进入 stale 期，后台重新验证，新值 hasAccess = false 入缓存
+T+2    后续 API 调用读取到 hasAccess = false，开始阻断
+
+同时：
+T+0~5  usage 缓存仍在 fresh 期（5 min），FreePlanUsage 显示的 usagePercentage < 1
+T+5~10 usage 缓存进入 stale 期，后台重新验证
+T+10   FreePlanUsage 才可能显示更新后的百分比
+
+结果：API 在 T+2 开始阻断，但 Dashboard 到 T+10 才反映真实用量
+      用户在 T+2~T+10 之间看到 Dashboard 正常但 API 报错 OutOfEntitlementError
+```
+
+**最大延迟：usage 缓存最多比 entitlement 缓存晚 8 分钟反映用量变化。**
+
+#### 场景 2：Dashboard 显示超限但 API 仍放行
+
+```
+时间线：
+T+0    用量刚过 includedUsage
+T+0    Platform Billing API 的 entitlement 判定尚未触发（可能有内部延迟）
+T+0    usage 缓存重新验证后返回最新 cents > includedUsage
+T+0    FreePlanUsage 变红、UpgradePrompt 出现
+T+0~1  entitlement 缓存仍为 hasAccess = true（Billing API 内部尚未判定）
+T+1~2  entitlement 缓存重新验证，hasAccess = false 入缓存
+
+结果：Dashboard 显示超限，但 API 在 T+0~T+1 仍允许触发
+      这是"假阳性"——用户看到警告但实际仍能触发任务
+```
+
+#### 场景 3：org loader 的 shouldRevalidate 进一步延迟
+
+即使 usage 缓存已更新，org loader 的 `shouldRevalidate` 逻辑决定了何时重新执行 loader：
 
 ```ts
-if (!plan || !plan.v3Usage.hasExceededFreeTier) {
-  return null;
-}
+return params.currentUrl.pathname !== params.nextUrl.pathname;
 ```
 
-触发条件计算：
-
-代码位置：[org route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120)
-
-```ts
-hasExceededFreeTier = usage.cents > plan.v3Subscription.plan.limits.includedUsage;
-```
-
-- **仅对免费用户**（`!plan.v3Subscription.isPaying`）计算
-- 当 `usage.cents > includedUsage` 时触发
-- **没有 90% 的提前预警**，只有超过 100% 后才出现
-
-显示位置：
-
-代码位置：[NavBar](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/PageHeader.tsx#L17-L28)
-
-```ts
-const showUpgradePrompt = useShowUpgradePrompt(organization);
-// ...
-{showUpgradePrompt.shouldShow && organization
-  ? <UpgradePrompt />
-  : <EnvironmentBanner />
-}
-```
-
-- UpgradePrompt **替换**了 EnvironmentBanner（环境标签），出现在 NavBar 下方
-- 一旦显示，**所有使用 NavBar 的页面**都会看到此横幅
-
-### 5.3 Entitlement 阻断的精确时机
-
-代码位置：[triggerTaskV1.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/triggerTaskV1.server.ts#L115-L142)
-
-触发任务时的检查顺序：
-
-```
-Step 1: 检查幂等键缓存命中 → 命中则跳过后续检查
-Step 2: Entitlement 检查 (仅非 DEV 环境)
-        → hasAccess === false → 抛出 OutOfEntitlementError (阻断)
-Step 3: Queue Size 守卫 (所有环境)
-        → 超限 → 抛出 ServiceValidationError (阻断)
-Step 4: Tags 数量检查
-        → 超过 MAX_TAGS_PER_RUN → 抛出 ServiceValidationError (阻断)
-Step 5: 创建 TaskRun → 进入队列
-```
-
-Batch 触发也遵循相同顺序：
-
-代码位置：[batchTriggerV3.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/batchTriggerV3.server.ts#L199-L258)
-
-```
-Step 1: 检查 parent run 状态
-Step 2: Entitlement 检查 (仅非 DEV 环境)
-Step 3: Queue Size 守卫 (考虑批量数量 newRunCount)
-Step 4: 准备 run 数据 → 创建批量 TaskRun
-```
-
-### 5.4 阻断的容错策略
-
-Entitlement 检查使用 **Fail-Open** 策略：
-
-```ts
-// getEntitlement 返回 undefined 或出错时
-if (result.err || result.val === undefined) {
-  return { hasAccess: true as const }; // 默认放行
-}
-```
+- 仅在 URL 路径变化时重新加载
+- **搜索参数变化不触发**（如 search params）
+- **同页面内操作不触发**（如触发任务、查看日志）
 
 这意味着：
-- 如果 Platform Billing API 宕机 → **不阻断**用户
-- 如果缓存读取失败 → **不阻断**用户
-- 只有明确返回 `hasAccess: false` 时才阻断
+- 用户如果停留在同一页面（如 Tasks 列表），`usagePercentage` 可能**长时间不更新**
+- 直到用户导航到其他页面，org loader 才重新执行，读取（可能已过期的）usage 缓存
+- **实际延迟 = org loader 未重新加载时间 + usage 缓存 TTL**
 
-### 5.5 DEV 环境的豁免
+### 4.4 不同步的影响总结
+
+| 不同步类型           | 最大延迟     | 影响                                       |
+|---------------------|-------------|-------------------------------------------|
+| Dashboard 滞后于阻断 | ~8 min      | 用户看到正常 Dashboard 但 API 报错，困惑    |
+| 阻断滞后于 Dashboard | ~1 min      | 用户看到超限警告但 API 仍放行，产生误判      |
+| org loader 不刷新    | 不确定（用户停留时间） | FreePlanUsage 长期不更新，颜色不变化     |
+| 侧边栏折叠           | 用户操作决定  | FreePlanUsage 完全不可见                    |
+
+### 4.5 Fail-Open 加剧不同步
+
+代码位置：[getEntitlement](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L565-L598)
 
 ```ts
-if (environment.type !== "DEVELOPMENT" && !options.skipChecks) {
-  const result = await getEntitlement(environment.organizationId);
-  // ...
+if (result.err || result.val === undefined) {
+  return { hasAccess: true as const }; // Fail-Open
 }
 ```
 
-- DEVELOPMENT 环境**跳过** Entitlement 检查
-- 即使超限，开发环境仍可触发任务
-- Queue Size 守卫仍然生效（`!options.skipChecks` 条件）
+- 当 Billing API 不可用时，entitlement 默认放行
+- 但 usage 缓存可能仍返回旧值，显示超限
+- 用户看到超限提示但任务仍能正常触发——**这可能让用户忽视超限提示的可信度**
 
 ---
 
-## 六、各提示机制的对比与差距分析
+## 五、NotificationPanel：产品内通知系统
 
-### 6.1 功能对比
+### 5.1 通知机制
 
-| 提示机制            | 触发时机          | 展示位置         | 通知方式   | 颜色预警          | 文案提示      |
-|--------------------|------------------|-----------------|-----------|------------------|-------------|
-| Limits 页面 Quota  | 用户主动查看      | Limits 页表格    | 被动      | 90% 橙 / 100% 红 | 无           |
-| Limits 页面 Rate   | 用户主动查看      | Limits 页表格    | 被动      | ≤10% 橙 / 0% 红  | 无           |
-| UsageBar           | 用户主动查看      | Usage 页进度条   | 被动      | 仅绿色深浅变化     | 无           |
-| Billing Alerts     | 自动触发          | 邮件             | 主动推送   | 不适用            | 阈值百分比    |
-| UpgradePrompt 横幅 | 超免费额度        | 全局 NavBar 下方  | 被动(可见) | 红色背景+图标      | 明确阻断文案  |
-| 功能页面 Dialog     | 尝试创建超限资源  | Schedules/Branches | 被动(交互) | 红色文案          | 超限对话框    |
-| Entitlement 阻断   | API 触发任务时    | API 响应         | 主动阻断   | 不适用            | Error 消息   |
+代码位置：[NotificationPanel](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/NotificationPanel.tsx) / [platformNotifications.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platformNotifications.server.ts)
 
-### 6.2 当前提示不够明确的方面
+SideMenu 中有一个 `NotificationPanel`，位于 FreePlanUsage 上方，展示来自 `PlatformNotification` 数据库表的通知卡片。
 
-| 问题                        | 详细说明                                                               |
-|-----------------------------|-----------------------------------------------------------------------|
-| UsageBar 无阈值预警色        | 超限时仅 green-600 → green-700，视觉差异极小，缺乏橙色/红色过渡         |
-| UsageBar 无文字提示          | 不显示 "approaching limit" 或 "exceeded limit" 等文案                   |
-| Limits 页面仅数字变色        | 没有背景色高亮、进度条、图标等更醒目的视觉提示                           |
-| 无 75% 提前预警（页面内）     | Limits 页面从正常直接跳到 90% 橙色，缺少 75% 的早期预警                |
-| UpgradePrompt 仅限免费用户    | 付费用户超限时没有类似的顶部横幅提醒                                     |
-| 无接近上限的 in-app 通知      | 没有在侧边栏、toast 或通知中心显示"即将达到上限"的提示                   |
-| Rate limit 低 token 无补充提示 | 剩余 token 低于 10% 时仅数字变橙色，没有建议使用 batchTrigger 的提示     |
+### 5.2 通知查询
+
+```ts
+const POLL_INTERVAL_MS = 60000; // 1 分钟轮询
+```
+
+- 每 **60 秒**轮询一次 `/resources/platform-notifications`
+- `shouldRevalidate: () => false`（不随页面导航重新验证）
+- 查询活跃通知：`surface: "WEBAPP"` + `archivedAt: null` + 时间范围内
+
+### 5.3 通知类型
+
+```ts
+type: z.enum(["card", "info", "warn", "error", "success", "changelog"])
+```
+
+通知支持多种类型，包括 `warn` 和 `error`。scope 可以是：
+- `GLOBAL`：所有用户
+- `ORGANIZATION`：特定组织
+- `PROJECT`：特定项目
+- `USER`：特定用户
+
+### 5.4 是否有配额相关通知？
+
+**当前代码中不存在自动创建配额通知的逻辑。** `PlatformNotification` 的创建和管理通过 admin 端点手动操作（`createPlatformNotification`），没有代码在用量达到阈值时自动插入通知记录。
+
+这意味着：
+- **没有代码自动在 NotificationPanel 中显示"接近上限"或"超限"通知**
+- 配额通知只能通过管理员手动创建 PlatformNotification 来实现
+- Billing Alerts 的邮件通知由 Platform Billing API 在后台发送，不走 NotificationPanel
+
+### 5.5 NotificationPanel 与 FreePlanUsage 的位置关系
+
+```
+SideMenu 底部区域（从上到下）：
+┌─────────────────────────────┐
+│ IncidentStatusPanel          │  ← 事故状态
+├─────────────────────────────┤
+│ V3DeprecationPanel           │  ← V3 弃用警告
+├─────────────────────────────┤
+│ NotificationPanel            │  ← 平台通知（手动创建）
+├─────────────────────────────┤
+│ HelpAndAI                    │  ← 帮助 + AI
+├─────────────────────────────┤
+│ FreePlanUsage (仅免费用户)    │  ← 配额进度条
+└─────────────────────────────┘
+```
+
+如果有管理员创建了配额相关的 PlatformNotification（scope=ORGANIZATION），它会出现在 NotificationPanel 中，位于 FreePlanUsage 上方。
+
+---
+
+## 六、完整的"提示→阻断"流程与时间窗口
+
+### 6.1 免费用户体验时间线
+
+```
+用量 0%──75%──95%──100%────────────────────────→
+
+       │     │     │      │
+       ▼     ▼     ▼      ▼
+    FreePlan  FreePlan  FreePlan    UpgradePrompt
+    绿色      琥珀色    红色        红色横幅出现
+    (侧边栏)  (侧边栏)  (侧边栏)   (全局 NavBar)
+                       +红色边框
+                       
+                       │
+                       ▼
+                    API 阻断
+                    OutOfEntitlementError
+                    (仅非 DEV 环境)
+
+       ◄── 5-10 min 缓存延迟 ──►
+       Dashboard 可能还没变红时 API 已阻断
+```
+
+### 6.2 付费用户体验时间线
+
+```
+用量 0%──75%──90%──100%──200%──→
+
+       │           │     │      │
+       ▼           ▼     ▼      ▼
+    Billing     Limits  Usage  Billing
+    Alert 75%   90%橙   Bar    Alert 100%
+    (邮件)      (需主动查看)    (邮件)
+                            (邮件)
+
+    注意：付费用户没有 FreePlanUsage 和 UpgradePrompt
+    付费用户没有侧边栏进度条
+    付费用户没有全局超限横幅
+```
+
+### 6.3 关键缺口
+
+| 用户类型 | 75% 时看到什么            | 95% 时看到什么           | 100% 时看到什么          |
+|---------|--------------------------|------------------------|------------------------|
+| 免费用户 | FreePlanUsage 琥珀色进度条 | FreePlanUsage 红色进度条 | UpgradePrompt 红色横幅 + API 阻断 |
+| 付费用户 | 仅邮件（如配置了 Billing Alert）| 仅邮件 + Limits 页面数字变色 | 仅邮件 + API 可能阻断（取决于计划）|
+
+**免费用户在 75%-95% 之间只有侧边栏进度条变色，没有文字提示解释变色含义。**
 
 ---
 
@@ -532,26 +496,25 @@ if (environment.type !== "DEVELOPMENT" && !options.skipChecks) {
 
 | 功能                        | 文件                                                                                                              |
 |-----------------------------|-------------------------------------------------------------------------------------------------------------------|
-| 颜色判定函数                | [getUsageColorClass](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L809-L826) |
-| Quota 行颜色应用            | [QuotaRow](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L554-L684) |
-| Rate Limit 行颜色应用       | [RateLimitRow](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L344-L415) |
-| Limits 页面自动刷新         | [autoReloadPollIntervalMs](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L97-L112) |
-| Token 剩余查询              | [getRateLimitRemainingTokens](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/presenters/v3/LimitsPresenter.server.ts#L458-L491) |
-| UsageBar 组件               | [UsageBar](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx) |
-| UsageBar 超限颜色逻辑       | [UsageBar L52-L54](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx#L52-L54) |
-| UsageBar Legend 翻转        | [Legend L108-L109](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx#L108-L109) |
+| FreePlanUsage 组件          | [FreePlanUsage.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx) |
+| FreePlanUsage 颜色阈值      | [useTransform L10-L14](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx#L10-L14) |
+| FreePlanUsage 超限边框      | [hasHitLimit L16-L23](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/FreePlanUsage.tsx#L16-L23) |
+| SideMenu 渲染条件           | [SideMenu.tsx#L745-L752](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L745-L752) |
+| isFreeUser 判定             | [SideMenu.tsx#L180](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L180) |
+| CollapsibleHeight 折叠隐藏  | [SideMenu.tsx#L1172-L1192](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/SideMenu.tsx#L1172-L1192) |
+| usagePercentage 计算        | [org route.tsx#L115-L120](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120) |
+| shouldRevalidate 逻辑       | [org route.tsx#L33-L59](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L33-L59) |
+| getCachedUsage 缓存         | [platform.v3.server.ts#L497-L512](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L497-L512) |
+| 缓存 TTL 配置               | [platform.v3.server.ts#L91-L107](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L91-L107) |
+| getEntitlement + Fail-Open  | [platform.v3.server.ts#L565-L598](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L565-L598) |
+| NotificationPanel           | [NotificationPanel.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/navigation/NotificationPanel.tsx) |
+| 通知轮询 (60s)              | [platform-notifications.tsx#L40-L61](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/resources.platform-notifications.tsx#L40-L61) |
+| 通知查询逻辑                | [platformNotifications.server.ts#L139-L205](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platformNotifications.server.ts#L139-L205) |
+| UpgradePrompt 横幅          | [UpgradePrompt.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UpgradePrompt.tsx) |
+| NavBar 中 UpgradePrompt 位置| [PageHeader.tsx#L17-L28](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/PageHeader.tsx#L17-L28) |
+| UsageBar 组件               | [UsageBar.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UsageBar.tsx) |
+| Limits 页面颜色函数         | [limits/route.tsx#L809-L826](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.limits/route.tsx#L809-L826) |
 | Billing Alerts 页面         | [billing-alerts/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx) |
-| 标准告警阈值                | [checkboxLevels](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L185) |
-| 尖峰告警阈值                | [spikeAlertLevels](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L187) |
-| 100% 阈值不可取消           | [readOnly level 1.0](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.billing-alerts/route.tsx#L273) |
-| UpgradePrompt 横幅          | [UpgradePrompt](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/billing/UpgradePrompt.tsx#L11-L47) |
-| NavBar 中 UpgradePrompt 位置| [NavBar](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/components/primitives/PageHeader.tsx#L17-L28) |
-| hasExceededFreeTier 计算    | [org route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug/route.tsx#L115-L120) |
-| Entitlement 阻断            | [triggerTaskV1.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/triggerTaskV1.server.ts#L115-L120) |
-| Batch Entitlement 阻断      | [batchTriggerV3.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/batchTriggerV3.server.ts#L199-L203) |
-| Entitlement Fail-Open       | [getEntitlement](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/services/platform.v3.server.ts#L565-L598) |
-| Queue Size 守卫             | [queueSizeLimits.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/queueSizeLimits.server.ts) |
-| Branches 超限文案+环形图     | [branches/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.branches/route.tsx#L240-L246) |
-| Schedules 超限对话框         | [schedules/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.projects.$projectParam.env.$envParam.schedules/route.tsx#L192-L194) |
-| LimitsPresenter 数据层       | [LimitsPresenter.server.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/presenters/v3/LimitsPresenter.server.ts) |
-| Usage 页面（UsageBar 使用处）| [usage/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/_app.orgs.$organizationSlug.settings.usage/route.tsx#L155-L163) |
+| Storybook 测试页            | [storybook.free-plan-usage/route.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/routes/storybook.free-plan-usage/route.tsx) |
+| Entitlement 阻断            | [triggerTaskV1.server.ts#L115-L120](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/triggerTaskV1.server.ts#L115-L120) |
+| Batch Entitlement 阻断      | [batchTriggerV3.server.ts#L199-L203](file:///d:/fz/0508-3/solo-dogfeeding/code/192-trigger.dev/apps/webapp/app/v3/services/batchTriggerV3.server.ts#L199-L203) |
