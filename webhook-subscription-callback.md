@@ -330,7 +330,7 @@ const event = await webhooks.constructEvent(request, "webhook_secret");
 - 抛出异常（TypeError: signal timed out）
 - Worker 捕获异常 → 触发重试
 
-> **注意**：此 5 秒超时是**出站专用**的客户端超时，与入站路由的请求超时完全无关。trigger.dev 的 Express 服务器未设置 `requestTimeout`，入站请求的超时由调用方的 HTTP 客户端配置决定（见 [server.ts](apps/webapp/server.ts)）。
+> **注意**：此 5 秒超时是**出站专用**的客户端超时，与入站路由的请求超时完全无关。trigger.dev 的 Express 服务器未显式设置 `requestTimeout` 或 `headersTimeout`（见 [server.ts](apps/webapp/server.ts)），但 Node.js `http.Server` 在 v18+ 中有默认超时保护：`requestTimeout` 默认 300,000ms（5 分钟）、`headersTimeout` 默认 60,000ms（60 秒）。仅 `keepAliveTimeout` 被显式覆盖为 65,000ms（见 [server.ts#L203](apps/webapp/server.ts#L203)）。入站请求并非"无超时"，而是使用 Node.js 的默认超时，远长于出站的 5 秒。
 
 ### 7.2 Worker 重试机制
 
@@ -536,6 +536,7 @@ Webhook payload 有 v1 和 v2 两个版本：
 | 2 | "maxTimeoutInMs: 60,000 (默认)" | **错误**。Alerts Worker 的 `retry` 配置仅指定了 `maxAttempts: 3`，`maxTimeoutInMs` 来自 Worker 的 `defaultRetrySettings`（3,600,000 = 1小时），而非 `@trigger.dev/core` 的 `defaultRetryOptions`（60,000） | [worker.ts#L97-L105](packages/redis-worker/src/worker.ts#L97-L105)：`defaultRetrySettings = { maxTimeoutInMs: 3_600_000 }`；[worker.ts#L927-L930](packages/redis-worker/src/worker.ts#L927-L930)：`...defaultRetrySettings, ...catalogItem?.retry` |
 | 3 | "Worker 可见性超时与 job 执行时间不匹配：`visibilityTimeoutMs: 60_000` 但 `v3.evaluateErrorAlerts` 的实际执行可能超过 60 秒" | **错误**。`v3.evaluateErrorAlerts` 的 `visibilityTimeoutMs` 实际为 `60_000 * 5 = 300,000`（5分钟），与错误评估的执行时间匹配，不存在不匹配风险。此条已从风险表中移除 | [alertsWorker.server.ts#L65](apps/webapp/app/v3/alertsWorker.server.ts#L65)：`visibilityTimeoutMs: 60_000 * 5` |
 | 4 | "DLQ 消息重新入队后可能遇到已被标记为 SENT 的 alert" | 需要补充说明：由于进入 DLQ 时 ProjectAlert 状态仍为 PENDING（不会被更新为 FAILED），redrive 后 `DeliverAlertService` 检查 `status !== PENDING` 时仍会尝试递送。只有在极端情况下（如同时有另一条 Worker 成功递送了同一 alert），redrive 后才会遇到 SENT 状态而被跳过 | [deliverAlert.server.ts#L149](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L149) |
+| 5 | "Node.js 18+ 默认 `requestTimeout` 为 `0`（无超时）" | **错误**。Node.js v14.11.0 引入 `requestTimeout` 时默认为 `0`，但 **v18.0.0 起已改为 300,000ms（5 分钟）**。`headersTimeout` 同期改为 60,000ms（60 秒）。trigger.dev 的 `engines` 要求 `node >= 18.19.0 || >= 20.6.0`（见 [package.json#L305-L306](apps/webapp/package.json#L305-L306)），因此入站路由实际上有 Node.js 默认的 5 分钟请求超时和 60 秒头部超时保护，并非"无超时" | [Node.js v18.0.0 changelog](https://nodejs.org/en/blog/release/v18.0.0#http-timeouts)；[server.ts#L203](apps/webapp/server.ts#L203)：仅覆盖了 `keepAliveTimeout = 65s` |
 
 ### 12.2 入站路径代码分析与风险适用性
 
@@ -604,7 +605,7 @@ RunQueue 的 `maxAttempts` 可通过 `RunQueueOptions.retryOptions` 覆盖，但
 | 1 | 重试次数仅 3 次 | ✅ 适用 | ❌ 不适用（无 Redis Worker 队列） | ❌ 不适用（同步请求，重试由调用方控制） | ❌ **不适用**（默认 maxAttempts=12，远高于 3） |
 | 2 | DLQ 无自动补偿 | ✅ 适用 | ❌ 不适用 | ❌ 不适用 | ✅ **适用**（RunQueue 同样依赖手动 redrive，无自动扫描） |
 | 3 | ProjectAlert 状态不更新为 FAILED | ✅ 适用 | ❌ 不适用 | ❌ 不适用（TaskRun 持久化到 DB，状态可查询） | ❌ **不适用**（TaskRun 有完整的状态机：QUEUED → EXECUTING → COMPLETED/FAILED 等） |
-| 4 | 出站 fetch 超时仅 5 秒 | ✅ 适用（trigger.dev 出站 fetch 的 `AbortSignal.timeout(5000)`） | ❌ **不适用**（入站路由无 5 秒超时，见下方说明） | ❌ **不适用**（同左，入站路由无 5 秒超时） | ❌ 不适用（内部队列处理，不涉及 HTTP fetch） |
+| 4 | 出站 fetch 超时仅 5 秒 | ✅ 适用（trigger.dev 出站 fetch 的 `AbortSignal.timeout(5000)`） | ❌ **不适用**（入站路由无 5 秒超时；Node.js 默认 `requestTimeout`=5min、`headersTimeout`=60s） | ❌ **不适用**（同左） | ❌ 不适用（内部队列处理，不涉及 HTTP fetch） |
 | 5 | 所有非 2xx 响应都触发重试 | ✅ 适用 | ❌ 不适用 | ❌ 不适用 | ❌ 不适用 |
 | 6 | 速率限制静默丢弃 | ✅ 适用（EMAIL/SLACK 类型） | ❌ **不适用**（白名单豁免限流） | ❌ 不适用（限流返回 429，非静默丢弃） | ❌ 不适用（Worker 通信被白名单豁免） |
 | 7 | Webhook secret 存储依赖 ENCRYPTION_KEY | ✅ 适用 | ❌ 不适用 | ❌ 不适用（使用 API Key 认证） | ❌ 不适用 |
@@ -613,11 +614,14 @@ RunQueue 的 `maxAttempts` 可通过 `RunQueueOptions.retryOptions` 覆盖，但
 
 1. **原矩阵第 2 项"DLQ 无自动补偿"**：原判断为入站路径"不适用"，**部分修正**。Task Trigger API 本身确实不涉及 DLQ，但 TaskRun 创建后进入 Run-Engine 队列执行阶段时，RunQueue **同样存在 DLQ 无自动补偿的风险**。如果 run-engine 队列中的消息因执行失败耗尽重试次数进入 DLQ，同样需要手动 redrive，且**没有自动扫描/通知机制**。
 
-2. **原矩阵第 4 项"HTTP 超时仅 5 秒"**：原判断为入站路径"适用但角色相反"，**修正为不适用**。"5 秒超时"是指 `DeliverAlertService.#deliverWebhook()` 和 `DeliverErrorGroupAlertService` 中 `fetch()` 调用的 `AbortSignal.timeout(5000)`（见 [deliverAlert.server.ts#L956](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L956) 和 [deliverErrorGroupAlert.server.ts#L252](apps/webapp/app/v3/services/alerts/deliverErrorGroupAlert.server.ts#L252)），这是 **trigger.dev 作为 HTTP 客户端**对外发起请求时设置的超时。入站路由（HTTP Endpoint / Source 回调、Task Trigger API）中 **不存在 5 秒超时机制**：
-   - Express 服务器未设置 `requestTimeout` 或 `headersTimeout`（见 [server.ts](apps/webapp/server.ts)），Node.js 18+ 默认 `requestTimeout` 为 `0`（无超时），仅设置了 `keepAliveTimeout = 65s`
-   - 每个请求创建了 `AbortController`，但仅在客户端断开连接时 `abort()`（见 [server.ts#L148-L149](apps/webapp/server.ts#L148-L149)），**没有基于时间的超时**
-   - 入站路由的请求处理是同步的 DB 写入 + Redis 排队，通常在毫秒级完成
-   - 入站请求的超时由**调用方的 HTTP 客户端配置**决定，与 trigger.dev 的 5 秒出站超时无关
+2. **原矩阵第 4 项"HTTP 超时仅 5 秒"**：原判断为入站路径"适用但角色相反"，**修正为不适用**。"5 秒超时"是指 `DeliverAlertService.#deliverWebhook()` 和 `DeliverErrorGroupAlertService` 中 `fetch()` 调用的 `AbortSignal.timeout(5000)`（见 [deliverAlert.server.ts#L956](apps/webapp/app/v3/services/alerts/deliverAlert.server.ts#L956) 和 [deliverErrorGroupAlert.server.ts#L252](apps/webapp/app/v3/services/alerts/deliverErrorGroupAlert.server.ts#L252)），这是 **trigger.dev 作为 HTTP 客户端**对外发起请求时设置的超时。入站路由中 **不存在 5 秒超时机制**：
+   - Express 服务器未显式设置 `requestTimeout` 或 `headersTimeout`（见 [server.ts](apps/webapp/server.ts)），但 Node.js `http.Server` 在 v18+ 中有非零默认值（见 [Node.js v18.0.0 changelog](https://nodejs.org/en/blog/release/v18.0.0#http-timeouts)）：
+     - `requestTimeout` 默认 **300,000ms（5 分钟）**：接收完整请求的超时，超时后返回 408 并关闭连接
+     - `headersTimeout` 默认 **60,000ms（60 秒）**：接收完整 HTTP 头的超时
+     - `keepAliveTimeout` 默认 5,000ms，被 [server.ts#L203](apps/webapp/server.ts#L203) 覆盖为 **65,000ms**
+   - **之前文档中"Node.js 18+ 默认 requestTimeout 为 0（无超时）"的说法是错误的**。Node.js v14.11.0 引入 `requestTimeout` 时默认为 `0`，但 **v18.0.0 起已改为 300,000ms**。trigger.dev 的 `engines` 要求 `node >= 18.19.0 || >= 20.6.0`（见 [package.json#L305-L306](apps/webapp/package.json#L305-L306)），因此始终使用 300,000ms 默认值
+   - 每个请求创建了 `AbortController`，仅在客户端断开连接时 `abort()`（见 [server.ts#L148-L149](apps/webapp/server.ts#L148-L149)），**没有额外基于时间的超时**
+   - 入站请求的超时由 **Node.js http.Server 默认值**（5 分钟 / 60 秒）和**调用方的 HTTP 客户端配置**共同决定，与 trigger.dev 出站 fetch 的 5 秒超时无关
 
 3. **原矩阵第 6 项"速率限制静默丢弃"**：对于 HTTP Endpoint / Source 回调路径，这些路径被**白名单豁免**API 限流（见 [apiRateLimit.server.ts#L57-L58](apps/webapp/app/services/apiRateLimit.server.ts#L57-L58)），因此不存在被限流静默丢弃的风险。但这同时意味着这些路径**完全没有速率保护**，如果外部系统发送大量请求，可能对 trigger.dev 造成过载。
 
@@ -631,7 +635,7 @@ RunQueue 的 `maxAttempts` 可通过 `RunQueueOptions.retryOptions` 覆盖，但
 | DLQ | 有，无自动补偿 | 无 | 有，无自动补偿 |
 | 丢事件可追溯性 | 差（状态永远 PENDING） | 好（同步返回错误码 + 幂等支持） | 好（TaskRun 状态机完整） |
 | 速率限制 | WEBHOOK 不受限，EMAIL/SLACK 静默丢弃 | 限流返回 429 | Worker 通信被白名单豁免 |
-| 5 秒出站超时 | ✅ trigger.dev 出站 fetch `AbortSignal.timeout(5000)` | 无（入站路由无此超时，由调用方客户端控制） | 不涉及 HTTP |
+| 5 秒出站超时 | ✅ trigger.dev 出站 fetch `AbortSignal.timeout(5000)` | 无 5 秒超时；Node.js 默认 `requestTimeout`=5min、`headersTimeout`=60s | 不涉及 HTTP |
 
 因此，集成方反馈的"丢事件"问题需要根据方向分别排查：
 - **出站告警 Webhook**：高风险点 1-3（重试仅 3 次、DLQ 无补偿、状态不更新）是直接原因
