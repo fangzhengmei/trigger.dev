@@ -542,7 +542,7 @@ const stateResult = await generateVercelOAuthState({
 3. 带 `state + code + configurationId + origin=marketplace` 重定向到 `/vercel/connect`
 4. `/vercel/connect` 验证 state JWT 签名、过期、用户权限，然后交换 token 并创建集成
 
-**安全边界**：Marketplace 流程中，`configurationId` 从 Vercel 回调一路传递到 `createOrFindVercelIntegration`，最终存入 `VercelSecret.installationId`。`configurationId` 本身不是 secret（它是 Vercel 侧的集成配置 ID），但它在 onboarding 各步骤间通过隐藏表单字段传递，未做额外校验——攻击者无法篡改 `configurationId` 来指向其他集成配置，因为后续 Vercel API 调用使用的 `code` 是一次性且绑定该 `configurationId` 的。
+**安全边界**：Marketplace 流程中，`configurationId` 从 Vercel 回调一路传递到 `createOrFindVercelIntegration`，最终存入 `VercelSecret.installationId`。`configurationId` 本身不是 secret（它是 Vercel 侧的集成配置 ID），但它在 onboarding 各步骤间通过隐藏表单字段传递，本地代码没有额外校验它与 `code` 的对应关系；这一层正确性主要交给后续 Vercel code exchange 和 Vercel API 的配置访问控制兜底。
 
 ### 7.2 Slack State 未与 Session 绑定的风险分析
 
@@ -561,15 +561,15 @@ Slack 的 `state` 参数是裸 `organizationId`，**不与 Session 绑定**。�
   → 成员校验通过 → 集成创建成功
 ```
 
-**此攻击的效果**：攻击者可以让受害者为攻击者选择的 Slack workspace 安装到受害者的组织中。不过：
+**此攻击的效果**：攻击者可以诱导受害者把某个 Slack workspace 安装到受害者的组织中。不过：
 
 1. **攻击者无法获取凭据**：凭据存储在 SecretStore 中，攻击者无法读取
-2. **攻击者无法选择安装哪个 Slack workspace**：OAuth 授权页面由 Slack 展示给受害者，受害者看到的是自己有权限的 workspace
+2. **攻击者无法直接控制安装哪个 Slack workspace**：OAuth 授权页面由 Slack 展示给受害者，受害者看到并授权的是自己有权限的 workspace
 3. **实际威胁有限**：攻击者最多能让受害者组织连接一个"不想要的" Slack workspace，但不会导致凭据泄露
 
 **更严重但无法实现的攻击场景（理论上）**：
 
-如果攻击者能获取一个有效的 Slack `code`（需要 Slack 授权流程中的 client_secret 交换），理论上可以构造：
+如果攻击者能获取一个有效的 Slack `code`，理论上可以构造：
 
 ```
 攻击者自己的 Slack workspace 授权 → 获得 code
@@ -577,7 +577,7 @@ Slack 的 `state` 参数是裸 `organizationId`，**不与 Session 绑定**。�
 发送给受害者浏览器访问
 ```
 
-但此攻击**不可行**，因为 Slack 的 `code` 只能使用一次，且绑定 `redirect_uri`——攻击者无法让受害者的浏览器触发带有正确 `redirect_uri` 的回调。
+但此攻击**不可行**，因为 Slack 的 `code` 只能使用一次且绑定 OAuth 应用与 `redirect_uri`；攻击者即使在自己的浏览器触发授权，也无法在不消耗该 code 的情况下把同一个 code 交给受害者会话复用。
 
 **对比 Vercel 的安全性**：Vercel 的 state JWT 包含 `projectId`、`organizationSlug` 等信息并用 `ENCRYPTION_KEY` 签名，攻击者无法篡改 state 中的目标组织/项目，也无法伪造有效的 state。
 
@@ -657,7 +657,7 @@ if (!environment) {
      → 新的 OrganizationIntegration 行
 ```
 
-结果：同一组织可以有**多条** `service: "SLACK"` 的 `OrganizationIntegration` 记录（旧记录的 `deletedAt` 可能为 null 或有值）。代码中查询 Slack 集成使用 `findFirst`，只会返回最新的一条。
+结果：同一组织可以有**多条** `service: "SLACK"` 的 `OrganizationIntegration` 记录（旧记录的 `deletedAt` 可能为 null 或有值）。代码中查询 Slack 集成使用 `findFirst` 且没有显式排序，实际会拿到某一条活跃记录，不能保证一定是最近安装的那条。
 
 **旧凭据未清理**：重装后，旧的 SecretStore 和 SecretReference 记录仍然存在，旧的加密凭据未被删除。
 
