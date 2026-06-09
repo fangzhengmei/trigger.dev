@@ -9,24 +9,48 @@
 trigger.dev 当前支持两类第三方集成 OAuth：**Slack** 和 **Vercel**。整体链路如下：
 
 ```
-前端点击"连接 Slack/Vercel"
-  → 后端生成 OAuth URL + state 参数
-  → 用户在第三方页面授权
-  → 第三方回调 callback URL（带 code + state）
-  → 后端用 code 换取 access_token（服务端到服务端）
+Slack 安装流程：
+  Dashboard 点击"连接 Slack"
+  → 后端生成 OAuth URL（state = 裸 organizationId）
+  → 用户在 Slack 授权
+  → Slack 回调带 code + state
+  → 后端验证用户登录 + 组织成员身份
+  → 用 code 换取 access_token（服务端到服务端）
   → access_token 经 AES-256-GCM 加密后存入 SecretStore
   → 数据库记录 SecretReference → OrganizationIntegration 关联
-  → 任务运行时按需取出解密使用
+
+Vercel 安装流程（两条入口，state 生成时机不同）：
+
+  入口 A — Dashboard：
+    Dashboard 点击"连接 Vercel"
+    → 后端生成 OAuth URL（state = JWT，含 orgId/projectId/envSlug）
+    → 用户在 Vercel 授权
+    → Vercel 回调带 code + state + configurationId?
+    → 后端验证 state JWT 签名 + 用户权限
+    → 用 code 换取 access_token → 加密存入 SecretStore
+
+  入口 B — Marketplace：
+    用户从 Vercel Marketplace 安装
+    → Vercel 回调带 code + configurationId（无 state）
+    → 跳转 Onboarding 页 → 用户选组织/项目
+    → 选择项目后，后端生成 state JWT
+    → 带 state + code + configurationId 重定向到 /vercel/connect
+    → 后端验证 state JWT 签名 + 用户权限
+    → 用 code 换取 access_token → 加密存入 SecretStore
+
+运行时取用：
+  任务运行时按需从 SecretStore 取出解密 → 构造第三方 SDK 客户端
 ```
 
-### 1.1 授权发起——两种集成的 state 机制差异
+### 1.1 授权发起——各入口的 state 机制差异
 
-| 集成 | 授权 URL 生成 | state 参数 | 回跳地址保存 |
-|------|-------------|-----------|-------------|
-| Slack | [OrgIntegrationRepository.slackAuthorizationUrl](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L116-L133) | **裸字符串** = `organizationId` | Session cookie（`REDIRECT_AFTER_AUTH_KEY`） |
-| Vercel | [OrgIntegrationRepository.vercelInstallUrl](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L108-L114) | **JWT**，含 orgId/projectId/envSlug，15分钟过期，签名密钥为 `ENCRYPTION_KEY` | 无需 Session，state JWT 内自包含 |
+| 入口 | 授权 URL 生成 | 回调携带参数 | state 参数 | 回跳地址保存 |
+|------|-------------|-------------|-----------|-------------|
+| Slack（Dashboard） | [slackAuthorizationUrl](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L116-L133) | `code + state` | **裸字符串** = `organizationId`，授权前生成 | Session cookie（`REDIRECT_AFTER_AUTH_KEY`） |
+| Vercel（Dashboard） | [vercelInstallUrl](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L108-L114) | `code + state + configurationId?` | **JWT**，含 orgId/projectId/envSlug，15分钟过期，授权前生成 | 无需 Session，state JWT 内自包含 |
+| Vercel（Marketplace） | 用户从 Vercel Marketplace 发起 | `code + configurationId`（**无 state**） | **无**——回调时不携带 state；用户在 [onboarding](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx#L249-L258) 选择项目后才生成 state JWT | 无需 Session，state JWT 在 onboarding 中生成后传递 |
 
-**关键区分**：Slack 与 Vercel 的 state 参数承担了截然不同的安全职责。
+**关键区分**：三种入口的 state 生成时机和安全保障完全不同。
 
 - **Slack**：`state` 是一个**裸 organizationId 字符串**，直接拼进 OAuth URL。它**不做签名校验**，Slack 回调时将其原样带回，后端仅依赖两点保证安全：
   1. `requireUserId` 确认当前用户已登录
@@ -34,7 +58,11 @@ trigger.dev 当前支持两类第三方集成 OAuth：**Slack** 和 **Vercel**�
 
   回跳地址通过 [Session cookie](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L141-L142) 中的 `REDIRECT_AFTER_AUTH_KEY` 保存，回调后由 [redirectAfterAuth](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/orgIntegration.server.ts#L165-L187) 读取并跳转，随后从 Session 中清除。
 
-- **Vercel**：`state` 是一个 **JWT**，由 [generateVercelOAuthState](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/v3/vercel/vercelOAuthState.server.ts#L15-L22) 使用 `ENCRYPTION_KEY` 签名，15 分钟过期，payload 包含 `organizationId`、`projectId`、`environmentSlug`、`organizationSlug`、`projectSlug`。回调时由 [validateVercelOAuthState](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/v3/vercel/vercelOAuthState.server.ts#L25-L39) 验证签名和过期时间，然后根据 JWT 内的 `projectId` 再次查库验证用户权限。Vercel 流程**不依赖 Session** 来传递状态。
+- **Vercel（Dashboard 入口）**：`state` 在授权前由 [generateVercelOAuthState](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/v3/vercel/vercelOAuthState.server.ts#L15-L22) 生成，使用 `ENCRYPTION_KEY` 签名的 JWT，15 分钟过期，payload 包含 `organizationId`、`projectId`、`environmentSlug`、`organizationSlug`、`projectSlug`。回调时由 [validateVercelOAuthState](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/v3/vercel/vercelOAuthState.server.ts#L25-L39) 验证签名和过期时间，然后根据 JWT 内的 `projectId` 再次查库验证用户权限。
+
+- **Vercel（Marketplace 入口）**：用户从 Vercel Marketplace 安装时，回调**不携带 state**，只有 `code + configurationId`。[vercel.callback.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.callback.ts#L61-L74) 将其重定向到 [onboarding 页面](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx)，用户选择组织→项目（每步验证成员身份）后，[onboarding action](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx#L249-L258) 才生成 state JWT，然后带 `state + code + configurationId` 重定向到 `/vercel/connect`。这意味着 Marketplace 入口的 state **在回调之后、用户选择项目之后才生成**，而非授权前。
+
+  两种 Vercel 入口最终都汇聚到 `/vercel/connect`，由相同的 state JWT 验证逻辑保障安全，都不依赖 Session。
 
 ### 1.2 回调处理与 Token 交换
 
@@ -736,7 +764,7 @@ return prisma.organizationIntegration.findFirst({
 | 幂等性 | ❌ 不幂等 | ⚠️ 条件幂等——依赖 `findFirst` 找到唯一匹配记录 |
 | 凭据残留 | ⚠️ 有——旧凭据成为孤立数据 | ✅ 正常情况下无，但无约束保障 |
 
-**安全边界**：Vercel 的 teamId 匹配更新机制意味着，如果同一个 Vercel team 的 token 被两个不同的 trigger.dev 组织安装，后安装的会**覆盖**先安装的 token（因为 `findVercelOrgIntegrationByTeamId` 只在 `organizationId` 内查找，不会跨组织冲突）。但每个 trigger.dev 组织独立管理自己的集成，所以实际不会发生跨组织覆盖。
+**安全边界**：`findVercelOrgIntegrationByTeamId` 的查询条件包含 `organizationId`，因此不同 trigger.dev 组织之间的 Vercel 集成记录是隔离的——即使两个 trigger.dev 组织连接了同一个 Vercel team，也不会在数据库层面互相覆盖，因为 `findFirst` 限定在各自 `organizationId` 范围内查找。但这只是**应用层查询逻辑**的隔离，并非数据库唯一约束强制；如果绕过应用层直接操作数据库，同一 `(organizationId, teamId)` 仍可插入多条记录。
 
 ---
 
