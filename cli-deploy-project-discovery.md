@@ -368,22 +368,70 @@ deploymentService.progressDeployment(authenticatedEnv, deploymentId, {
 
 **② Worker 元数据真实值（BackgroundWorker.contentHash）**
 
-部署终结时，`finalizeDeployment()` 要求 `WorkerDeployment` 上已关联一个 `BackgroundWorker`（`apps/webapp/app/v3/services/finalizeDeployment.server.ts:41-52`）。BackgroundWorker 的 `contentHash` 来自构建产物元数据，而非部署记录：
+部署终结时，`finalizeDeployment()` 要求 `WorkerDeployment` 上已关联一个 `BackgroundWorker`（`apps/webapp/app/v3/services/finalizeDeployment.server.ts:41-52`）。BackgroundWorker 的创建有两条服务路径，它们的 contentHash 处理逻辑截然不同：
 
-- V4 路径：`apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts:83`
-  ```ts
-  contentHash: body.metadata.contentHash,  // 来自 CLI 或构建服务器传入的 metadata
-  ```
-- V3 路径（已废弃）：`apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts:70`
+**路径 A：`CreateDeploymentBackgroundWorkerServiceV4`（部署路径，当前使用）**
 
-**BackgroundWorker.contentHash 是实际运行时的指纹**。它用于判断两个 worker 是否代码相同——在 `apps/webapp/app/v3/services/createBackgroundWorker.server.ts:107` 中，如果最新 worker 的 contentHash 与新部署相同，则直接复用现有 worker 而不创建新的：
+API 端点：`POST /api/v1/deployments/:deploymentId/background-workers`（`apps/webapp/app/routes/api.v1.deployments.$deploymentId.background-workers.ts:45-48`）
+
+调用方：CLI 的 `managed-index-controller`（`packages/cli-v3/src/entryPoints/managed-index-controller.ts:119`），即部署时 supervisor 内的 worker 入口点。
+
+此服务**每次都创建新的 BackgroundWorker**，不做 contentHash 去重：
 
 ```ts
-// apps/webapp/app/v3/services/createBackgroundWorker.server.ts:107-109
+// apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts:76-91
+const backgroundWorker = await this._prisma.backgroundWorker.create({
+  data: {
+    ...BackgroundWorkerId.generate(),
+    version: deployment.version,
+    contentHash: body.metadata.contentHash,  // 直接使用 metadata 中的真实值
+    // ...
+  },
+});
+```
+
+创建后**立即回写 `deployment.workerId`**，并将部署状态推进为 `DEPLOYING`：
+
+```ts
+// apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts:192-204
+await this._prisma.workerDeployment.update({
+  where: { id: deployment.id },
+  data: {
+    status: "DEPLOYING",
+    workerId: backgroundWorker.id,   // ← 关键：回写 deployment.workerId
+    builtAt: new Date(),
+    type: backgroundWorker.engine === "V2" ? "MANAGED" : "V1",
+    runtimeVersion: body.metadata.runtimeVersion,
+  },
+});
+```
+
+**路径 B：`CreateBackgroundWorkerService`（dev 模式路径，旧版）**
+
+API 端点：`POST /api/v1/projects/:projectRef/background-workers`（`apps/webapp/app/routes/api.v1.projects.$projectRef.background-workers.ts:47`）
+
+调用方：CLI 的 `devSupervisor`（`packages/cli-v3/src/dev/devSupervisor.ts:365`），仅用于本地 `trigger dev` 开发模式。
+
+此服务**按 contentHash 复用已有 worker**，如果最新 worker 的 contentHash 与新部署相同，则直接返回现有 worker：
+
+```ts
+// apps/webapp/app/v3/services/createBackgroundWorker.server.ts:105-109
+const latestBackgroundWorker = project.backgroundWorkers[0];
 if (latestBackgroundWorker?.contentHash === body.metadata.contentHash) {
   return latestBackgroundWorker;  // 代码未变，复用已有 worker
 }
+// 否则创建新的 BackgroundWorker (apps/webapp/app/v3/services/createBackgroundWorker.server.ts:118-133)
 ```
+
+**两条路径的核心差异总结**：
+
+| 维度 | V4（部署路径） | 旧版（dev 路径） |
+|------|---------------|-----------------|
+| API 端点 | `/api/v1/deployments/:id/background-workers` | `/api/v1/projects/:ref/background-workers` |
+| contentHash 去重 | **不做去重**，每次创建新 worker | **按 contentHash 复用**已有 worker |
+| workerId 回写 | **回写** `deployment.workerId` + 推进状态为 DEPLOYING | **不涉及** deployment 记录 |
+| 调用场景 | 生产/staging 部署、Native Build Server | `trigger dev` 本地开发 |
+| 版本号来源 | `deployment.version`（由 initializeDeployment 分配） | `calculateNextBuildVersion()`（自增） |
 
 **③ Docker 构建参数（TRIGGER_CONTENT_HASH）**
 
@@ -403,28 +451,34 @@ contentHash 还作为 Docker build-arg 传入镜像构建，最终成为容器�
 ### 5.3 contentHash 三层值的关系总结
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                     WorkerDeployment 记录                        │
-│  contentHash: 普通路径=真实MD5 / Native路径=初始"-",后由progress更新 │
-│  用途: Dashboard 展示、版本记录                                    │
-└──────────────────────────┬──────────────────────────────────────┘
-                           │ finalize 时要求已关联
+┌─────────────────────────────────────────────────────────────────────┐
+│                     WorkerDeployment 记录                            │
+│  contentHash: 普通路径=真实MD5 / Native路径=初始"-",后由progress更新    │
+│  workerId: 由 CreateDeploymentBackgroundWorkerV4 回写                 │
+│  用途: Dashboard 展示、版本记录、状态机推进                             │
+└──────────────────────────┬──────────────────────────────────────────┘
+                           │ V4: 回写 workerId，推进 BUILDING → DEPLOYING
+                           │ 旧版(dev): 无关联
                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     BackgroundWorker 记录                        │
-│  contentHash: 始终为真实值 (来自 metadata)                        │
-│  用途: worker 去重判断 (同 contentHash 复用已有 worker)             │
-└──────────────────────────┬──────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     BackgroundWorker 记录                            │
+│  创建策略:                                                           │
+│    V4(部署): 每次创建新 worker，不做 contentHash 去重                   │
+│    旧版(dev): 按 contentHash 复用已有 worker                          │
+│  contentHash: 始终为真实值 (来自 metadata)                            │
+│  用途: V4 仅记录指纹 / dev 模式下用于 worker 去重                      │
+└──────────────────────────┬──────────────────────────────────────────┘
                            │ 镜像内可读取
                            ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Docker 镜像 (运行时)                         │
-│  TRIGGER_CONTENT_HASH: 作为 build-arg 烧录                       │
-│  用途: worker 进程可读自己的指纹                                    │
-└─────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                     Docker 镜像 (运行时)                             │
+│  TRIGGER_CONTENT_HASH: 作为 build-arg 烧录                           │
+│  用途: worker 进程可读自己的指纹                                      │
+│       Docker 缓存失效信号 (ARG 值变化 → 层缓存失效)                    │
+└─────────────────────────────────────────────────────────────────────┘
 ```
 
-**注意**：WorkerDeployment.contentHash 和 BackgroundWorker.contentHash 可能不同步——Native 路径中，如果 `progressDeployment` 因故障未执行，部署记录的 contentHash 可能停留在 `"-"`，但 BackgroundWorker 的 contentHash 始终是真实值。
+**关键澄清**：contentHash 的去重复用**仅存在于 dev 模式**（`CreateBackgroundWorkerService`），在部署路径中**不生效**。每次部署无论 contentHash 是否变化，都会创建新的 BackgroundWorker 并回写 `deployment.workerId`。
 
 ---
 
@@ -454,12 +508,12 @@ contentHash 和 Docker 缓存是**两个独立的优化维度**：
 
 它们的交互方式：
 
-1. contentHash 变化 → 新部署记录 → 新镜像构建 → Docker 可能复用未改变的层
-2. contentHash 不变 → dev 模式下跳过重建（`packages/cli-v3/src/dev/devSupervisor.ts:310-311`），生产部署仍会创建新记录
+1. contentHash 变化 → 新部署记录 → 新 BackgroundWorker → 新镜像构建 → Docker 可能复用未改变的层
+2. contentHash 不变 → dev 模式下跳过重建（`packages/cli-v3/src/dev/devSupervisor.ts:310-311` 客户端跳过 + `packages/cli-v3/src/dev/devSupervisor.ts:365` 服务端复用已有 worker），生产部署**仍会创建新记录和新 worker**（V4 不做去重）
 3. `--no-cache` 跳过 Docker 层缓存 → 即使 contentHash 未变也全量构建
 4. contentHash 作为 `TRIGGER_CONTENT_HASH` build-arg → **如果 contentHash 变化，对应 Docker 层必然失效**（因为 ARG 值变了）
 
-这意味着 contentHash 实际上充当了 Docker 缓存的一个「失效信号」：代码改动 → contentHash 改变 → `TRIGGER_CONTENT_HASH` build-arg 改变 → 至少一层缓存失效。
+这意味着 contentHash 在部署路径中充当了 Docker 缓存的一个「失效信号」：代码改动 → contentHash 改变 → `TRIGGER_CONTENT_HASH` build-arg 改变 → 至少一层缓存失效。而在 dev 模式中，contentHash 还额外起到了 worker 去重的作用（通过 `CreateBackgroundWorkerService`）。
 
 ### 6.3 版本号分配：乐观并发 + 重试
 
@@ -707,8 +761,11 @@ npx trigger.dev@latest promote <version>
 | 部署 progress 服务端逻辑 | `apps/webapp/app/v3/services/deployment.server.ts` |
 | 部署终结服务 | `apps/webapp/app/v3/services/finalizeDeployment.server.ts` |
 | 部署终结 V2（含镜像推送） | `apps/webapp/app/v3/services/finalizeDeploymentV2.server.ts` |
-| BackgroundWorker 创建 V4 | `apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts` |
+| BackgroundWorker 创建 V4（部署路径，每次新建+回写 workerId） | `apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV4.server.ts` |
+| V4 Worker 创建 API 路由 | `apps/webapp/app/routes/api.v1.deployments.$deploymentId.background-workers.ts` |
+| 部署时 CLI worker 入口点 | `packages/cli-v3/src/entryPoints/managed-index-controller.ts` |
 | BackgroundWorker 创建 V3（已废弃） | `apps/webapp/app/v3/services/createDeploymentBackgroundWorkerV3.server.ts` |
-| Worker 去重与资源创建 | `apps/webapp/app/v3/services/createBackgroundWorker.server.ts` |
+| Worker 去重与资源创建（dev 模式路径） | `apps/webapp/app/v3/services/createBackgroundWorker.server.ts` |
+| Dev 模式 Worker API 路由 | `apps/webapp/app/routes/api.v1.projects.$projectRef.background-workers.ts` |
 | 部署 API schema | `packages/core/src/v3/schemas/api.ts` |
 | Dev 模式增量检测 | `packages/cli-v3/src/dev/devSupervisor.ts` |
