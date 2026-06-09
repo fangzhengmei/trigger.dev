@@ -49,11 +49,17 @@ trigger.dev 当前支持两类第三方集成 OAuth：**Slack** 和 **Vercel**�
 
 **Vercel 回调**：[vercel.callback.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.callback.ts#L21-L78) → [vercel.connect.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.connect.tsx#L66-L170)
 
+Vercel 回调有两种入口，根据是否携带 `state` 参数分叉：
+
+1. **Dashboard 入口（有 state）**：回调带 `state + code + configurationId?`，直接跳转 `/vercel/connect`
+2. **Marketplace 入口（无 state，有 configurationId）**：回调带 `code + configurationId`，先跳转 `/vercel/onboarding` 让用户选择组织/项目，选择后生成 state JWT，再重定向到 `/vercel/connect`
+
+在 `/vercel/connect` 中：
 1. 验证用户登录状态
 2. 验证 state JWT 签名与过期
 3. 从 state JWT 中提取 `projectId`、`organizationId`，查库验证用户对 project 有权限
-4. 调用 `VercelIntegrationRepository.exchangeCodeForToken()` 用 code 换取 access_token
-5. 调用 `createOrFindVercelIntegration()` 创建或更新集成记录
+4. 调用 `VercelIntegrationRepository.exchangeCodeForToken(code)` 用 code 换取 access_token
+5. 调用 `createOrFindVercelIntegration()` 创建或更新集成记录，`configurationId` 作为 `installationId` 存入密文
 
 ### 1.3 凭据存储路径
 
@@ -196,6 +202,12 @@ GCM 模式同时提供**机密性**和**完整性**保护。解密时如果 tag 
 │ SecretStore 表 / encryptedToken 列（密文）                 │
 │   - AES-256-GCM 加密                                      │
 │   - 存储 { nonce, ciphertext, tag } 结构                   │
+│   - 覆盖：OAuth 凭据、环境变量 Secret、MFA 密钥、PAT       │
+├─────────────────────────────────────────────────────────┤
+│ RuntimeEnvironment.apiKey / RevokedApiKey.apiKey（明文）   │
+│   - ⚠️ API Key 以明文存储，无加密无哈希                    │
+│   - RuntimeEnvironment.apiKey 有 @@unique 约束            │
+│   - RevokedApiKey.apiKey 有 @@index 索引，含 24h 过期      │
 ├─────────────────────────────────────────────────────────┤
 │ SecretReference 表（索引层，不含密文）                       │
 │   - key: 指向 SecretStore 的唯一键                         │
@@ -210,7 +222,7 @@ GCM 模式同时提供**机密性**和**完整性**保护。解密时如果 tag 
 
 **关键设计原则**：
 - 密文与业务数据分离：`SecretStore` 表只存加密后的值，业务表通过 `SecretReference` 间接引用
-- 数据库中不存在明文凭据
+- 数据库中**第三方 OAuth 凭据和 PAT 不存在明文**，但 API Key（`RuntimeEnvironment.apiKey`）和已撤销 API Key（`RevokedApiKey.apiKey`）是**明文存储**的例外
 - `PersonalAccessToken` 的 `obfuscatedToken` 列仅显示脱敏格式（如 `tr_pat_bhbd•••••••••••••••••••fd4a`）
 
 ### 3.4 SecretStore 版本演进
@@ -466,7 +478,7 @@ API 请求的认证链路（[apiAuth.server.ts](file:///d:/fz/0508-3/solo-dogfee
 
 | 认证方式 | 格式前缀 | 隔离粒度 | 存储方式 |
 |---------|---------|---------|---------|
-| API Key | `tr_dev_` / `tr_prod_` | 环境（Environment） | 明文存储，哈希查找 |
+| API Key | `tr_dev_` / `tr_prod_` | 环境（Environment） | 明文存储，明文查找 |
 | Personal Access Token | `tr_pat_` | 用户（User） | AES-256-GCM 加密 + SHA-256 哈希 |
 | Organization Access Token | `tr_oat_` | 组织（Organization） | SHA-256 哈希（无加密） |
 | Public JWT | - | 环境（Environment） | JWT 签名验证 |
@@ -542,7 +554,15 @@ const stateResult = await generateVercelOAuthState({
 3. 带 `state + code + configurationId + origin=marketplace` 重定向到 `/vercel/connect`
 4. `/vercel/connect` 验证 state JWT 签名、过期、用户权限，然后交换 token 并创建集成
 
-**安全边界**：Marketplace 流程中，`configurationId` 从 Vercel 回调一路传递到 `createOrFindVercelIntegration`，最终存入 `VercelSecret.installationId`。`configurationId` 本身不是 secret（它是 Vercel 侧的集成配置 ID），但它在 onboarding 各步骤间通过隐藏表单字段传递，本地代码没有额外校验它与 `code` 的对应关系；这一层正确性主要交给后续 Vercel code exchange 和 Vercel API 的配置访问控制兜底。
+**安全边界**：Marketplace 流程中，`configurationId` 从 Vercel 回调一路传递到 `createOrFindVercelIntegration`，最终存入 `VercelSecret.installationId`。`configurationId` 本身不是 secret（它是 Vercel 侧的集成配置 ID），但它在 onboarding 各步骤间通过隐藏表单字段传递。
+
+**⚠️ configurationId 与 code 在本地并未绑定校验**：从 [vercel.callback.ts](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.callback.ts#L61-L74) 到 [vercel.onboarding.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.onboarding.tsx) 再到 [vercel.connect.tsx](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.connect.tsx#L66-L170)，`code` 和 `configurationId` 始终作为**独立参数**传递，本地代码从未校验两者是否属于同一个 Vercel 安装。具体来说：
+
+1. `exchangeCodeForToken(code)` 只使用 `code`，不涉及 `configurationId`
+2. `configurationId` 仅在 `createOrFindVercelIntegration` 中作为 `installationId` 存入 `VercelSecret`
+3. 没有任何代码检查"该 `code` 换来的 token 是否确实属于 `configurationId` 所指的配置"
+
+实际安全保障依赖 Vercel 侧的 OAuth 协议正确性：Vercel 在用户授权时将 `code` 和 `configurationId` 绑定到同一个安装会话中，回传时它们自然对应。但如果攻击者能同时获得一个有效的 `code`（来自安装 A）和一个不同的 `configurationId`（来自安装 B），本地代码无法检测这种不匹配——安装 B 的 `configurationId` 会被存入密文，而 token 来自安装 A。
 
 ### 7.2 Slack State 未与 Session 绑定的风险分析
 
@@ -661,7 +681,7 @@ if (!environment) {
 
 **旧凭据未清理**：重装后，旧的 SecretStore 和 SecretReference 记录仍然存在，旧的加密凭据未被删除。
 
-**Vercel：按 teamId 查找并更新**
+**Vercel：应用层按 teamId 查找并更新（非数据库约束）**
 
 [createOrFindVercelIntegration](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/routes/vercel.connect.tsx#L21-L64) 中，Vercel 流程**先查找已有集成**：
 
@@ -693,6 +713,12 @@ return prisma.organizationIntegration.findFirst({
 });
 ```
 
+⚠️ **这是应用层面的 `findFirst` 查询，不是数据库唯一约束**。`OrganizationIntegration` 表上没有 `(organizationId, service, externalOrganizationId)` 的 `@@unique` 约束——只有 `friendlyId` 有 `@unique`。这意味着：
+
+- 正常情况下 `findFirst` 会找到已有记录并更新，行为看起来是幂等的
+- 但如果存在并发安装、或数据库中已有脏数据（如同一 teamId 有多条未删除记录），`findFirst` 只会更新其中一条，其余成为孤立记录
+- 这与 Slack 重装的问题本质相同——区别仅在于 Vercel **尝试**查找已有记录，而 Slack **完全不查找**
+
 [updateVercelOrgIntegrationToken](file:///d:/fz/0508-3/solo-dogfeeding/code/189-trigger.dev/apps/webapp/app/models/vercelIntegration.server.ts#L753-L799) 更新时：
 
 1. 通过现有的 `SecretReference.key` 找到 SecretStore 中的旧凭据
@@ -703,11 +729,12 @@ return prisma.organizationIntegration.findFirst({
 
 | 维度 | Slack 重装 | Vercel 重装 |
 |------|-----------|------------|
-| 策略 | 总是创建新记录 | 按 teamId 查找并更新 |
-| 旧凭据 | 保留在 SecretStore 中（孤立） | 被**覆盖**，同一 SecretStore key 被重写 |
-| 旧记录 | 可能存在多条未删除的 SLACK 集成 | 始终保持一条 VERCEL 集成（per teamId） |
-| 幂等性 | ❌ 不幂等 | ✅ 幂等 |
-| 凭据残留 | ⚠️ 有——旧凭据成为孤立数据 | ✅ 无——旧凭据被覆盖 |
+| 策略 | 总是创建新记录 | 应用层按 teamId `findFirst` 查找并更新 |
+| 查找机制 | 无查找逻辑 | `findFirst({ organizationId, service: "VERCEL", externalOrganizationId: teamId, deletedAt: null })` |
+| 数据库约束保障 | 无 | 无——`OrganizationIntegration` 表无 `(organizationId, service, externalOrganizationId)` 唯一约束 |
+| 旧凭据 | 保留在 SecretStore 中（孤立） | 被覆盖（同一 SecretStore key 重写），但并发场景下仍可能产生孤立记录 |
+| 幂等性 | ❌ 不幂等 | ⚠️ 条件幂等——依赖 `findFirst` 找到唯一匹配记录 |
+| 凭据残留 | ⚠️ 有——旧凭据成为孤立数据 | ✅ 正常情况下无，但无约束保障 |
 
 **安全边界**：Vercel 的 teamId 匹配更新机制意味着，如果同一个 Vercel team 的 token 被两个不同的 trigger.dev 组织安装，后安装的会**覆盖**先安装的 token（因为 `findVercelOrgIntegrationByTeamId` 只在 `organizationId` 内查找，不会跨组织冲突）。但每个 trigger.dev 组织独立管理自己的集成，所以实际不会发生跨组织覆盖。
 
@@ -725,8 +752,10 @@ return prisma.organizationIntegration.findFirst({
 | 集成软删除未清理 SecretStore | 中 | `OrganizationIntegration` 软删除后，`SecretStore` 和 `SecretReference` 中的密文仍残留。数据库泄露时这些密文可被解密（若有 ENCRYPTION_KEY） |
 | Slack 重装产生孤立凭据 | 中 | 每次 Slack 重装都创建新记录，旧 SecretStore 凭据未清理，形成不可控的凭据残留 |
 | Slack 撤销不调用第三方 API | 中 | Slack 集成删除后，token 在 Slack 侧仍有效，存在被滥用的窗口期 |
+| Vercel configurationId 与 code 未绑定校验 | 低 | Marketplace 流程中 `code` 和 `configurationId` 作为独立参数传递，本地不校验两者是否属于同一个 Vercel 安装。实际安全依赖 Vercel 侧协议正确性 |
 | Slack state 无签名校验 | 低 | Slack 的 `state` 参数是裸 `organizationId`，不与 Session 绑定，依赖后续成员校验保证安全。CSRF 式安装攻击理论上可行但实际威胁有限 |
 | OAuth state 验证机制不一致 | 低 | Vercel 使用签名 JWT 验证 state，Slack 依赖 Session + 成员校验，两种模式安全基线不同 |
+| Vercel 重装无数据库唯一约束 | 低 | `OrganizationIntegration` 表无 `(organizationId, service, externalOrganizationId)` 唯一约束，`findFirst` 查找在并发或脏数据场景下可能产生多条记录 |
 | RevokedApiKey 宽限期过长 | 低 | API Key 轮换后旧 key 仍有 24 小时有效期，数据库泄露场景下缩小了轮换的即时防护效果 |
 | OrganizationAccessToken 未加密 | 低 | 仅存哈希，但原始 token 只在创建时返回一次，类似密码存储模式 |
 
@@ -739,11 +768,13 @@ return prisma.organizationIntegration.findFirst({
 5. **实现 Slack Token 自动刷新**：在 `getAuthenticatedClientForIntegration` 中实现基于 `refreshToken` 的自动刷新逻辑
 6. **集成删除时清理凭据**：在软删除 `OrganizationIntegration` 时，同步删除 `SecretStore` 和 `SecretReference` 中的记录
 7. **Slack 重装时查找并更新**：参考 Vercel 的 `createOrFindVercelIntegration` 模式，按 Slack team_id 查找已有集成并更新 token，而非创建新记录
-8. **Slack 撤销时调用 Slack API**：参考 Vercel 的 `uninstallVercelIntegration` 模式，在删除 Slack 集成时调用 Slack 的 `auth.revoke` API 使 token 失效
-9. **统一 state 验证机制**：将 Slack 的 state 也改为 JWT 签名方式，并在 payload 中绑定 userId，与 Vercel 对齐
-10. **审计日志**：对凭据的读取、解密操作记录审计日志，包含操作者、时间、目标集成
-11. **传输加密**：确保数据库连接使用 SSL/TLS（PostgreSQL `sslmode=require`）
-12. **密钥轮换**：实现 `ENCRYPTION_KEY` 轮换机制，新数据用新密钥加密，旧数据保留旧密钥版本标记（当前 version 字段已预留此能力）
+8. **添加数据库唯一约束**：为 `OrganizationIntegration` 表添加 `(organizationId, service, externalOrganizationId, deletedAt)` 的部分唯一索引，从数据库层面保证同一组织同一 teamId 只有一条活跃集成
+9. **Slack 撤销时调用 Slack API**：参考 Vercel 的 `uninstallVercelIntegration` 模式，在删除 Slack 集成时调用 Slack 的 `auth.revoke` API 使 token 失效
+10. **统一 state 验证机制**：将 Slack 的 state 也改为 JWT 签名方式，并在 payload 中绑定 userId，与 Vercel 对齐
+11. **Vercel configurationId 与 code 绑定校验**：在 `createOrFindVercelIntegration` 中，将 `configurationId` 存入密文后，可通过 Vercel API 调用 `getConfiguration({ id: configurationId })` 验证该配置的安装状态与当前 token 一致
+12. **审计日志**：对凭据的读取、解密操作记录审计日志，包含操作者、时间、目标集成
+13. **传输加密**：确保数据库连接使用 SSL/TLS（PostgreSQL `sslmode=require`）
+14. **密钥轮换**：实现 `ENCRYPTION_KEY` 轮换机制，新数据用新密钥加密，旧数据保留旧密钥版本标记（当前 version 字段已预留此能力）
 
 ---
 
